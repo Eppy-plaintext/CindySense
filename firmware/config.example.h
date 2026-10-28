@@ -1,0 +1,7 @@
+#pragma once
+
+// Copy to config.h in this folder and fill in local values. config.h is ignored by Git.
+#define CINDYSENSE_WIFI_SSID "YOUR_WIFI_SSID"
+#define CINDYSENSE_WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
+#define CINDYSENSE_TINYIOT_URL "http://YOUR_TINYIOT_HOST:3000/TinyIoT/CindySense_AE/SensorData"
+#define CINDYSENSE_ORIGINATOR "YOUR_DEVICE_ORIGINATOR"
