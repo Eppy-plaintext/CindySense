@@ -71,4 +71,4 @@ npm run lint
 
 Run checks in a local copy with dependencies installed. The backend tests use mocks; they should not require a live TinyIoT server. No firmware build command is configured in this repository.
 
-Read [architecture](docs/architecture.md), [API](docs/api.md), and [TinyIoT setup](docs/tinyiot-setup.md) before connecting devices or changing oneM2M resources.
+Read [architecture](docs/architecture.md), [API](docs/api.md), and [TinyIoT setup](docs/tinyiot-setup.md) before connecting devices or changing oneM2M resources. The [consolidation plan](docs/consolidation-plan.md) records the source comparison and team review steps. Detailed notes from the standalone dashboard repository are preserved as [historical dashboard notes](docs/dashboard-standalone-notes.md); use the commands above for this repository layout.
