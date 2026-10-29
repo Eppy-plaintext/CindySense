@@ -2,6 +2,9 @@
 .env
 .env.*
 !.env.example
+tools/collector.local.json
+tools/collector.json
+data/recordings/
 firmware/config.h
 *.pem
 *.key

@@ -12,6 +12,7 @@ CindySense is a three-person university hackathon prototype for IoT workout trac
 | [dashboard](dashboard/) | React/Vite user interface |
 | [firmware](firmware/) | ESP32/MPU6050 Arduino sketch |
 | [docs](docs/) | Architecture, API, TinyIoT setup, and team workflow |
+| [tools](tools/) | Read-only, labelled sensor CIN collection |
 
 TinyIoT is an **external dependency**. See [TinyIoT setup](docs/tinyiot-setup.md); its source, database, and configuration are not part of this repository.
 
@@ -71,4 +72,8 @@ npm run lint
 
 Run checks in a local copy with dependencies installed. The backend tests use mocks; they should not require a live TinyIoT server. No firmware build command is configured in this repository.
 
+
 Read [architecture](docs/architecture.md), [API](docs/api.md), and [TinyIoT setup](docs/tinyiot-setup.md) before connecting devices or changing oneM2M resources. The [consolidation plan](docs/consolidation-plan.md) records the source comparison and team review steps. Detailed notes from the standalone dashboard repository are preserved as [historical dashboard notes](docs/dashboard-standalone-notes.md); use the commands above for this repository layout.
+
+To capture labelled MPU6050 batches from an existing SensorData container, follow [sensor data collection](docs/sensor-data-collection.md).
+

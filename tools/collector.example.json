@@ -1,0 +1,13 @@
+{
+  "base_url": "http://localhost:3000/TinyIoT",
+  "origin": "",
+  "container": "CindySense_AE/SensorData",
+  "output_dir": "../data/recordings",
+  "device_id": "",
+  "poll_seconds": 1,
+  "settle_seconds": 3,
+  "page_size": 150,
+  "max_pages": 40,
+  "expected_samples_per_batch": 50,
+  "timestamp_unit": "ms"
+}

@@ -1,0 +1,227 @@
+import csv
+import json
+from pathlib import Path
+import tempfile
+import unittest
+from unittest.mock import Mock, patch
+
+from tools.collect_sensor_data import (CollectorError, Config, TinyIoTReader,
+                                       order_and_check, parse_cin, record)
+
+
+def cin(timestamps, con_as_string=True):
+    content = {
+        "deviceId": "chest-1",
+        "sampleRateHz": 50,
+        "samples": [
+            {"t": t, "ax": 1, "ay": 2, "az": 3, "gx": 4, "gy": 5, "gz": 6}
+            for t in timestamps
+        ],
+    }
+    return {"m2m:cin": {"ri": "cin-1", "ct": "20261029T120000",
+                        "con": json.dumps(content) if con_as_string else content}}
+
+
+class CollectorTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        Path("tmp").mkdir(exist_ok=True)
+
+    def config(self, output_dir):
+        return Config("http://localhost:3000/TinyIoT", "read-origin",
+                      "CindySense_AE/SensorData", Path(output_dir), 0.001, 0,
+                      150, 3, 50, "ms", "")
+
+    def test_parses_batch_and_detects_gap_and_duplicate(self):
+        rows, warnings = parse_cin(cin([0, 20, 60]), "ms", 50)
+        self.assertEqual(len(rows), 3)
+        self.assertTrue(any("expected 50" in warning for warning in warnings))
+        ordered, warnings = order_and_check(rows + rows[:1])
+        self.assertEqual([row.sample_t for row in ordered], ["0", "20", "60"])
+        self.assertTrue(any("duplicate" in warning for warning in warnings))
+        self.assertTrue(any("gap" in warning for warning in warnings))
+
+    def test_malformed_cin_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "malformed JSON"):
+            parse_cin({"m2m:cin": {"con": "{"}}, "ms", 50)
+        bad = cin([0], con_as_string=False)
+        del bad["m2m:cin"]["con"]["samples"][0]["gx"]
+        with self.assertRaisesRegex(ValueError, "sample 0"):
+            parse_cin(bad, "ms", 50)
+
+    def test_paginates_references_and_stops_at_baseline(self):
+        with tempfile.TemporaryDirectory(dir="tmp") as directory:
+            reader = TinyIoTReader(self.config(directory))
+            prefix = "TinyIoT/CindySense_AE/SensorData/"
+            calls = []
+
+            def fake_get(path, params=None):
+                calls.append(params["ofst"])
+                names = [f"new-{i}" for i in range(151)] if params["ofst"] == 0 else ["new-150", "old"]
+                return {"m2m:rrl": {"rrf": [
+                    {"nm": name, "typ": 4, "val": prefix + name} for name in names
+                ]}}
+
+            with patch.object(reader, "get", side_effect=fake_get):
+                refs = reader.list_cins(known={"CindySense_AE/SensorData/old"},
+                                        stop_at="CindySense_AE/SensorData/old")
+            self.assertEqual(len(refs), 151)
+            self.assertEqual(refs[0], "CindySense_AE/SensorData/new-0")
+            self.assertEqual(calls, [0, 150])
+
+    def test_rejects_unsupported_listing_shape(self):
+        with tempfile.TemporaryDirectory(dir="tmp") as directory:
+            reader = TinyIoTReader(self.config(directory))
+            with patch.object(reader, "get", return_value={"m2m:cnt": {}}):
+                with self.assertRaisesRegex(CollectorError, "m2m:rrl.rrf"):
+                    reader.list_cins(first_page_only=True)
+
+    def test_seen_newer_cin_does_not_hide_unseen_older_cin_on_next_page(self):
+        reader = TinyIoTReader(self.config("tmp"))
+        reader.config = Config("http://localhost:3000/TinyIoT", "read-origin",
+                               "CindySense_AE/SensorData", Path("tmp"), 0.001, 0,
+                               2, 3, 50, "ms", "")
+        prefix = "TinyIoT/CindySense_AE/SensorData/"
+        pages = {
+            0: ["new-3", "new-2"],
+            2: ["new-2", "new-1", "baseline"],
+            4: ["baseline", "historical"],
+        }
+
+        def fake_get(path, params=None):
+            return {"m2m:rrl": {"rrf": [
+                {"typ": 4, "val": prefix + name}
+                for name in pages[params["ofst"]]
+            ]}}
+
+        with patch.object(reader, "get", side_effect=fake_get) as get:
+            refs = reader.list_cins(
+                known={"CindySense_AE/SensorData/new-3",
+                       "CindySense_AE/SensorData/baseline"},
+                stop_at="CindySense_AE/SensorData/baseline")
+        self.assertEqual(refs, ["CindySense_AE/SensorData/new-2",
+                                "CindySense_AE/SensorData/new-1"])
+        self.assertEqual([call.args[1]["ofst"] for call in get.call_args_list], [0, 2])
+
+    def test_does_not_include_historical_cins_after_baseline_in_same_page(self):
+        reader = TinyIoTReader(self.config("tmp"))
+        prefix = "TinyIoT/CindySense_AE/SensorData/"
+        with patch.object(reader, "get", return_value={"m2m:rrl": {"rrf": [
+                {"typ": 4, "val": prefix + name}
+                for name in ("new", "baseline", "historical")
+        ]}}):
+            refs = reader.list_cins(known={"CindySense_AE/SensorData/baseline"},
+                                    stop_at="CindySense_AE/SensorData/baseline")
+        self.assertEqual(refs, ["CindySense_AE/SensorData/new"])
+
+    def test_stops_if_baseline_disappears(self):
+        reader = TinyIoTReader(self.config("tmp"))
+        with patch.object(reader, "get", return_value={"m2m:rrl": {"rrf": [
+            {"nm": "new", "typ": 4,
+             "val": "TinyIoT/CindySense_AE/SensorData/new"}
+        ]}}):
+            with self.assertRaisesRegex(CollectorError, "Baseline CIN disappeared"):
+                reader.list_cins(known={"CindySense_AE/SensorData/old"},
+                                 stop_at="CindySense_AE/SensorData/old")
+
+    def test_normalizes_relative_and_absolute_cin_references(self):
+        reader = TinyIoTReader(self.config("tmp"))
+        suffix = "CindySense_AE/SensorData/4-20261029T122259%2C1250176"
+        expected = "http://localhost:3000/TinyIoT/" + suffix
+        references = (
+            "4-20261029T122259,1250176",
+            suffix,
+            "/" + suffix,
+            "TinyIoT/" + suffix,
+            "/TinyIoT/" + suffix,
+            "http://localhost:3000/TinyIoT/" + suffix,
+            "http://localhost:3000/" + suffix,
+        )
+        for reference in references:
+            with self.subTest(reference=reference):
+                self.assertEqual(reader.resource_url(reference), expected)
+        for reference in (
+            "http://evil.example/TinyIoT/" + suffix,
+            "//evil.example/TinyIoT/" + suffix,
+            "TinyIoT/TinyIoT/" + suffix,
+            "../" + suffix,
+            "TinyIoT/CindySense_AE/Other/id",
+        ):
+            with self.subTest(rejected=reference):
+                with self.assertRaises(CollectorError):
+                    reader.resource_url(reference)
+
+    def test_http_request_is_read_only_with_onem2m_headers(self):
+        reader = TinyIoTReader(self.config("tmp"))
+        response = Mock()
+        response.headers = {"X-M2M-RSC": "2000"}
+        response.read.return_value = b'{"m2m:rrl":{"rrf":[]}}'
+        with patch("tools.collect_sensor_data.urlopen") as open_url:
+            open_url.return_value.__enter__.return_value = response
+            reader.get("CindySense_AE/SensorData", {"rcn": 6})
+        request = open_url.call_args.args[0]
+        headers = dict(request.header_items())
+        self.assertEqual(request.get_method(), "GET")
+        self.assertEqual(headers["X-m2m-origin"], "read-origin")
+        self.assertEqual(headers["X-m2m-rvi"], "4")
+        self.assertTrue(headers["X-m2m-ri"].startswith("cindysense-collector-"))
+        self.assertIn("rcn=6", request.full_url)
+
+    def test_discovered_reference_builds_single_cse_prefix(self):
+        reader = TinyIoTReader(self.config("tmp"))
+        response = Mock()
+        response.headers = {"X-M2M-RSC": "2000"}
+        response.read.return_value = b'{"m2m:cin":{"con":"{}"}}'
+        with patch("tools.collect_sensor_data.urlopen") as open_url:
+            open_url.return_value.__enter__.return_value = response
+            reader.get("TinyIoT/CindySense_AE/SensorData/4-20261029T122259,1250176")
+        request = open_url.call_args.args[0]
+        self.assertEqual(request.full_url,
+                         "http://localhost:3000/TinyIoT/CindySense_AE/SensorData/"
+                         "4-20261029T122259%2C1250176")
+
+    def test_records_only_new_cin_to_csv(self):
+        with tempfile.TemporaryDirectory(dir="tmp") as directory:
+            reader = TinyIoTReader(self.config(directory))
+            uri = "TinyIoT/CindySense_AE/SensorData/new"
+            listings = [["TinyIoT/CindySense_AE/SensorData/old"], [uri], []]
+            with patch.object(reader, "list_cins", side_effect=listings), \
+                 patch.object(reader, "get", return_value=cin(range(0, 1000, 20))):
+                output = record(reader, "squat", "squat-slow-01", 0.0001)
+            with output.open(newline="", encoding="utf-8") as file:
+                rows = list(csv.DictReader(file))
+            self.assertEqual(len(rows), 50)
+            self.assertEqual(rows[0]["session_id"], "squat-slow-01")
+            self.assertEqual(rows[0]["label"], "squat")
+            self.assertEqual(rows[0]["sample_t"], "0")
+            self.assertEqual(rows[-1]["sample_t"], "980")
+
+    def test_records_several_cins_arriving_between_polls(self):
+        with tempfile.TemporaryDirectory(dir="tmp") as directory:
+            reader = TinyIoTReader(self.config(directory))
+            prefix = "CindySense_AE/SensorData/"
+            listings = [[prefix + "baseline"],
+                        [prefix + "new-2", prefix + "new-1"],
+                        [prefix + "new-4", prefix + "new-3"]]
+
+            def fake_get(ref):
+                index = int(ref.rsplit("-", 1)[-1])
+                payload = cin(range(index * 1000, (index + 1) * 1000, 20))
+                payload["m2m:cin"]["ri"] = ref.rsplit("/", 1)[-1]
+                return payload
+
+            with patch.object(reader, "list_cins", side_effect=listings) as listing, \
+                 patch.object(reader, "get", side_effect=fake_get), \
+                 patch("tools.collect_sensor_data.time.sleep", side_effect=KeyboardInterrupt):
+                output = record(reader, "squat", "several-cins", None)
+            with output.open(newline="", encoding="utf-8") as file:
+                rows = list(csv.DictReader(file))
+            self.assertEqual(len(rows), 200)
+            self.assertEqual([rows[i]["sample_t"] for i in (0, 50, 100, 150)],
+                             ["1000", "2000", "3000", "4000"])
+            self.assertEqual(listing.call_args_list[1].kwargs["stop_at"],
+                             prefix + "baseline")
+
+
+if __name__ == "__main__":
+    unittest.main()
