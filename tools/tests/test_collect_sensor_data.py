@@ -122,7 +122,35 @@ class CollectorTests(unittest.TestCase):
         ]}}):
             with self.assertRaisesRegex(CollectorError, "Baseline CIN disappeared"):
                 reader.list_cins(known={"CindySense_AE/SensorData/old"},
-                                 stop_at="CindySense_AE/SensorData/old")
+                                 stop_at="CindySense_AE/SensorData/old",
+                                 fallback_known={"CindySense_AE/SensorData/newer-gone"})
+
+    def test_uses_session_overlap_when_baseline_expires_across_pages(self):
+        reader = TinyIoTReader(self.config("tmp"))
+        reader.config = Config("http://localhost:3000/TinyIoT", "read-origin",
+                               "CindySense_AE/SensorData", Path("tmp"), 0.001, 0,
+                               2, 5, 50, "ms", "")
+        prefix = "TinyIoT/CindySense_AE/SensorData/"
+        pages = {0: ["new-5", "new-4"],
+                 2: ["new-4", "new-3", "new-2"],
+                 4: ["new-2", "new-1", "historical"],
+                 6: ["historical"]}
+
+        def fake_get(path, params=None):
+            return {"m2m:rrl": {"rrf": [
+                {"typ": 4, "val": prefix + name}
+                for name in pages[params["ofst"]]
+            ]}}
+
+        with patch.object(reader, "get", side_effect=fake_get):
+            refs = reader.list_cins(
+                known={f"CindySense_AE/SensorData/{name}"
+                       for name in ("baseline", "new-2", "new-1")},
+                stop_at="CindySense_AE/SensorData/baseline",
+                fallback_known={"CindySense_AE/SensorData/new-2",
+                                "CindySense_AE/SensorData/new-1"})
+        self.assertEqual(refs, [f"CindySense_AE/SensorData/new-{i}"
+                                for i in (5, 4, 3)])
 
     def test_normalizes_relative_and_absolute_cin_references(self):
         reader = TinyIoTReader(self.config("tmp"))
@@ -221,6 +249,75 @@ class CollectorTests(unittest.TestCase):
                              ["1000", "2000", "3000", "4000"])
             self.assertEqual(listing.call_args_list[1].kwargs["stop_at"],
                              prefix + "baseline")
+
+    def test_records_new_cin_after_oldest_baseline_cin_is_evicted(self):
+        with tempfile.TemporaryDirectory(dir="tmp") as directory:
+            reader = TinyIoTReader(self.config(directory))
+            prefix = "TinyIoT/CindySense_AE/SensorData/"
+            retained = ["baseline-newest", "baseline-middle", "baseline-oldest"]
+
+            def fake_get(path, params=None):
+                if params is not None:
+                    return {"m2m:rrl": {"rrf": [
+                        {"typ": 4, "val": prefix + name} for name in retained
+                    ]}}
+                self.assertEqual(path, "CindySense_AE/SensorData/new")
+                return cin(range(0, 1000, 20))
+
+            sleeps = 0
+
+            def advance_upload(_seconds):
+                nonlocal sleeps
+                sleeps += 1
+                if sleeps == 1:
+                    retained[:] = ["new", "baseline-newest", "baseline-middle"]
+                else:
+                    raise KeyboardInterrupt
+
+            with patch.object(reader, "get", side_effect=fake_get), \
+                 patch("tools.collect_sensor_data.time.sleep", side_effect=advance_upload):
+                output = record(reader, "rest", "rolling-baseline", None)
+            with output.open(newline="", encoding="utf-8") as file:
+                rows = list(csv.DictReader(file))
+            self.assertEqual(len(rows), 50)
+            self.assertEqual(rows[0]["label"], "rest")
+
+    def test_record_continues_after_baseline_expires_with_session_overlap(self):
+        with tempfile.TemporaryDirectory(dir="tmp") as directory:
+            reader = TinyIoTReader(self.config(directory))
+            prefix = "CindySense_AE/SensorData/"
+            retained = ["baseline"]
+
+            def fake_get(path, params=None):
+                if params is not None:
+                    return {"m2m:rrl": {"rrf": [
+                        {"typ": 4, "val": prefix + name} for name in retained
+                    ]}}
+                index = int(path.rsplit("-", 1)[-1])
+                payload = cin(range(index * 1000, (index + 1) * 1000, 20))
+                payload["m2m:cin"]["ri"] = path.rsplit("/", 1)[-1]
+                return payload
+
+            sleeps = 0
+
+            def advance_upload(_seconds):
+                nonlocal sleeps
+                sleeps += 1
+                if sleeps == 1:
+                    retained[:] = ["new-1", "baseline"]
+                elif sleeps == 2:
+                    retained[:] = ["new-2", "new-1", "historical"]
+                else:
+                    raise KeyboardInterrupt
+
+            with patch.object(reader, "get", side_effect=fake_get), \
+                 patch("tools.collect_sensor_data.time.sleep", side_effect=advance_upload):
+                output = record(reader, "rest", "expired-baseline", None)
+            with output.open(newline="", encoding="utf-8") as file:
+                rows = list(csv.DictReader(file))
+            self.assertEqual(len(rows), 100)
+            self.assertEqual([rows[0]["sample_t"], rows[50]["sample_t"]],
+                             ["1000", "2000"])
 
 
 if __name__ == "__main__":

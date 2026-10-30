@@ -161,10 +161,12 @@ class TinyIoTReader:
         return payload
 
     def list_cins(self, known: set[str] | None = None, first_page_only: bool = False,
-                  stop_at: str | None = None) -> list[str]:
-        """Read CIN references newest first, stopping at the oldest baseline CIN."""
+                  stop_at: str | None = None,
+                  fallback_known: set[str] | None = None) -> list[str]:
+        """Read newest-first CINs, bounded by the baseline or session overlap."""
         refs: list[str] = []
         seen_in_listing: set[str] = set()
+        fallback_cutoff: int | None = None
         for page in range(self.config.max_pages):
             payload = self.get(self.config.container, {
                 "rcn": 6, "ty": 4, "lvl": 1,
@@ -185,12 +187,16 @@ class TinyIoTReader:
                 seen_in_listing.add(uri)
                 if uri == stop_at:
                     return refs
+                if fallback_known is not None and uri in fallback_known:
+                    fallback_cutoff = len(refs)
                 if known is None or uri not in known:
                     refs.append(uri)
             if first_page_only:
                 return refs
             if len(entries) < self.config.page_size:
                 if stop_at is not None:
+                    if fallback_cutoff is not None:
+                        return refs[:fallback_cutoff]
                     raise CollectorError("Baseline CIN disappeared; cannot distinguish new CINs from older history")
                 return refs
         raise CollectorError("CIN listing exceeded max_pages; increase it before recording")
@@ -307,7 +313,7 @@ def record(reader: TinyIoTReader, label: str, session_id: str,
     if output.exists():
         raise CollectorError(f"Output already exists: {output}")
     baseline_refs = reader.list_cins(first_page_only=True)
-    baseline_boundary = baseline_refs[-1] if baseline_refs else None
+    baseline_boundary = baseline_refs[0] if baseline_refs else None
     print(f"Baseline: {len(baseline_refs)} recent CINs. Recording {label} as {session_id}.")
     seen = set(baseline_refs)
     batches: list[Sample] = []
@@ -317,7 +323,8 @@ def record(reader: TinyIoTReader, label: str, session_id: str,
 
     def poll() -> None:
         nonlocal selected_device
-        refs = reader.list_cins(known=seen, stop_at=baseline_boundary)
+        refs = reader.list_cins(known=seen, stop_at=baseline_boundary,
+                                fallback_known=seen.difference(baseline_refs))
         for ref in reversed(refs):
             try:
                 payload = reader.get(ref)
