@@ -20,19 +20,31 @@ resource identifier or full CIN path as `batch_id`; do not pass `X-M2M-RI`,
 which identifies an HTTP request rather than a stored batch. If a batch has
 no identity, repeated sample timestamps still prevent duplicate events.
 
-The filter is a stateful, causal one-pole low-pass filter. Calibration requires
-observed quiet samples; after eight seconds without enough quiet readings,
-it uses a provisional reference and reports `calibration: uncertain`.
-The automatic orientation is undetermined until a full cycle passes tilt,
-timing, raw-return, and gyro checks. A gap over 40 ms aborts an incomplete
-cycle. A detected device clock reset restarts calibration while preserving
-the session's repetition count. No missing samples are synthesized.
+The filter is a stateful, causal one-pole low-pass filter. The default
+`adaptive` calibration looks for quiet samples. For a workout with a labelled
+standing lead-in, select `calibration_mode="initial_standing"`. It requires a
+continuous stable standing window before enabling counts; set its duration with
+`standing_calibration_seconds`. The replay tool accepts
+`--calibration-mode initial_standing --standing-calibration-seconds 5`.
+
+If calibration quality is insufficient, the state is `uncertain`, the reason
+and measured quality are available from `get_state()`, and confirmed counts
+remain disabled. Do not interpret zero counts in an uncertain session as a
+detector miss. The detector only confirms a repetition after a complete causal
+tilt cycle passes timing, raw tilt return, and directional gyro checks. A
+rejected movement is diagnostic only and does not increment the count.
+Uncertain movement candidates are surfaced separately with their evidence and
+reason; they are not confirmed repetitions. The automatic orientation becomes
+known only after a confirmed full cycle. A gap over 40 ms aborts an incomplete
+cycle. A detected device clock reset restarts calibration while preserving the
+session's confirmed count. No missing samples are synthesized.
 
 For a local, sequential CSV replay:
 
 ```sh
 python tools/replay_squat_stream.py data/recordings/squat_slow_08.csv
 python tools/replay_squat_stream.py data/recordings/rest_validation_03.csv --batch-size 37
+python tools/replay_squat_stream.py data/recordings/squat-slow-01.csv --calibration-mode initial_standing --standing-calibration-seconds 5
 ```
 
 Batch size changes when an event becomes available to a caller, but not

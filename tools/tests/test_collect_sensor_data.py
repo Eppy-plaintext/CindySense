@@ -4,6 +4,8 @@ from urllib.error import HTTPError
 from pathlib import Path
 import tempfile
 import unittest
+from contextlib import redirect_stderr
+from io import StringIO
 from unittest.mock import MagicMock, Mock, patch
 
 from tools.collect_sensor_data import (CollectorError, Config, TinyIoTReader,
@@ -41,6 +43,65 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual([row.sample_t for row in ordered], ["0", "20", "60"])
         self.assertTrue(any("duplicate" in warning for warning in warnings))
         self.assertTrue(any("gap" in warning for warning in warnings))
+
+    def test_timestamp_reset_is_reported_in_original_order(self):
+        before, _ = parse_cin(cin([1000, 1020]), "ms", 2)
+        after_payload = cin([0, 20])
+        after_payload["m2m:cin"]["ri"] = "after-reboot"
+        after, _ = parse_cin(after_payload, "ms", 2)
+        original = before + after
+        ordered, warnings = order_and_check(original)
+        self.assertEqual(ordered, original)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("timestamp reset detected in original sample order", warnings[0])
+        self.assertIn("1020 (cin-1) -> 0 (after-reboot)", warnings[0])
+
+    def test_boot_nonce_change_detects_reset_even_when_timestamps_overlap(self):
+        payload_a = cin([1000, 1020])
+        payload_a["m2m:cin"]["ri"] = "cs-012345abcdef-00000001-00000001"
+        payload_b = cin([0, 20])
+        payload_b["m2m:cin"]["ri"] = "cs-012345abcdef-00000002-00000001"
+        before, _ = parse_cin(payload_a, "ms", 2)
+        after, _ = parse_cin(payload_b, "ms", 2)
+        ordered, warnings = order_and_check(before + after)
+        self.assertEqual(ordered, before + after)
+        self.assertTrue(any("firmware boot identity changed" in warning
+                            for warning in warnings))
+
+    def test_record_rejects_reset_session_without_writing_replay_csv(self):
+        with tempfile.TemporaryDirectory(dir="tmp") as directory:
+            reader = TinyIoTReader(self.config(directory))
+            prefix = "CindySense_AE/SensorData/"
+            names = [prefix + "cs-012345abcdef-00000002-00000001",
+                     prefix + "cs-012345abcdef-00000001-00000001"]
+
+            def fake_get(ref):
+                payload = cin(range(1000, 2000, 20) if ref.endswith("-00000001-00000001")
+                              else range(0, 1000, 20))
+                payload["m2m:cin"]["ri"] = ref.rsplit("/", 1)[-1]
+                return payload
+
+            ticks = iter((0.0, 0.0, 1.0))
+            output = Path(directory) / "reset-session.csv"
+            stderr = StringIO()
+            with patch.object(reader, "list_cins", side_effect=[[], names, names]), \
+                 patch.object(reader, "get", side_effect=fake_get), \
+                 patch("tools.collect_sensor_data.time.monotonic",
+                       side_effect=lambda: next(ticks)), \
+                 patch("tools.collect_sensor_data.time.sleep"), \
+                 redirect_stderr(stderr), \
+                 self.assertRaisesRegex(CollectorError, "normal replay CSV was not written"):
+                record(reader, "squat", "reset-session", 0.5)
+            self.assertFalse(output.exists())
+            quarantined = Path(directory) / "reset-session.invalid.csv"
+            self.assertTrue(quarantined.exists())
+            with quarantined.open(newline="", encoding="utf-8") as file:
+                recorded = list(csv.DictReader(file))
+            self.assertEqual([row["sample_t"] for row in recorded[:2]],
+                             ["1000", "1020"])
+            self.assertEqual([row["sample_t"] for row in recorded[50:52]],
+                             ["0", "20"])
+            self.assertIn("timestamp reset detected", stderr.getvalue())
 
     def test_malformed_cin_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "malformed JSON"):

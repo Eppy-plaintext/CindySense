@@ -10,7 +10,7 @@ from collections import deque
 from dataclasses import asdict, dataclass, field
 import hashlib
 import math
-from statistics import median
+from statistics import median, pstdev
 from typing import Iterable, Mapping
 
 
@@ -60,19 +60,25 @@ class StreamingConfig:
     max_gap_ms: float = 40.0
     reset_gap_seconds: float = 1.0
     baseline_adaptation_hz: float = 0.02
+    calibration_mode: str = "adaptive"  # adaptive or initial_standing
+    standing_calibration_seconds: float = 2.0
+    standing_angle_std_deg: float = 2.0
 
     def __post_init__(self) -> None:
         if self.orientation not in ("auto", "positive", "negative"):
             raise ValueError("orientation must be auto, positive or negative")
         if self.gyro_axis not in ("auto", *AXES) or self.gyro_sign not in (-1, 0, 1):
             raise ValueError("Invalid gyroscope axis or sign")
+        if self.calibration_mode not in ("adaptive", "initial_standing"):
+            raise ValueError("calibration_mode must be adaptive or initial_standing")
         if not 0 < self.lowpass_hz < self.sample_hz / 2:
             raise ValueError("Invalid low-pass cutoff")
         if not 0 <= self.exit_deg <= self.enter_deg < self.bottom_deg:
             raise ValueError("Invalid tilt thresholds")
         if min(self.warmup_seconds, self.max_warmup_seconds, self.quiet_gyro_deg_s,
                self.turn_hysteresis_deg, self.max_cycle_seconds, self.max_gap_ms,
-               self.reset_gap_seconds) <= 0 or self.min_quiet_samples < 1:
+               self.reset_gap_seconds, self.standing_calibration_seconds,
+               self.standing_angle_std_deg) <= 0 or self.min_quiet_samples < 1:
             raise ValueError("Calibration and timing values must be positive")
         if self.max_warmup_seconds < self.warmup_seconds or (
             self.max_cycle_seconds <= self.min_cycle_seconds
@@ -100,6 +106,9 @@ class RepetitionEvent:
     gyro_axis: str
     gyro_sign: int
     bottom_to_confirmation_seconds: float
+    cycle_duration_seconds: float
+    descent_duration_seconds: float
+    ascent_duration_seconds: float
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -147,6 +156,9 @@ class StreamingSquatDetector:
         self.calibration = "warming_up"
         self.calibration_note = "Waiting for observed quiet samples"
         self.reference: float | None = None
+        self._calibration_sample_count = 0
+        self._calibration_angle_std: float | None = None
+        self._best_standing_angles: list[float] = []
         self.orientation: int | None = (
             None if self.config.orientation == "auto" else
             1 if self.config.orientation == "positive" else -1)
@@ -157,6 +169,8 @@ class StreamingSquatDetector:
         self._filtered_acc: list[float] | None = None
         self._filtered_gyro: list[float] | None = None
         self._quiet: deque[float] = deque(maxlen=round(self.config.sample_hz * 8))
+        self._standing: deque[tuple[float, float]] = deque(
+            maxlen=round(self.config.sample_hz * self.config.standing_calibration_seconds))
         self._warmup_angles: deque[float] = deque(
             maxlen=round(self.config.sample_hz * self.config.max_warmup_seconds))
         self._seen_times: set[float] = set()
@@ -170,6 +184,8 @@ class StreamingSquatDetector:
             "rejected_cycles": 0, "invalid_samples": 0, "processed_samples": 0,
         }
         self._recent_rejections: deque[str] = deque(maxlen=30)
+        self._recent_confirmed_gyro_peaks: deque[float] = deque(maxlen=10)
+        self._uncertain_candidates: deque[dict] = deque(maxlen=20)
 
     def get_state(self) -> dict:
         return {
@@ -180,9 +196,25 @@ class StreamingSquatDetector:
             "phase": (self._cycles[self.orientation].phase if self.orientation else
                       "orientation_pending"),
             "standing_reference_deg": self.reference,
+            "calibration_quality": {
+                "mode": self.config.calibration_mode,
+                "quiet_samples": self._calibration_sample_count or len(self._quiet),
+                "required_quiet_samples": self.config.min_quiet_samples,
+                "standing_window_samples": (len(self._standing) if
+                                            self.config.calibration_mode == "initial_standing"
+                                            else self._calibration_sample_count),
+                "standing_angle_std_deg": self._calibration_angle_std,
+                "longest_standing_run_samples": len(self._best_standing_angles),
+                "longest_standing_run_angle_std_deg": (
+                    pstdev(self._best_standing_angles)
+                    if len(self._best_standing_angles) > 1 else
+                    0.0 if self._best_standing_angles else None),
+                "counts_enabled": self.calibration == "ready",
+            },
             "last_sample_time_seconds": self._last_time,
             "diagnostics": self.diagnostics.copy(),
             "recent_rejections": list(self._recent_rejections),
+            "uncertain_candidates": list(self._uncertain_candidates),
         }
 
     def process_batch(
@@ -228,7 +260,11 @@ class StreamingSquatDetector:
         self.calibration = "warming_up"
         self.calibration_note = "Recalibrating after sensor reset"
         self.reference = None
+        self._calibration_sample_count = 0
+        self._calibration_angle_std = None
+        self._best_standing_angles.clear()
         self._quiet.clear()
+        self._standing.clear()
         self._warmup_angles.clear()
         self._first_time = None
         self._filtered_acc = self._filtered_gyro = None
@@ -285,27 +321,65 @@ class StreamingSquatDetector:
         self._raw_angle = angle
         gyro_norm = math.sqrt(sum(value * value for value in self._filtered_gyro))
         if self.reference is None:
+            # An initial-standing timeout is terminal for calibration. Continue
+            # processing timestamps and diagnostics, but do not let later exercise
+            # samples rewrite the quality evidence from the calibration attempt.
+            if (self.config.calibration_mode == "initial_standing" and
+                    self.calibration == "uncertain"):
+                return []
             self._warmup_angles.append(angle)
             if gyro_norm < self.config.quiet_gyro_deg_s:
                 self._quiet.append(angle)
+                self._standing.append((t, angle))
+                if len(self._standing) > len(self._best_standing_angles):
+                    self._best_standing_angles = [value for _, value in self._standing]
+            else:
+                self._standing.clear()
             elapsed = t - self._first_time
+            if self.config.calibration_mode == "initial_standing":
+                window_complete = (len(self._standing) == self._standing.maxlen and
+                                   self._standing[-1][0] - self._standing[0][0] >=
+                                   self.config.standing_calibration_seconds - 1 / self.config.sample_hz)
+                if window_complete and pstdev(v for _, v in self._standing) <= self.config.standing_angle_std_deg:
+                    self.reference = median(v for _, v in self._standing)
+                    self._calibration_sample_count = len(self._standing)
+                    self._calibration_angle_std = pstdev(v for _, v in self._standing)
+                    self.calibration = "ready"
+                    self.calibration_note = "Explicit initial standing window observed"
+                elif elapsed >= self.config.max_warmup_seconds:
+                    self.calibration = "uncertain"
+                    self._calibration_sample_count = len(self._quiet)
+                    self.calibration_note = "No stable initial standing window; counting disabled"
+                else:
+                    self.calibration = "warming_up"
+                    self.calibration_note = "Waiting for a stable initial standing window"
+                return []
             if elapsed >= self.config.warmup_seconds:
                 if len(self._quiet) >= self.config.min_quiet_samples:
                     self.reference = median(self._quiet)
+                    self._calibration_sample_count = len(self._quiet)
+                    self._calibration_angle_std = (pstdev(self._quiet)
+                                                    if len(self._quiet) > 1 else 0.0)
                     self.calibration = "ready"
                     self.calibration_note = "Quiet standing reference observed"
                 elif elapsed >= self.config.max_warmup_seconds:
                     # A moving sensor may have no quiet window. Use the observed
                     # posture provisionally and expose the uncertainty to callers.
                     self.reference = median(self._warmup_angles)
+                    self._calibration_sample_count = len(self._quiet)
+                    self._calibration_angle_std = (pstdev(self._warmup_angles)
+                                                    if len(self._warmup_angles) > 1 else None)
                     self.calibration = "uncertain"
                     self.calibration_note = (
-                        f"Only {len(self._quiet)} quiet samples; provisional reference")
+                        f"Only {len(self._quiet)} quiet samples; counting disabled")
                 else:
                     self.calibration = "uncertain"
                     self.calibration_note = (
                         f"Only {len(self._quiet)} quiet samples; waiting for "
                         f"{self.config.min_quiet_samples}")
+            return []
+        if self.calibration != "ready":
+            # An uncertain reference cannot support a confirmed repetition.
             return []
         assert self.reference is not None
         relative = angle - self.reference
@@ -377,7 +451,10 @@ class StreamingSquatDetector:
             if (t - cycle.bottom < config.min_ascent_seconds or
                     not config.min_cycle_seconds <= t - cycle.start <= config.max_cycle_seconds or
                     raw_return < config.min_raw_return_deg):
-                self._reject(cycle, t, "incomplete timing or raw tilt return")
+                self._reject(cycle, t, (
+                    f"incomplete timing/raw return (peak={cycle.peak:.1f}deg, "
+                    f"raw_return={raw_return:.1f}deg, cycle={t-cycle.start:.2f}s, "
+                    f"ascent={t-cycle.bottom:.2f}s)"))
                 return None
             choices = []
             for axis, name in enumerate(AXES):
@@ -398,7 +475,9 @@ class StreamingSquatDetector:
                         choices.append((aligned_correlation, strength, axis,
                                         gyro_sign, descent, ascent))
             if not choices:
-                self._reject(cycle, t, "weak directional gyroscope evidence")
+                self._reject(cycle, t, (
+                    f"weak directional gyroscope evidence (peak={cycle.peak:.1f}deg, "
+                    f"raw_return={raw_return:.1f}deg)"))
                 return None
             correlation, strength, axis, gyro_sign, descent, ascent = max(choices)
             if correlation < 0.5:
@@ -408,7 +487,21 @@ class StreamingSquatDetector:
                 self.session_id, self.count + 1, cycle.start, cycle.bottom, t,
                 cycle.peak, raw_return, descent, ascent,
                 "positive" if sign == 1 else "negative", AXES[axis], gyro_sign,
+                t - cycle.bottom, t - cycle.start, cycle.bottom - cycle.start,
                 t - cycle.bottom)
+            gyro_peak = max(descent, ascent)
+            prior_typical_peak = (median(self._recent_confirmed_gyro_peaks)
+                                  if len(self._recent_confirmed_gyro_peaks) >= 3 else None)
+            if prior_typical_peak is not None and gyro_peak > 3 * prior_typical_peak:
+                candidate = event.as_dict()
+                candidate["reason"] = (
+                    f"directional gyro peak {gyro_peak:.1f}deg/s exceeds 3x "
+                    f"prior confirmed median {prior_typical_peak:.1f}deg/s")
+                self._uncertain_candidates.append(candidate)
+                cycle.clear()
+                self._cooldown_until = t + config.cooldown_seconds
+                return None
+            self._recent_confirmed_gyro_peaks.append(gyro_peak)
             cycle.clear()
             self._cooldown_until = t + config.cooldown_seconds
             return event

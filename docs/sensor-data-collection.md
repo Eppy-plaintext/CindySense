@@ -16,31 +16,36 @@ python tools/collect_sensor_data.py --config tools/collector.local.json probe
 
 Run `probe` before recording. It verifies the container listing and attempts to parse its newest CIN. A 403 means the origin lacks read privilege. If the listing succeeds but parsing fails, inspect the actual CIN format before recording.
 
-## Record three sessions
+## Consistent recording protocol
 
-Keep the chest sensor in the same position for all sessions. Start each command just before the activity. Stop moving before the command's final three-second upload wait; keep the rest posture through that wait. Each command creates a new CSV and refuses to overwrite an existing session ID.
+Keep the sensor in the same chest position and orientation for every session.
+Start collection before moving. For each squat trial, stand still for five
+seconds, perform exactly five slow squats (about two seconds down, one second
+paused at the bottom, and two seconds up), then stand still for five seconds.
+This is a 35-second recording. Do not press Ctrl+C early; the duration includes
+the full post-exercise rest. The collector adds its configured final upload
+settle time before saving the CSV.
 
-1. **Rest:** Stand still for at least 10 seconds.
+```powershell
+python tools/collect_sensor_data.py --config tools/collector.local.json record --label squat --session-id squat-slow-01 --duration 35
+python tools/replay_squat_stream.py data/recordings/squat-slow-01.csv --calibration-mode initial_standing --standing-calibration-seconds 5
+```
 
-   ```powershell
-   python tools/collect_sensor_data.py --config tools/collector.local.json record --label rest --session-id rest-01 --duration 10
-   ```
+Record a separate rest-only validation trial with the sensor in the same
+position. Remain standing and still for the full 35 seconds; do not perform
+squats. Use a distinct session ID:
 
-2. **Five slow squats:** Start the command, perform five slow squats, return to standing, then press Ctrl+C. The label remains `squat`; the session ID records the pace.
+```powershell
+python tools/collect_sensor_data.py --config tools/collector.local.json record --label rest --session-id rest-validation-01 --duration 35
+python tools/replay_squat_stream.py data/recordings/rest-validation-01.csv --calibration-mode initial_standing --standing-calibration-seconds 5
+```
 
-   ```powershell
-   python tools/collect_sensor_data.py --config tools/collector.local.json record --label squat --session-id squat-slow-01
-   ```
-
-3. **Five normal-speed squats:** Repeat at a normal pace, then press Ctrl+C once standing.
-
-   ```powershell
-   python tools/collect_sensor_data.py --config tools/collector.local.json record --label squat --session-id squat-normal-01
-   ```
+Each command creates a new CSV and refuses to overwrite an existing session ID.
+Keep the final standing rest through the collector's upload settle wait.
 
 The CSV contains `session_id`, `label`, `device_id`, raw `sample_t`, normalized `sample_time_seconds`, `cin_created_at`, `cin_ri`, and `ax`, `ay`, `az`, `gx`, `gy`, `gz`. Set `timestamp_unit` to `ms` or `s` to match numeric `t`. Numeric timestamps are not assumed to be UTC; they may be milliseconds since ESP32 boot. Timezone-aware ISO 8601 `t` values are also accepted. `cin_created_at` is the server's creation timestamp and may lag the sample time.
 
-The recorder checks for batches other than 50 samples, unexpected sample rate, missing fields, malformed `con` JSON, repeated timestamps, and gaps greater than 1.5 times the expected 20 ms interval. It skips malformed CINs and prints warnings. A device reboot can reset `t`; start a new session after a reboot.
+The recorder checks for batches other than 50 samples, unexpected sample rate, missing fields, malformed `con` JSON, repeated timestamps, and gaps greater than 1.5 times the expected 20 ms interval. It skips malformed CINs and prints warnings. It checks collected samples in original acquisition order before sorting. If a device timestamp moves backwards or the firmware boot nonce changes, it reports the adjacent samples, saves the untouched acquisition order as `<session-id>.invalid.csv` for diagnosis, and refuses to write the normal replay CSV. Do not replay the invalid file as a valid session. Start a new session after a reboot; do not combine samples from different boots.
 
 ## Listing method and limits
 

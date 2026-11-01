@@ -287,6 +287,30 @@ def parse_cin(payload: dict, unit: str, expected_count: int) -> tuple[list[Sampl
 
 
 def order_and_check(rows: list[Sample], rate: float = 50) -> tuple[list[Sample], list[str]]:
+    # Inspect acquisition order before sorting. Firmware CIN names include a
+    # boot nonce, which also exposes resets when the new clock overlaps old time.
+    original_previous: dict[str, Sample] = {}
+    original_seen: set[tuple[str, float]] = set()
+    for index, row in enumerate(rows):
+        key = (row.device_id, row.sample_time_seconds)
+        previous = original_previous.get(row.device_id)
+        if previous is not None:
+            previous_boot = _firmware_boot_identity(previous.cin_ri)
+            current_boot = _firmware_boot_identity(row.cin_ri)
+            boot_changed = (previous_boot is not None and current_boot is not None
+                            and previous_boot != current_boot)
+            timestamp_reversed = (row.sample_time_seconds < previous.sample_time_seconds
+                                  and key not in original_seen)
+            if boot_changed or timestamp_reversed:
+                reason = ("firmware boot identity changed" if boot_changed else
+                          "sample timestamp moved backwards")
+                return rows.copy(), [(
+                    f"timestamp reset detected in original sample order at row {index + 1}: "
+                    f"{reason}; {previous.sample_t} ({previous.cin_ri}) -> "
+                    f"{row.sample_t} ({row.cin_ri}); original order preserved")]
+        original_seen.add(key)
+        original_previous[row.device_id] = row
+
     ordered = sorted(rows, key=lambda row: (row.sample_time_seconds, row.cin_ri))
     unique: list[Sample] = []
     seen: set[tuple[str, float]] = set()
@@ -305,6 +329,13 @@ def order_and_check(rows: list[Sample], rate: float = 50) -> tuple[list[Sample],
         unique.append(row)
         previous = row
     return unique, warnings
+
+
+def _firmware_boot_identity(cin_ri: str) -> str | None:
+    """Extract MAC and boot nonce from firmware CIN names when present."""
+    match = re.search(r"(?:^|/)cs-([0-9a-f]{12})-([0-9a-f]{8})-[0-9a-f]{8}$",
+                      cin_ri, re.IGNORECASE)
+    return f"{match.group(1).lower()}:{match.group(2).lower()}" if match else None
 
 
 def write_csv(path: Path, rows: list[Sample], session_id: str, label: str) -> None:
@@ -399,6 +430,16 @@ def record(reader: TinyIoTReader, label: str, session_id: str,
             warnings.append(f"{ref}: still unread after final poll; batch lost")
         ordered, checks = order_and_check(batches)
         warnings.extend(checks)
+        reset_warning = next((warning for warning in checks
+                              if warning.startswith("timestamp reset detected")), None)
+        if reset_warning:
+            quarantine = output.with_name(f"{session_id}.invalid.csv")
+            write_csv(quarantine, ordered, session_id, label)
+            for warning in warnings:
+                print(f"WARNING: {warning}", file=sys.stderr)
+            raise CollectorError(
+                f"{reset_warning}; session rejected, original-order evidence saved to "
+                f"{quarantine}, and normal replay CSV was not written")
         if not ordered:
             warnings.append("No valid samples were recorded")
         write_csv(output, ordered, session_id, label)

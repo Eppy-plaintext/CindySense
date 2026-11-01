@@ -150,6 +150,62 @@ class StreamingSquatDetectorTests(unittest.TestCase):
         self.assertEqual(detector.get_state()["repetitions"], 0)
         self.assertEqual(detector.get_state()["session_id"], "new-session")
 
+    def test_initial_standing_calibration_requires_stable_observed_window(self) -> None:
+        config = StreamingConfig(calibration_mode="initial_standing",
+                                 standing_calibration_seconds=1.0,
+                                 max_warmup_seconds=2.0)
+        rows = samples()
+        detector = StreamingSquatDetector("standing", config)
+        self.assertEqual(detector.process_batch(rows[:49]), [])
+        self.assertEqual(detector.get_state()["calibration"], "warming_up")
+        events = detector.process_batch(rows[49:])
+        self.assertEqual(len(events), 3)
+        quality = detector.get_state()["calibration_quality"]
+        self.assertTrue(quality["counts_enabled"])
+        self.assertEqual(quality["mode"], "initial_standing")
+
+    def test_uncertain_provisional_reference_never_confirms_repetitions(self) -> None:
+        detector = StreamingSquatDetector(
+            "uncalibrated",
+            StreamingConfig(max_warmup_seconds=1.0, min_quiet_samples=1000))
+        rows = samples()
+        events = detector.process_batch(rows)
+        state = detector.get_state()
+        self.assertEqual(state["calibration"], "uncertain")
+        self.assertFalse(state["calibration_quality"]["counts_enabled"])
+        self.assertEqual(events, [])
+        self.assertEqual(state["repetitions"], 0)
+
+    def test_initial_standing_timeout_freezes_calibration_quality(self) -> None:
+        config = StreamingConfig(calibration_mode="initial_standing",
+                                 standing_calibration_seconds=2.0,
+                                 max_warmup_seconds=1.0)
+        detector = StreamingSquatDetector("calibration-timeout", config)
+
+        def row(index: int, gx: float) -> dict:
+            return {
+                "sample_time_seconds": index * 0.02, "sample_t": index * 20,
+                "ax": 0.0, "ay": -9.81, "az": 0.0,
+                "gx": gx, "gy": 0.0, "gz": 0.0,
+            }
+
+        # Observe a short quiet interval, then movement before the required
+        # two-second standing interval can complete.
+        for index in range(51):
+            detector.process_sample(row(index, 0.0 if index < 30 else 30.0))
+        self.assertEqual(detector.get_state()["calibration"], "uncertain")
+        at_timeout = detector.get_state()["calibration_quality"].copy()
+        self.assertGreater(at_timeout["longest_standing_run_samples"], 0)
+        self.assertLess(at_timeout["longest_standing_run_samples"], 100)
+
+        # Later rest samples must not make the failed initial calibration look
+        # more complete or stable than it was at the timeout decision.
+        for index in range(51, 151):
+            detector.process_sample(row(index, 0.0))
+        after_recording = detector.get_state()["calibration_quality"]
+        self.assertEqual(after_recording, at_timeout)
+        self.assertFalse(after_recording["counts_enabled"])
+
     def test_invalid_sample_rejected(self) -> None:
         detector = StreamingSquatDetector("session")
         row = samples()[0]
