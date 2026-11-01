@@ -142,14 +142,25 @@ class TinyIoTReader:
             "X-M2M-RVI": "4",
             "Accept": "application/json",
         }, method="GET")
-        try:
-            with urlopen(request, timeout=10) as response:
-                rsc = response.headers.get("X-M2M-RSC", "")
-                data = response.read()
-        except HTTPError as exc:
-            raise CollectorError(f"GET {url}: HTTP {exc.code}; check read/discovery privileges") from exc
-        except URLError as exc:
-            raise CollectorError(f"GET {url}: {exc.reason}") from exc
+        for attempt in range(3):
+            try:
+                with urlopen(request, timeout=10) as response:
+                    rsc = response.headers.get("X-M2M-RSC", "")
+                    data = response.read()
+                break
+            except HTTPError as exc:
+                failure = exc
+                retryable = exc.code in (404, 408, 429, 500, 502, 503, 504)
+                reason = f"HTTP {exc.code}"
+            except (URLError, TimeoutError) as exc:
+                failure = exc
+                retryable = True
+                reason = str(getattr(exc, "reason", exc))
+            if not retryable or attempt == 2:
+                raise CollectorError(f"GET {url}: {reason} after {attempt + 1} attempt(s)") from failure
+            print(f"WARNING: GET {url}: {reason}; retrying ({attempt + 1}/2)",
+                  file=sys.stderr)
+            time.sleep(0.1 * (attempt + 1))
         if rsc and not rsc.startswith("2"):
             raise CollectorError(f"GET {path}: oneM2M response status {rsc}")
         try:
@@ -188,7 +199,8 @@ class TinyIoTReader:
                 if uri == stop_at:
                     return refs
                 if fallback_known is not None and uri in fallback_known:
-                    fallback_cutoff = len(refs)
+                    if fallback_cutoff is None:
+                        fallback_cutoff = len(refs)
                 if known is None or uri not in known:
                     refs.append(uri)
             if first_page_only:
@@ -312,20 +324,35 @@ def record(reader: TinyIoTReader, label: str, session_id: str,
     output = config.output_dir / f"{session_id}.csv"
     if output.exists():
         raise CollectorError(f"Output already exists: {output}")
-    baseline_refs = reader.list_cins(first_page_only=True)
-    baseline_boundary = baseline_refs[0] if baseline_refs else None
-    print(f"Baseline: {len(baseline_refs)} recent CINs. Recording {label} as {session_id}.")
-    seen = set(baseline_refs)
+    baseline_refs = reader.list_cins()
+    print(f"Baseline: {len(baseline_refs)} retained CINs. Recording {label} as {session_id}.")
+    observed = set(baseline_refs)
+    previous_window = set(baseline_refs)
+    pending: set[str] = set()
+    processed: set[str] = set()
     batches: list[Sample] = []
     warnings: list[str] = []
     selected_device = config.device_id
     started = time.monotonic()
 
     def poll() -> None:
-        nonlocal selected_device
-        refs = reader.list_cins(known=seen, stop_at=baseline_boundary,
-                                fallback_known=seen.difference(baseline_refs))
-        for ref in reversed(refs):
+        nonlocal selected_device, previous_window
+        current_refs = reader.list_cins()
+        current_window = set(current_refs)
+        if previous_window and current_refs and not previous_window.intersection(current_window):
+            warnings.append("Discovery windows did not overlap; CINs may have expired "
+                            "between polls, so sample continuity is unverified")
+        for ref in pending.difference(current_window):
+            warnings.append(f"{ref}: disappeared before retrieval; batch lost")
+            pending.remove(ref)
+        new_refs = [ref for ref in current_refs if ref not in observed]
+        pending.update(new_refs)
+        observed.update(current_window)
+        previous_window = current_window
+        retrieved = 0
+        for ref in reversed(current_refs):
+            if ref not in pending or ref in processed:
+                continue
             try:
                 payload = reader.get(ref)
             except CollectorError as exc:
@@ -336,22 +363,28 @@ def record(reader: TinyIoTReader, label: str, session_id: str,
                                                   config.expected_samples_per_batch)
             except ValueError as exc:
                 warnings.append(f"{ref}: {exc}; skipped")
-                seen.add(ref)
+                pending.remove(ref)
+                processed.add(ref)
                 continue
-            seen.add(ref)
+            pending.remove(ref)
+            processed.add(ref)
             if not selected_device:
                 selected_device = rows[0].device_id
             if rows[0].device_id != selected_device:
                 warnings.append(f"{ref}: device {rows[0].device_id} differs from {selected_device}; skipped")
                 continue
             batches.extend(rows)
+            retrieved += 1
             warnings.extend(f"{ref}: {message}" for message in batch_warnings)
-        if refs:
-            print(f"Retrieved {len(refs)} new CINs; {len(batches)} raw samples.")
+        if retrieved:
+            print(f"Retrieved {retrieved} CINs; {len(batches)} raw samples.")
 
     try:
         while duration is None or time.monotonic() - started < duration:
-            poll()
+            try:
+                poll()
+            except CollectorError as exc:
+                warnings.append(f"Discovery failed ({exc}); will retry next poll")
             time.sleep(config.poll_seconds)
     except KeyboardInterrupt:
         print("Recording stopped. Waiting for the final upload...")
@@ -362,6 +395,8 @@ def record(reader: TinyIoTReader, label: str, session_id: str,
             poll()
         except CollectorError as exc:
             warnings.append(f"Final poll failed: {exc}")
+        for ref in sorted(pending):
+            warnings.append(f"{ref}: still unread after final poll; batch lost")
         ordered, checks = order_and_check(batches)
         warnings.extend(checks)
         if not ordered:

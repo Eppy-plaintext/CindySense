@@ -1,9 +1,10 @@
 import csv
 import json
+from urllib.error import HTTPError
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 from tools.collect_sensor_data import (CollectorError, Config, TinyIoTReader,
                                        order_and_check, parse_cin, record)
@@ -208,6 +209,29 @@ class CollectorTests(unittest.TestCase):
                          "http://localhost:3000/TinyIoT/CindySense_AE/SensorData/"
                          "4-20261029T122259%2C1250176")
 
+    def test_retries_transient_http_404_then_retrieves_cin(self):
+        reader = TinyIoTReader(self.config("tmp"))
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.headers = {"X-M2M-RSC": "2000"}
+        response.read.return_value = b'{"m2m:cin":{"ri":"one"}}'
+        missing = HTTPError("http://localhost:3000", 404, "not found", None, None)
+        with patch("tools.collect_sensor_data.urlopen", side_effect=[missing, response]) as open_url, \
+             patch("tools.collect_sensor_data.time.sleep") as sleep:
+            payload = reader.get("CindySense_AE/SensorData/4-20261029T122259,1250176")
+        self.assertEqual(payload["m2m:cin"]["ri"], "one")
+        self.assertEqual(open_url.call_count, 2)
+        sleep.assert_called_once_with(0.1)
+
+    def test_http_404_retries_are_bounded(self):
+        reader = TinyIoTReader(self.config("tmp"))
+        with patch("tools.collect_sensor_data.urlopen",
+                   side_effect=HTTPError("http://localhost:3000", 404, "not found", None, None)) as open_url, \
+             patch("tools.collect_sensor_data.time.sleep"):
+            with self.assertRaisesRegex(CollectorError, "HTTP 404 after 3 attempt"):
+                reader.get("CindySense_AE/SensorData/missing")
+        self.assertEqual(open_url.call_count, 3)
+
     def test_records_only_new_cin_to_csv(self):
         with tempfile.TemporaryDirectory(dir="tmp") as directory:
             reader = TinyIoTReader(self.config(directory))
@@ -247,8 +271,7 @@ class CollectorTests(unittest.TestCase):
             self.assertEqual(len(rows), 200)
             self.assertEqual([rows[i]["sample_t"] for i in (0, 50, 100, 150)],
                              ["1000", "2000", "3000", "4000"])
-            self.assertEqual(listing.call_args_list[1].kwargs["stop_at"],
-                             prefix + "baseline")
+            self.assertEqual(listing.call_args_list[1].kwargs, {})
 
     def test_records_new_cin_after_oldest_baseline_cin_is_evicted(self):
         with tempfile.TemporaryDirectory(dir="tmp") as directory:
@@ -306,7 +329,7 @@ class CollectorTests(unittest.TestCase):
                 if sleeps == 1:
                     retained[:] = ["new-1", "baseline"]
                 elif sleeps == 2:
-                    retained[:] = ["new-2", "new-1", "historical"]
+                    retained[:] = ["new-2", "new-1"]
                 else:
                     raise KeyboardInterrupt
 
@@ -318,6 +341,101 @@ class CollectorTests(unittest.TestCase):
             self.assertEqual(len(rows), 100)
             self.assertEqual([rows[0]["sample_t"], rows[50]["sample_t"]],
                              ["1000", "2000"])
+
+    def test_rolling_retention_collects_45_unique_batches(self):
+        with tempfile.TemporaryDirectory(dir="tmp") as directory:
+            reader = TinyIoTReader(self.config(directory))
+            upload = 0
+            names = ["old"]
+
+            def fake_list():
+                return [f"CindySense_AE/SensorData/{name}" for name in reversed(names[-15:])]
+
+            def fake_get(ref):
+                index = int(ref.rsplit("-", 1)[-1])
+                payload = cin(range((index - 1) * 1000, index * 1000, 20))
+                payload["m2m:cin"]["ri"] = ref.rsplit("/", 1)[-1]
+                return payload
+
+            def advance_upload(_seconds):
+                nonlocal upload
+                upload += 1
+                names.append(f"new-{upload}")
+                if upload == 45:
+                    raise KeyboardInterrupt
+
+            with patch.object(reader, "list_cins", side_effect=fake_list), \
+                 patch.object(reader, "get", side_effect=fake_get) as get, \
+                 patch("tools.collect_sensor_data.time.sleep", side_effect=advance_upload):
+                output = record(reader, "squat", "forty-five-seconds", None)
+            with output.open(newline="", encoding="utf-8") as file:
+                rows = list(csv.DictReader(file))
+            self.assertEqual(len(rows), 2250)
+            self.assertEqual(len({row["sample_t"] for row in rows}), 2250)
+            self.assertEqual(get.call_count, 45)
+
+    def test_disappearing_baseline_and_temporary_retrieval_failure(self):
+        with tempfile.TemporaryDirectory(dir="tmp") as directory:
+            reader = TinyIoTReader(self.config(directory))
+            prefix = "CindySense_AE/SensorData/"
+            listings = [[prefix + "baseline"],
+                        [prefix + "new-1", prefix + "baseline"],
+                        [prefix + "new-2", prefix + "new-1"],
+                        [prefix + "new-2", prefix + "new-1"],
+                        [prefix + "new-2", prefix + "new-1"]]
+            calls = {}
+
+            def fake_get(ref):
+                calls[ref] = calls.get(ref, 0) + 1
+                if ref.endswith("new-1") and calls[ref] == 1:
+                    raise CollectorError("HTTP 404 after 3 attempts")
+                index = int(ref.rsplit("-", 1)[-1])
+                payload = cin(range((index - 1) * 1000, index * 1000, 20))
+                payload["m2m:cin"]["ri"] = ref.rsplit("/", 1)[-1]
+                return payload
+
+            sleeps = 0
+
+            def advance(_seconds):
+                nonlocal sleeps
+                sleeps += 1
+                if sleeps == 3:
+                    raise KeyboardInterrupt
+
+            with patch.object(reader, "list_cins", side_effect=listings), \
+                 patch.object(reader, "get", side_effect=fake_get), \
+                 patch("tools.collect_sensor_data.time.sleep", side_effect=advance):
+                output = record(reader, "squat", "retry-after-404", None)
+            with output.open(newline="", encoding="utf-8") as file:
+                rows = list(csv.DictReader(file))
+            self.assertEqual(len(rows), 100)
+            self.assertEqual(calls[prefix + "new-1"], 2)
+            self.assertEqual(calls[prefix + "new-2"], 1)
+
+    def test_record_recovers_from_failed_discovery_poll(self):
+        with tempfile.TemporaryDirectory(dir="tmp") as directory:
+            reader = TinyIoTReader(self.config(directory))
+            prefix = "CindySense_AE/SensorData/"
+            listings = [[prefix + "baseline"], CollectorError("HTTP 503 after 3 attempts"),
+                        [prefix + "new", prefix + "baseline"],
+                        [prefix + "new", prefix + "baseline"],
+                        [prefix + "new", prefix + "baseline"]]
+            sleeps = 0
+
+            def advance(_seconds):
+                nonlocal sleeps
+                sleeps += 1
+                if sleeps == 3:
+                    raise KeyboardInterrupt
+
+            with patch.object(reader, "list_cins", side_effect=listings), \
+                 patch.object(reader, "get", return_value=cin(range(0, 1000, 20))) as get, \
+                 patch("tools.collect_sensor_data.time.sleep", side_effect=advance):
+                output = record(reader, "squat", "listing-retry", None)
+            with output.open(newline="", encoding="utf-8") as file:
+                rows = list(csv.DictReader(file))
+            self.assertEqual(len(rows), 50)
+            get.assert_called_once_with(prefix + "new")
 
 
 if __name__ == "__main__":

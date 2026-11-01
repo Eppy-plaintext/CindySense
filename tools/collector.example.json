@@ -1,9 +1,10 @@
+
 {
   "base_url": "http://localhost:3000/TinyIoT",
-  "origin": "",
+  "origin": "CAdmin",
   "container": "CindySense_AE/SensorData",
   "output_dir": "../data/recordings",
-  "device_id": "",
+  "device_id": "CindySense_ESP32",
   "poll_seconds": 1,
   "settle_seconds": 3,
   "page_size": 150,
