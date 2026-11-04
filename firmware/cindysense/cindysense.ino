@@ -6,32 +6,28 @@
 #include <esp_system.h>
 #include <ctype.h>
 #include <math.h>
+#include "config.h"
+#include "batch_verification.h"
 
 // Arduino generates function prototypes before the type definitions below.
 struct BufferStats;
-enum VerificationResult : int;
 
 // =====================================
 // 1. CONFIGURATION
 // =====================================
 
-// Enter your Wi-Fi credentials here
-const char* WIFI_SSID = "eppy";
-const char* WIFI_PASSWORD = "zafriakhtar2026";
-
-// TinyIoT server
-const char* TINYIOT_URL =
-  "http://172.30.1.24:3000/TinyIoT/CindySense_AE/SensorData";
-
-const char* ORIGINATOR = "CAdmin";
+// Keep Wi-Fi credentials in the ignored local config.h.
+// TinyIoT URL and originator are configured below.
+const char* WIFI_SSID = CINDYSENSE_WIFI_SSID;
+const char* WIFI_PASSWORD = CINDYSENSE_WIFI_PASSWORD;
+const char* TINYIOT_URL = CINDYSENSE_TINYIOT_URL;
+const char* ORIGINATOR = CINDYSENSE_ORIGINATOR;
 
 // MPU6050 I2C address
 const uint8_t MPU_ADDR = 0x68;
 
-// Sampling and batching
 const int SAMPLE_INTERVAL_MS = 20;
-const int BATCH_SIZE = 50;
-// 30 seconds of samples. A pending 50-sample batch is held separately.
+const int BATCH_SIZE = 100;
 const int BUFFER_SIZE = 1500;
 
 // HTTP retry configuration
@@ -43,16 +39,6 @@ const int MAX_RETRY_DELAY_MS = 8000;
 // 2. SENSOR STRUCTURE
 // =====================================
 
-struct SensorSample {
-  uint32_t timestamp;
-  float ax;
-  float ay;
-  float az;
-  float gx;
-  float gy;
-  float gz;
-};
-
 // Shared ring buffer
 SensorSample sampleBuffer[BUFFER_SIZE];
 SensorSample uploadBatch[BATCH_SIZE];
@@ -62,6 +48,8 @@ int bufferTail = 0;
 int bufferCount = 0;
 
 uint32_t droppedSamples = 0;
+uint32_t firstDroppedTimestamp = 0;
+uint32_t lastDroppedTimestamp = 0;
 uint32_t i2cReadFailures = 0;
 uint32_t invalidAccelerationFrames = 0;
 uint32_t missedSampleSlots = 0;
@@ -336,6 +324,9 @@ bool storeSample(const SensorSample &s) {
   bool overflow = bufferCount >= BUFFER_SIZE;
   if (overflow) {
     // Remove oldest sample on overflow
+    uint32_t evictedTimestamp = sampleBuffer[bufferTail].timestamp;
+    if (droppedSamples == 0) firstDroppedTimestamp = evictedTimestamp;
+    lastDroppedTimestamp = evictedTimestamp;
     bufferTail =
       (bufferTail + 1) % BUFFER_SIZE;
 
@@ -394,6 +385,8 @@ struct BufferStats {
   int buffered;
   int peak;
   uint32_t dropped;
+  uint32_t firstDroppedAt;
+  uint32_t lastDroppedAt;
   uint32_t readFailures;
   uint32_t invalidFrames;
   uint32_t missedSlots;
@@ -405,6 +398,8 @@ BufferStats getBufferStats() {
   stats.buffered = bufferCount;
   stats.peak = peakBufferCount;
   stats.dropped = droppedSamples;
+  stats.firstDroppedAt = firstDroppedTimestamp;
+  stats.lastDroppedAt = lastDroppedTimestamp;
   stats.readFailures = i2cReadFailures;
   stats.invalidFrames = invalidAccelerationFrames;
   stats.missedSlots = missedSampleSlots;
@@ -519,10 +514,12 @@ void sensorTask(void* parameter) {
                       (unsigned long)(stats.missedSlots - lastReportedMissedSlots));
         lastReportedMissedSlots = stats.missedSlots;
       }
-      Serial.printf("[SENSOR] buffered=%d/%d peak=%d dropped=%lu i2c_failures=%lu "
+      Serial.printf("[SENSOR] buffered=%d/%d peak=%d dropped=%lu dropped_ts=%lu..%lu i2c_failures=%lu "
                     "invalid_frames=%lu missed_slots=%lu\n",
                     stats.buffered, BUFFER_SIZE, stats.peak,
                     (unsigned long)stats.dropped,
+                    (unsigned long)stats.firstDroppedAt,
+                    (unsigned long)stats.lastDroppedAt,
                     (unsigned long)stats.readFailures,
                     (unsigned long)stats.invalidFrames,
                     (unsigned long)stats.missedSlots);
@@ -557,34 +554,14 @@ String buildPayload(int count, const String &batchName) {
   data += "\"samples\":[";
 
   for (int i = 0; i < count; i++) {
-    if (i > 0) {
-      data += ",";
-    }
-
     SensorSample &s = uploadBatch[i];
-
-    data += "{\"t\":";
-    data += String(s.timestamp);
-
-    data += ",\"ax\":";
-    data += String(s.ax, 3);
-
-    data += ",\"ay\":";
-    data += String(s.ay, 3);
-
-    data += ",\"az\":";
-    data += String(s.az, 3);
-
-    data += ",\"gx\":";
-    data += String(s.gx, 3);
-
-    data += ",\"gy\":";
-    data += String(s.gy, 3);
-
-    data += ",\"gz\":";
-    data += String(s.gz, 3);
-
-    data += "}";
+    char sampleJson[160];
+    int written = snprintf(sampleJson, sizeof(sampleJson),
+                           "%s{\"t\":%lu,\"ax\":%.3f,\"ay\":%.3f,\"az\":%.3f,\"gx\":%.3f,\"gy\":%.3f,\"gz\":%.3f}",
+                           i ? "," : "", (unsigned long)s.timestamp,
+                           s.ax, s.ay, s.az, s.gx, s.gy, s.gz);
+    if (written < 0 || written >= (int)sizeof(sampleJson)) return "";
+    data += sampleJson;
   }
 
   data += "]}";
@@ -623,40 +600,9 @@ String makeBatchName(uint32_t sequence) {
   return String(name);
 }
 
-// Extract a JSON string literal without changing its escapes. TinyIoT stores
-// our con as a string; an exact comparison fails closed if readback differs.
-bool conLiteral(const String &json, String &literal) {
-  int key = json.indexOf("\"con\"");
-  if (key < 0) return false;
-  int colon = json.indexOf(':', key + 5);
-  if (colon < 0) return false;
-  int start = colon + 1;
-  while (start < json.length() && isspace((unsigned char)json[start])) start++;
-  if (start >= json.length() || json[start] != '"') return false;
-  bool escaped = false;
-  for (int i = start + 1; i < json.length(); i++) {
-    char ch = json[i];
-    if (escaped) {
-      escaped = false;
-    } else if (ch == '\\') {
-      escaped = true;
-    } else if (ch == '"') {
-      literal = json.substring(start, i + 1);
-      return true;
-    }
-  }
-  return false;
-}
+static char decodedVerificationContent[24000];
 
-enum VerificationResult : int {
-  VERIFY_MATCH,
-  VERIFY_NOT_FOUND,
-  VERIFY_UNKNOWN,
-  VERIFY_MISMATCH
-};
-
-VerificationResult verifyStoredBatch(const String &batchName,
-                                     const String &payload) {
+VerificationResult verifyStoredBatch(const String &batchName, int sampleCount) {
   if (WiFi.status() != WL_CONNECTED) return VERIFY_UNKNOWN;
   WiFiClient client;
   HTTPClient http;
@@ -665,7 +611,7 @@ VerificationResult verifyStoredBatch(const String &batchName,
     return VERIFY_UNKNOWN;
   }
   http.setTimeout(HTTP_TIMEOUT_MS);
-  http.setConnectTimeout(5000);
+  http.setConnectTimeout(1500);
   http.addHeader("X-M2M-Origin", ORIGINATOR);
   http.addHeader("X-M2M-RVI", "4");
   http.addHeader("X-M2M-RI", nextRequestId());
@@ -679,15 +625,13 @@ VerificationResult verifyStoredBatch(const String &batchName,
     result = VERIFY_NOT_FOUND;
   } else if (code == 200) {
     String stored = http.getString();
-    String expectedCon, storedCon;
-    if (stored.indexOf("\"m2m:cin\"") >= 0 &&
-        conLiteral(payload, expectedCon) && conLiteral(stored, storedCon) &&
-        expectedCon == storedCon) {
-      result = VERIFY_MATCH;
-    } else {
+    result = verifyBatchHttpResponse(
+        code, stored.c_str(), stored.length(), batchName.c_str(),
+        uploadBatch, (size_t)sampleCount, decodedVerificationContent,
+        sizeof(decodedVerificationContent));
+    if (result == VERIFY_MISMATCH) {
       Serial.printf("ERROR: named CIN %s exists with different or unreadable content; upload paused\n",
                     batchName.c_str());
-      result = VERIFY_MISMATCH;
     }
   }
   http.end();
@@ -714,7 +658,7 @@ int sendToTinyIoT(
   }
 
   http.setTimeout(HTTP_TIMEOUT_MS);
-  http.setConnectTimeout(5000);
+  http.setConnectTimeout(1500);
   http.setReuse(false);
 
   http.addHeader(
@@ -758,6 +702,16 @@ int sendToTinyIoT(
     "[HTTP] Status: %d | Duration: %lu ms\n",
     code,
     duration
+  );
+
+  // Diagnostics: response duration, queued samples, and free ESP32 heap.
+  Serial.printf(
+    "[PERF] status=%d duration=%lu ms buffer=%d/%d heap=%u\n",
+    code,
+    duration,
+    getBufferCount(),
+    BUFFER_SIZE,
+    (unsigned int)ESP.getFreeHeap()
   );
 
   if (code > 0 && code != 201) {
@@ -838,7 +792,7 @@ void networkTask(void* parameter) {
 
     bool confirmed = false;
     if (mustVerify) {
-      VerificationResult result = verifyStoredBatch(pendingName, pendingPayload);
+      VerificationResult result = verifyStoredBatch(pendingName, pendingCount);
       if (result == VERIFY_MATCH) {
         confirmed = true;
       } else if (result == VERIFY_NOT_FOUND) {
@@ -864,11 +818,13 @@ void networkTask(void* parameter) {
 
     BufferStats stats = getBufferStats();
     Serial.printf("[UPLOAD] batch=%s code=%d attempts=%lu samples=%d buffered=%d/%d "
-                  "peak=%d dropped=%lu i2c_failures=%lu invalid_frames=%lu "
+                  "peak=%d dropped=%lu dropped_ts=%lu..%lu i2c_failures=%lu invalid_frames=%lu "
                   "missed_slots=%lu free_heap=%u\n",
                   pendingName.c_str(), code, (unsigned long)batchAttempts,
                   pendingCount, stats.buffered, BUFFER_SIZE, stats.peak,
                   (unsigned long)stats.dropped,
+                  (unsigned long)stats.firstDroppedAt,
+                  (unsigned long)stats.lastDroppedAt,
                   (unsigned long)stats.readFailures,
                   (unsigned long)stats.invalidFrames,
                   (unsigned long)stats.missedSlots, (unsigned int)ESP.getFreeHeap());
@@ -946,9 +902,9 @@ void setup() {
     WIFI_PASSWORD
   );
   bootNonce = esp_random();
-  Serial.printf("[UPLOAD] Boot nonce: %08lx, buffer capacity: %d samples (%d seconds)\n",
+  Serial.printf("[UPLOAD] Boot nonce: %08lx, buffer capacity: %d samples (%d seconds); batch=%d\n",
                 (unsigned long)bootNonce, BUFFER_SIZE,
-                BUFFER_SIZE / (1000 / SAMPLE_INTERVAL_MS));
+                BUFFER_SIZE / (1000 / SAMPLE_INTERVAL_MS), BATCH_SIZE);
 
   Serial.println("Connecting to Wi-Fi...");
 

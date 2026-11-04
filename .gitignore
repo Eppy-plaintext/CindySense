@@ -60,3 +60,6 @@ Thumbs.db
 # IDE
 .idea/
 .vscode/
+
+# Local ESP32 Wi-Fi credentials
+firmware/cindysense/config.h

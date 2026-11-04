@@ -1,0 +1,9 @@
+ docs/sensor-data-collection.md          |   6 [32m+[m[31m-[m
+ firmware/cindysense.ino                 | 331 [32m+++++++++++++++[m[31m-----[m
+ tools/collect_sensor_data.py            |  79 [32m+++[m[31m--[m
+ tools/collector.example.json            |   5 [32m+[m[31m-[m
+ tools/detect_squats.py                  | 536 [32m++++++++++++++++++++++++++++++++[m
+ tools/plot_sensor_data.py               | 134 [32m++++++++[m
+ tools/tests/test_collect_sensor_data.py | 126 [32m+++++++[m[31m-[m
+ tools/tests/test_detect_squats.py       | 227 [32m++++++++++++++[m
+ 8 files changed, 1341 insertions(+), 103 deletions(-)
