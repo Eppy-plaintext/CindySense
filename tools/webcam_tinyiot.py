@@ -25,6 +25,7 @@ DEFAULT_BASE = os.environ.get("CINDYSENSE_TINYIOT_URL", "http://localhost:3000/T
 DEFAULT_ORIGIN = os.environ.get("CINDYSENSE_TINYIOT_ORIGIN", "CAdmin")
 AE_NAME = "Webcam_AE"
 CNT_NAME = "PoseData"
+EVENT_CONTAINER = "CindySense_AE/RepetitionCount"
 
 
 class TinyIoTError(RuntimeError):
@@ -140,6 +141,41 @@ class TinyIoTClient:
         self._check(status, rsc, data, 201, "POST PoseData CIN")
         return rsc
 
+    def publish_event(self, event, container=EVENT_CONTAINER):
+        """Create an idempotent event CIN; verify an existing CIN on retry."""
+        path = "/" + container.strip("/")
+        resource_name = "webcam-" + event["eventId"].replace("-", "")
+        item_path = f"{path}/{resource_name}"
+        status, _, data = self._request("GET", item_path)
+        if status == 200:
+            self._verify_event(data, event, item_path)
+            return "verified"
+        if status != 404:
+            raise TinyIoTError(f"Checking event {item_path} failed: HTTP {status}, body={data}")
+        payload = {"m2m:cin": {"rn": resource_name, "cnf": "application/json:0",
+                                "con": json.dumps(event, separators=(",", ":"))}}
+        status, rsc, data = self._request("POST", path, payload, ty=4)
+        if status == 201:
+            return rsc
+        if status in (409, 500, 502, 503, 504):
+            # A timeout/server error can mean POST committed but its reply was lost.
+            check_status, _, check_body = self._request("GET", item_path)
+            if check_status == 200:
+                self._verify_event(check_body, event, item_path)
+                return "verified"
+        self._check(status, rsc, data, 201, "POST repetition event CIN")
+
+    @staticmethod
+    def _verify_event(data, event, path):
+        cin = data.get("m2m:cin", {})
+        content = cin.get("con")
+        try:
+            content = json.loads(content) if isinstance(content, str) else content
+        except json.JSONDecodeError:
+            pass
+        if cin.get("rn", path.rsplit("/", 1)[-1]) != path.rsplit("/", 1)[-1] or content != event:
+            raise TinyIoTError(f"Event readback mismatch at {path}; refusing to confirm delivery")
+
     def latest(self):
         status, rsc, data = self._request("GET", f"/{AE_NAME}/{CNT_NAME}/la")
         self._check(status, rsc, data, 200, "GET latest PoseData CIN")
@@ -155,16 +191,23 @@ class TinyIoTClient:
 
 
 class PosePublisher:
-    """Send pose readings off the camera thread; never hold up inference on HTTP."""
+    """Send pose and repetition events off the camera thread."""
 
-    def __init__(self, base=DEFAULT_BASE, origin=DEFAULT_ORIGIN, interval=1.0):
+    def __init__(self, base=DEFAULT_BASE, origin=DEFAULT_ORIGIN, interval=1.0,
+                 event_container=EVENT_CONTAINER, event_origin=None):
         self.client = TinyIoTClient(base, origin)
+        self.event_client = TinyIoTClient(base, event_origin or origin)
         self.interval = interval
+        self.event_container = event_container
         self.last_queued = 0.0
         self.pending = queue.Queue(maxsize=5)
+        self.events = queue.Queue(maxsize=64)
+        self.event_overflow = 0
         self.stopping = threading.Event()
         self.worker = threading.Thread(target=self._run, name="tinyiot-webcam", daemon=True)
+        self.event_worker = threading.Thread(target=self._run_events, name="tinyiot-events", daemon=True)
         self.worker.start()
+        self.event_worker.start()
 
     def offer(self, data, important=False):
         now = time.monotonic()
@@ -198,9 +241,46 @@ class PosePublisher:
             except TinyIoTError as exc:
                 print(f"[TinyIoT] Upload failed: {exc}")
 
+    def offer_event(self, event):
+        try:
+            self.events.put_nowait(event)
+            print(f"[TinyIoT] Event queued seq={event.get('eventSequence')} "
+                  f"{event.get('exercise')} rep={event.get('repetitions')}")
+            return True
+        except queue.Full:
+            self.event_overflow += 1
+            print(f"[TinyIoT] EVENT QUEUE FULL; overflow={self.event_overflow}; event retained locally only")
+            return False
+
+    def _run_events(self):
+        delay = 1.0
+        while not self.stopping.is_set() or not self.events.empty():
+            try:
+                event = self.events.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            while True:
+                try:
+                    result = self.event_client.publish_event(event, self.event_container)
+                    print(f"[TinyIoT] Event confirmed seq={event.get('eventSequence')} ({result})")
+                    delay = 1.0
+                    break
+                except TinyIoTError as exc:
+                    print(f"[TinyIoT] Event retry seq={event.get('eventSequence')} in {delay:.0f}s: {exc}")
+                    if self.stopping.wait(delay):
+                        # Put the unconfirmed event back if shutdown interrupts retrying.
+                        try:
+                            self.events.put_nowait(event)
+                        except queue.Full:
+                            self.event_overflow += 1
+                            print(f"[TinyIoT] EVENT QUEUE FULL on shutdown; overflow={self.event_overflow}")
+                        return
+                    delay = min(delay * 2, 30.0)
+
     def close(self):
         self.stopping.set()
         self.worker.join(timeout=6.0)
+        self.event_worker.join(timeout=6.0)
         if self.worker.is_alive():
             print("[TinyIoT] Publisher stopped with some requests still in progress")
 

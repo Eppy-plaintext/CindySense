@@ -1,239 +1,239 @@
-"""CindySense webcam-only squat detector prototype.
-
-Run from Windows after placing this file at tools/webcam_squat.py.
-Uses OpenCV + MediaPipe Tasks (Pose Landmarker), and saves measurements
-as CSV. Only accesses TinyIoT with --tinyiot; never saves or uploads raw video.
-"""
+"""CindySense webcam exercise counter (MediaPipe Pose + OpenCV)."""
 
 import argparse
 import csv
-import math
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 import cv2
 import mediapipe as mp
 
-from webcam_tinyiot import PosePublisher, DEFAULT_BASE, DEFAULT_ORIGIN
+from webcam_exercises import (CindyWorkout, ExerciseCounter, body_movement_measurement,
+                              exercise_measurement,
+                              select_exercise_key, visibility)
+from webcam_tinyiot import PosePublisher, DEFAULT_BASE, DEFAULT_ORIGIN, EVENT_CONTAINER
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_MODEL = PROJECT_ROOT / "models" / "pose_landmarker_lite.task"
 OUTPUT_DIR = PROJECT_ROOT / "data" / "recordings"
-
-# Baseline only: tune these against labelled recordings and camera angle.
-DOWN_THRESHOLD_DEG = 115.0
-UP_THRESHOLD_DEG = 155.0
-STABLE_FRAMES = 3
-MIN_VISIBILITY = 0.50
-
 CONNECTIONS = [
-    (11, 12), (11, 23), (12, 24), (23, 24),
-    (23, 25), (25, 27), (24, 26), (26, 28),
-    (11, 13), (13, 15), (12, 14), (14, 16),
+    (11, 12), (11, 23), (12, 24), (23, 24), (23, 25), (25, 27),
+    (24, 26), (26, 28), (11, 13), (13, 15), (12, 14), (14, 16),
 ]
-
-
-def angle_degrees(a, b, c, width, height):
-    """Joint angle at b, using pixel-scaled 2D landmark coordinates."""
-    ax, ay = (a.x - b.x) * width, (a.y - b.y) * height
-    cx, cy = (c.x - b.x) * width, (c.y - b.y) * height
-    denom = math.hypot(ax, ay) * math.hypot(cx, cy)
-    if denom < 1e-6:
-        return None
-    cosine = max(-1.0, min(1.0, (ax * cx + ay * cy) / denom))
-    return math.degrees(math.acos(cosine))
-
-
-def visibility(point):
-    score = getattr(point, "visibility", None)
-    return 1.0 if score is None else float(score)
-
-
-def choose_knee_angle(landmarks, width, height):
-    """Choose the more visible leg. Returns (angle, leg, confidence)."""
-    candidates = []
-    for hip, knee, ankle, leg in [(23, 25, 27, "LEFT"), (24, 26, 28, "RIGHT")]:
-        points = [landmarks[hip], landmarks[knee], landmarks[ankle]]
-        confidence = min(visibility(p) for p in points)
-        if confidence < MIN_VISIBILITY:
-            continue
-        angle = angle_degrees(*points, width, height)
-        if angle is not None:
-            candidates.append((confidence, angle, leg))
-    if not candidates:
-        return None, "NONE", 0.0
-    confidence, angle, leg = max(candidates, key=lambda p: p[0])
-    return angle, leg, confidence
+TARGETS = {"pullup": 5, "pushup": 10, "squat": 15}
 
 
 def draw_pose(frame, landmarks):
     h, w = frame.shape[:2]
     for start, end in CONNECTIONS:
         a, b = landmarks[start], landmarks[end]
-        if min(visibility(a), visibility(b)) >= MIN_VISIBILITY:
-            p1 = (int(a.x * w), int(a.y * h))
-            p2 = (int(b.x * w), int(b.y * h))
-            cv2.line(frame, p1, p2, (50, 220, 50), 2)
+        if min(visibility(a), visibility(b)) >= 0.50:
+            cv2.line(frame, (int(a.x*w), int(a.y*h)), (int(b.x*w), int(b.y*h)), (50, 220, 50), 2)
     for index in {i for pair in CONNECTIONS for i in pair}:
         p = landmarks[index]
-        if visibility(p) >= MIN_VISIBILITY:
-            cv2.circle(frame, (int(p.x * w), int(p.y * h)), 4, (10, 60, 255), -1)
-
-
-class SquatCounter:
-    def __init__(self):
-        self.reps = 0
-        self.phase = "UNKNOWN"
-        self.down_frames = 0
-        self.up_frames = 0
-        self.smoothed_angle = None
-
-    def update(self, angle):
-        if angle is None:
-            self.down_frames = self.up_frames = 0
-            self.smoothed_angle = None
-            self.phase = "UNKNOWN"  # Require standing calibration after tracking loss.
-            return False
-        self.smoothed_angle = (
-            angle if self.smoothed_angle is None
-            else 0.4 * angle + 0.6 * self.smoothed_angle
-        )
-        a = self.smoothed_angle
-        if self.phase == "UNKNOWN":
-            if a >= UP_THRESHOLD_DEG:
-                self.phase = "UP"
-            return False
-        if self.phase == "UP":
-            self.down_frames = self.down_frames + 1 if a <= DOWN_THRESHOLD_DEG else 0
-            if self.down_frames >= STABLE_FRAMES:
-                self.phase = "DOWN"
-                self.down_frames = 0
-        elif self.phase == "DOWN":
-            self.up_frames = self.up_frames + 1 if a >= UP_THRESHOLD_DEG else 0
-            if self.up_frames >= STABLE_FRAMES:
-                self.phase = "UP"
-                self.up_frames = 0
-                self.reps += 1
-                return True
-        return False
+        if visibility(p) >= 0.50:
+            cv2.circle(frame, (int(p.x*w), int(p.y*h)), 4, (10, 60, 255), -1)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="CindySense webcam squat prototype")
-    parser.add_argument("--camera", type=int, default=0, help="Camera index (default 0)")
+    parser = argparse.ArgumentParser(description="CindySense webcam workout counter")
+    parser.add_argument("--camera", type=int, default=0)
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
-    parser.add_argument("--tinyiot", action="store_true", help="Send pose measurements to TinyIoT")
-    parser.add_argument("--tinyiot-base", default=DEFAULT_BASE, help="Full CSEBase URL")
+    parser.add_argument("--exercise", choices=("cindy", "squat", "pushup", "pullup"), default="cindy",
+                        help="Start in 20-minute Cindy AMRAP or a single exercise mode")
+    parser.add_argument("--duration-minutes", type=float, default=20.0, help="Cindy AMRAP duration")
+    parser.add_argument("--tinyiot", action="store_true", help="Publish webcam poses and repetition events")
+    parser.add_argument("--tinyiot-base", default=DEFAULT_BASE)
     parser.add_argument("--tinyiot-origin", default=DEFAULT_ORIGIN)
+    parser.add_argument("--tinyiot-event-origin", default="CAdmin",
+                        help="Originator with create access to CindySense_AE/RepetitionCount")
+    parser.add_argument("--event-container", default=EVENT_CONTAINER,
+                        help="Existing oneM2M container path, e.g. CindySense_AE/RepetitionCount")
     args = parser.parse_args()
     if not args.model.is_file():
         sys.exit(f"Model missing: {args.model}\nDownload pose_landmarker_lite.task into models/ first.")
-
-    if sys.platform.startswith("win"):
-        camera = cv2.VideoCapture(args.camera, cv2.CAP_DSHOW)
-        if not camera.isOpened():
-            camera.release()
+    camera = cv2.VideoCapture(args.camera, cv2.CAP_DSHOW) if sys.platform.startswith("win") else cv2.VideoCapture(args.camera)
+    if not camera.isOpened():
+        camera.release()
+        if sys.platform.startswith("win"):
             camera = cv2.VideoCapture(args.camera)
-    else:
-        camera = cv2.VideoCapture(args.camera)
     if not camera.isOpened():
         sys.exit("Cannot open webcam. Check camera privacy settings or try --camera 1.")
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    csv_path = OUTPUT_DIR / f"webcam_squat_{stamp}.csv"
-    counter = SquatCounter()
+    workout = CindyWorkout(max(1, int(args.duration_minutes * 60))) if args.exercise == "cindy" else None
+    active = workout.current_exercise if workout else args.exercise
+    counters = {name: ExerciseCounter(name) for name in TARGETS}
     start = time.monotonic()
+    session_id = "webcam-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
+    event_sequence = 0
     last_ts_ms = -1
+    last_diagnostic = 0.0
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    csv_path = OUTPUT_DIR / f"webcam_workout_{stamp}.csv"
     options = mp.tasks.vision.PoseLandmarkerOptions(
         base_options=mp.tasks.BaseOptions(model_asset_path=str(args.model)),
-        running_mode=mp.tasks.vision.RunningMode.VIDEO,
-        num_poses=1,
-        min_pose_detection_confidence=0.5,
-        min_pose_presence_confidence=0.5,
+        running_mode=mp.tasks.vision.RunningMode.VIDEO, num_poses=1,
+        min_pose_detection_confidence=0.5, min_pose_presence_confidence=0.5,
         min_tracking_confidence=0.5,
     )
-
-    publisher = (PosePublisher(args.tinyiot_base, args.tinyiot_origin)
-                 if args.tinyiot else None)
-    print("Webcam starting. Stand sideways with hips, knees and ankles visible.")
-    print("Stand upright first, then squat. Press R to reset or Q to quit.")
+    publisher = (PosePublisher(args.tinyiot_base, args.tinyiot_origin,
+                               event_container=args.event_container,
+                               event_origin=args.tinyiot_event_origin) if args.tinyiot else None)
+    print(f"Webcam session {session_id}; mode={args.exercise}; TinyIoT={'on' if publisher else 'off'}")
+    print("Click the webcam window before pressing keys.")
+    print("Manual modes: 1 pull-up | 2 push-up | 3 squat | C Cindy | R reset counts | Q quit")
+    print("Pull-ups need upper body and hands visible; bar/chin are not model landmarks.")
     print(f"Saving measurements to: {csv_path}")
+    reps_this_mode = {name: 0 for name in TARGETS}
+    total_reps = {name: 0 for name in TARGETS}
+    total_rounds = 0
     try:
         with open(csv_path, "w", newline="", encoding="utf-8") as f, \
                 mp.tasks.vision.PoseLandmarker.create_from_options(options) as landmarker:
-            writer = csv.DictWriter(f, fieldnames=[
-                "timestampUtc", "elapsedMs", "exercise", "kneeAngleDeg",
-                "trackedLeg", "visibility", "phase", "repCount",
-            ])
+            fields = ["timestampUtc", "elapsedMs", "exercise", "kneeAngleDeg", "trackedLeg",
+                      "visibility", "phase", "repCount", "angleDeg", "trackedSide",
+                      "confidence", "bodyMovement", "exerciseReps", "rounds", "sessionId"]
+            writer = csv.DictWriter(f, fieldnames=fields)
             writer.writeheader()
             while True:
                 ok, frame = camera.read()
                 if not ok:
                     print("Camera frame read failed.")
                     break
+                frame_exercise = active
                 frame = cv2.flip(frame, 1)
                 h, w = frame.shape[:2]
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
                 ts_ms = max(int((time.monotonic() - start) * 1000), last_ts_ms + 1)
                 last_ts_ms = ts_ms
-                result = landmarker.detect_for_video(mp_image, ts_ms)
-                angle, leg, confidence = None, "NONE", 0.0
+                result = landmarker.detect_for_video(image, ts_ms)
+                angle, confidence, side = None, 0.0, "NONE"
+                body_movement, body_confidence = None, 0.0
+                measurement_reason = "no pose landmarks"
+                movement_reason = "no pose landmarks"
                 if result.pose_landmarks:
                     landmarks = result.pose_landmarks[0]
                     draw_pose(frame, landmarks)
-                    angle, leg, confidence = choose_knee_angle(landmarks, w, h)
-                counted = counter.update(angle)
+                    angle, confidence, side, measurement_reason = exercise_measurement(
+                        frame_exercise, landmarks, w, h, include_reason=True
+                    )
+                    body_movement, body_confidence, movement_reason = body_movement_measurement(
+                        frame_exercise, landmarks
+                    )
+                counter = counters[frame_exercise]
+                counted = counter.update(angle, body_movement) if not (workout and workout.finished) else False
                 if counted:
-                    print(f"Rep {counter.reps} counted at {ts_ms / 1000:.2f}s")
-                angle_text = f"{counter.smoothed_angle:.0f} deg" if counter.smoothed_angle is not None else "No reliable leg"
-                for line_no, message in enumerate([
-                    f"SQUATS: {counter.reps}",
-                    f"Knee angle: {angle_text}",
-                    f"State: {counter.phase}   Leg: {leg}",
-                    "Side view, full body visible | R reset | Q quit",
-                ]):
-                    cv2.putText(frame, message, (15, 32 + 30 * line_no),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
-                timestamp_utc = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
-                if publisher is not None:
+                    event_round = workout.rounds + 1 if workout else 1
+                    reps_this_mode[frame_exercise] += 1
+                    total_reps[frame_exercise] += 1
+                    if workout:
+                        total_rounds = workout.record_rep(frame_exercise)
+                        reps_this_mode[frame_exercise] = workout.progress[frame_exercise]
+                        active = workout.current_exercise
+                    else:
+                        total_rounds = 0
+                    event_sequence += 1
+                    event = {
+                        "eventId": str(uuid.uuid4()), "eventSequence": event_sequence,
+                        "sessionId": session_id, "exercise": counter.exercise,
+                        "repetitions": total_reps[counter.exercise], "round": event_round,
+                        "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                        "source": "webcam",
+                    }
+                    print(f"[REP] {counter.exercise} total={total_reps[counter.exercise]} "
+                          f"sessionSeq={event_sequence} rounds={total_rounds}")
+                    if publisher:
+                        publisher.offer_event(event)
+
+                elapsed_s = (time.monotonic() - start)
+                display_exercise = frame_exercise
+                display_counter = counters[display_exercise]
+                if workout:
+                    remaining = workout.remaining
+                    clock_text = f"{int(remaining//60):02d}:{int(remaining%60):02d}"
+                    rounds_text = workout.rounds
+                    progress_text = f"{workout.progress[display_exercise]}/{TARGETS[display_exercise]}"
+                else:
+                    clock_text = f"{int(elapsed_s//60):02d}:{int(elapsed_s%60):02d}"
+                    rounds_text = total_rounds
+                    progress_text = str(total_reps[display_exercise])
+                angle_text = f"{angle:.0f} deg" if angle is not None else "untracked"
+                position_text = f"bodyΔ={body_movement:.3f}" if body_movement is not None else "bodyΔ=none"
+                tracking_confidence = max(confidence, body_confidence)
+                reason = "counted" if counted else (
+                    f"{measurement_reason}; {movement_reason}" if angle is None and body_movement is None
+                    else display_counter.last_reason
+                )
+                lines = [f"{display_exercise.upper()}  reps {progress_text}  phase {display_counter.phase}",
+                         f"Confidence {tracking_confidence:.2f}  {angle_text}  {position_text}",
+                         f"Cindy rounds {rounds_text}  {'remaining' if workout else 'elapsed'} {clock_text}",
+                         f"Reason: {reason[:72]}",
+                         "1 pull-up | 2 push-up | 3 squat | C Cindy | R reset | Q quit"]
+                if workout and workout.finished:
+                    lines[2] = f"AMRAP complete | rounds {workout.rounds}"
+                for i, line in enumerate(lines):
+                    cv2.putText(frame, line, (15, 32 + 30*i), cv2.FONT_HERSHEY_SIMPLEX,
+                                0.62, (255, 255, 255), 2)
+                if time.monotonic() - last_diagnostic >= 1.0:
+                    print(f"[DETECT] exercise={display_exercise} phase={display_counter.phase} "
+                          f"visibility={tracking_confidence:.2f} angle={angle if angle is not None else 'none'} "
+                          f"bodyMovement={body_movement if body_movement is not None else 'none'} "
+                          f"reason={reason}")
+                    last_diagnostic = time.monotonic()
+                timestamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+                if publisher:
+                    # Keep the existing Webcam_AE/PoseData shape and exercise/phase fields.
                     publisher.offer({
-                        "deviceId": "CindySense_Webcam_01",
-                        "source": "webcam_live",
-                        "synthetic": False,
-                        "timestampUtc": timestamp_utc,
-                        "elapsedMs": ts_ms,
-                        "exercise": "squat",
-                        "kneeAngleDeg": round(angle, 2) if angle is not None else None,
-                        "trackedLeg": leg,
-                        "visibility": round(confidence, 3),
-                        "phase": counter.phase,
-                        "repCount": counter.reps,
-                        "repEvent": counted,
+                        "deviceId": "CindySense_Webcam_01", "source": "webcam_live", "synthetic": False,
+                        "timestampUtc": timestamp, "elapsedMs": ts_ms, "exercise": display_exercise,
+                        "kneeAngleDeg": round(angle, 2) if display_exercise == "squat" and angle is not None else None,
+                        "trackedLeg": side if display_exercise == "squat" else "NONE",
+                        "jointAngleDeg": round(angle, 2) if angle is not None else None,
+                        "bodyMovement": round(body_movement, 4) if body_movement is not None else None,
+                        "visibility": round(tracking_confidence, 3), "phase": counters[display_exercise].phase,
+                        "repCount": total_reps[display_exercise], "repEvent": counted,
+                        "rounds": rounds_text,
                     }, important=counted)
-                writer.writerow({
-                    "timestampUtc": timestamp_utc,
-                    "elapsedMs": ts_ms, "exercise": "squat",
-                    "kneeAngleDeg": f"{angle:.2f}" if angle is not None else "",
-                    "trackedLeg": leg, "visibility": f"{confidence:.3f}",
-                    "phase": counter.phase, "repCount": counter.reps,
-                })
-                cv2.imshow("CindySense Webcam Squat Detector", frame)
+                writer.writerow({"timestampUtc": timestamp, "elapsedMs": ts_ms, "exercise": display_exercise,
+                                 "kneeAngleDeg": f"{angle:.2f}" if display_exercise == "squat" and angle is not None else "",
+                                 "trackedLeg": side if display_exercise == "squat" else "NONE",
+                                 "visibility": f"{tracking_confidence:.3f}", "repCount": total_reps[display_exercise],
+                                 "angleDeg": f"{angle:.2f}" if angle is not None else "",
+                                 "bodyMovement": f"{body_movement:.4f}" if body_movement is not None else "",
+                                 "trackedSide": side, "confidence": f"{confidence:.3f}",
+                                 "phase": counters[display_exercise].phase, "exerciseReps": total_reps[display_exercise],
+                                 "rounds": rounds_text, "sessionId": session_id})
+                cv2.imshow("CindySense Webcam Workout", frame)
                 key = cv2.waitKey(1) & 0xFF
-                if key == ord("q") or key == 27:
+                if key in (ord("q"), 27):
                     break
-                if key == ord("r"):
-                    counter = SquatCounter()
-                    print("Counter reset.")
+                selected = select_exercise_key(key, workout)
+                if selected is not None:
+                    active = selected
+                    print(f"[MODE] active exercise changed to {selected}; detector phase={counters[selected].phase}")
+                elif key in (ord("c"), ord("C")) and workout is None:
+                    workout = CindyWorkout(max(1, int(args.duration_minutes * 60)))
+                    active = workout.current_exercise
+                    print("Started Cindy AMRAP timer.")
+                elif key in (ord("r"), ord("R")):
+                    counters = {name: ExerciseCounter(name) for name in TARGETS}
+                    reps_this_mode = {name: 0 for name in TARGETS}
+                    total_reps = {name: 0 for name in TARGETS}
+                    total_rounds = 0
+                    if workout:
+                        workout = CindyWorkout(max(1, int(args.duration_minutes * 60)))
+                    print("Workout counts reset.")
     finally:
-        if publisher is not None:
+        if publisher:
             publisher.close()
         camera.release()
         cv2.destroyAllWindows()
-    print(f"Completed. Recorded {counter.reps} reps. CSV: {csv_path}")
+    print(f"Completed. Local repetitions: {total_reps}; rounds={workout.rounds if workout else total_rounds}. CSV: {csv_path}")
 
 
 if __name__ == "__main__":

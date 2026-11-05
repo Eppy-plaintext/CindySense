@@ -10,12 +10,13 @@ class RepetitionEvent(BaseModel):
     model_config = ConfigDict(extra='forbid', str_strip_whitespace=True)
 
     event_id: UUID = Field(alias='eventId')
+    event_sequence: int | None = Field(default=None, alias='eventSequence', ge=1, strict=True)
     session_id: str = Field(alias='sessionId', min_length=1, max_length=100, pattern=r'^[A-Za-z0-9][A-Za-z0-9_-]*$')
     exercise: Literal['pullup', 'pushup', 'squat']
     repetitions: int = Field(ge=0, strict=True)
     round: int = Field(ge=1, strict=True)
     timestamp: AwareDatetime
-    source: Literal['simulator', 'mpu6050', 'manual']
+    source: Literal['simulator', 'mpu6050', 'manual', 'webcam']
 
     @field_validator('timestamp', mode='before')
     @classmethod

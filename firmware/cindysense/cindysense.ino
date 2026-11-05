@@ -8,6 +8,16 @@
 #include <math.h>
 #include "config.h"
 #include "batch_verification.h"
+#include "squat_detector.h"
+#include <time.h>
+
+#ifndef CINDYSENSE_RAW_UPLOADS
+#define CINDYSENSE_RAW_UPLOADS 0
+#endif
+#ifndef CINDYSENSE_SENSOR_VERBOSE
+#define CINDYSENSE_SENSOR_VERBOSE 0
+#endif
+#define CINDYSENSE_FIRMWARE_VERSION "0.2.1-phase1"
 
 // Arduino generates function prototypes before the type definitions below.
 struct BufferStats;
@@ -39,7 +49,8 @@ const int MAX_RETRY_DELAY_MS = 8000;
 // 2. SENSOR STRUCTURE
 // =====================================
 
-// Shared ring buffer
+// Raw acquisition storage exists only in builds that explicitly enable uploads.
+#if CINDYSENSE_RAW_UPLOADS
 SensorSample sampleBuffer[BUFFER_SIZE];
 SensorSample uploadBatch[BATCH_SIZE];
 
@@ -50,10 +61,11 @@ int bufferCount = 0;
 uint32_t droppedSamples = 0;
 uint32_t firstDroppedTimestamp = 0;
 uint32_t lastDroppedTimestamp = 0;
+int peakBufferCount = 0;
+#endif
 uint32_t i2cReadFailures = 0;
 uint32_t invalidAccelerationFrames = 0;
 uint32_t missedSampleSlots = 0;
-int peakBufferCount = 0;
 
 portMUX_TYPE bufferMutex =
   portMUX_INITIALIZER_UNLOCKED;
@@ -68,6 +80,33 @@ uint32_t requestID = 0;
 uint32_t successfulBatches = 0;
 uint32_t failedAttempts = 0;
 uint32_t bootNonce = 0;
+
+static SquatDetector squatDetector;
+static const int EVENT_QUEUE_CAPACITY = 32;
+struct QueuedRepetition { uint32_t sequence; uint32_t repetitions; uint32_t timestampMs; uint32_t epochSeconds; };
+static QueuedRepetition eventQueue[EVENT_QUEUE_CAPACITY];
+static int eventHead=0,eventTail=0,eventCount=0;
+static uint32_t eventQueueOverflows=0,confirmedEvents=0,eventRetries=0;
+static portMUX_TYPE eventMutex=portMUX_INITIALIZER_UNLOCKED;
+static char eventSessionId[32];
+
+static bool enqueueEvent(const SquatEvent &event) {
+  bool ok=false;
+  time_t wall=time(nullptr);
+  portENTER_CRITICAL(&eventMutex);
+  if(eventCount<EVENT_QUEUE_CAPACITY){
+    QueuedRepetition &slot=eventQueue[eventHead];
+    slot.sequence=event.eventSequence;slot.repetitions=event.repetition;slot.timestampMs=event.timestampMs;
+    slot.epochSeconds=wall>1700000000?(uint32_t)wall:0;
+    eventHead=(eventHead+1)%EVENT_QUEUE_CAPACITY;eventCount++;ok=true;
+  } else eventQueueOverflows++;
+  portEXIT_CRITICAL(&eventMutex);
+  return ok;
+}
+static int queuedEventCount(){portENTER_CRITICAL(&eventMutex);int n=eventCount;portEXIT_CRITICAL(&eventMutex);return n;}
+static bool peekEvent(QueuedRepetition &e){portENTER_CRITICAL(&eventMutex);bool ok=eventCount>0;if(ok)e=eventQueue[eventTail];portEXIT_CRITICAL(&eventMutex);return ok;}
+static void confirmEvent(uint32_t sequence){portENTER_CRITICAL(&eventMutex);if(eventCount&&eventQueue[eventTail].sequence==sequence){eventTail=(eventTail+1)%EVENT_QUEUE_CAPACITY;eventCount--;confirmedEvents++;}portEXIT_CRITICAL(&eventMutex);}
+static void setEventEpoch(uint32_t sequence,uint32_t epoch){portENTER_CRITICAL(&eventMutex);if(eventCount&&eventQueue[eventTail].sequence==sequence&&!eventQueue[eventTail].epochSeconds)eventQueue[eventTail].epochSeconds=epoch;portEXIT_CRITICAL(&eventMutex);}
 
 // =====================================
 // 3. MPU6050 REGISTER FUNCTIONS
@@ -115,25 +154,25 @@ bool writeRegister(
 // 4. INITIALIZE MPU6050
 // =====================================
 
-bool initializeMPU() {
-  Serial.println("Checking MPU6050...");
+bool initializeMPU(bool waitForSettle = true, bool printStatus = true) {
+  if (printStatus) Serial.println("Checking MPU6050...");
 
   uint8_t id = 0;
 
   if (!readRegisters(0x75, &id, 1)) {
-    Serial.println(
+    if (printStatus) Serial.println(
       "ERROR: WHO_AM_I read failed"
     );
     return false;
   }
 
-  Serial.printf(
+  if (printStatus) Serial.printf(
     "WHO_AM_I: 0x%02X\n",
     id
   );
 
   if (id != 0x68) {
-    Serial.println(
+    if (printStatus) Serial.println(
       "ERROR: Unexpected sensor ID"
     );
     return false;
@@ -141,37 +180,37 @@ bool initializeMPU() {
 
   // Wake MPU6050
   if (!writeRegister(0x6B, 0x01)) {
-    Serial.println("ERROR: Wake-up failed");
+    if (printStatus) Serial.println("ERROR: Wake-up failed");
     return false;
   }
 
   // Enable accelerometer and gyroscope
   if (!writeRegister(0x6C, 0x00)) {
-    Serial.println("ERROR: Sensor enable failed");
+    if (printStatus) Serial.println("ERROR: Sensor enable failed");
     return false;
   }
 
   // Digital low-pass filter
   if (!writeRegister(0x1A, 0x03)) {
-    Serial.println("ERROR: Filter setup failed");
+    if (printStatus) Serial.println("ERROR: Filter setup failed");
     return false;
   }
 
   // Accelerometer range: +/- 4g
   if (!writeRegister(0x1C, 0x08)) {
-    Serial.println("ERROR: Accelerometer setup failed");
+    if (printStatus) Serial.println("ERROR: Accelerometer setup failed");
     return false;
   }
 
   // Gyroscope range: +/- 500 deg/s
   if (!writeRegister(0x1B, 0x08)) {
-    Serial.println("ERROR: Gyroscope setup failed");
+    if (printStatus) Serial.println("ERROR: Gyroscope setup failed");
     return false;
   }
 
-  delay(200);
+  if (waitForSettle) delay(200);
 
-  Serial.println(
+  if (printStatus) Serial.println(
     "MPU6050 initialization successful!"
   );
 
@@ -304,19 +343,11 @@ bool readSensor(SensorSample &s, bool &invalidAcceleration) {
   return true;
   }
 
-bool recoverMPU() {
-  Serial.println("Recovering MPU6050 after repeated zero-acceleration frames");
-  if (!writeRegister(0x6B, 0x80)) {
-    return false;
-  }
-  vTaskDelay(pdMS_TO_TICKS(100));
-  return initializeMPU();
-}
-
 // =====================================
 // 7. BUFFER OPERATIONS
 // =====================================
 
+#if CINDYSENSE_RAW_UPLOADS
 // Add new sensor reading to ring buffer
 bool storeSample(const SensorSample &s) {
   portENTER_CRITICAL(&bufferMutex);
@@ -380,6 +411,7 @@ int getBufferCount() {
 
   return count;
 }
+#endif
 
 struct BufferStats {
   int buffered;
@@ -395,11 +427,16 @@ struct BufferStats {
 BufferStats getBufferStats() {
   BufferStats stats;
   portENTER_CRITICAL(&bufferMutex);
+#if CINDYSENSE_RAW_UPLOADS
   stats.buffered = bufferCount;
   stats.peak = peakBufferCount;
   stats.dropped = droppedSamples;
   stats.firstDroppedAt = firstDroppedTimestamp;
   stats.lastDroppedAt = lastDroppedTimestamp;
+#else
+  stats.buffered = stats.peak = 0;
+  stats.dropped = stats.firstDroppedAt = stats.lastDroppedAt = 0;
+#endif
   stats.readFailures = i2cReadFailures;
   stats.invalidFrames = invalidAccelerationFrames;
   stats.missedSlots = missedSampleSlots;
@@ -423,9 +460,14 @@ void sensorTask(void* parameter) {
   uint32_t consecutiveInvalidAcceleration = 0;
   uint32_t consecutiveI2cFailures = 0;
   uint32_t lastRecovery = 0;
+  bool recoveryWaiting = false;
+  uint32_t recoveryStarted = 0;
   uint32_t lastAttempt = 0;
   uint32_t lastDiagnostics = millis();
-  uint32_t lastReportedMissedSlots = 0;
+  uint32_t lastFrequencyReport=millis();
+  uint32_t frequencySamples=0;
+  uint32_t reportedSquats=0;
+  uint32_t reportedEventOverflows=0;
 
   while (true) {
     uint32_t now = millis();
@@ -442,6 +484,13 @@ void sensorTask(void* parameter) {
     if (readSensor(s, invalidAcceleration)) {
       consecutiveInvalidAcceleration = 0;
       consecutiveI2cFailures = 0;
+      // Detection is synchronous, fixed-state work on core 1; it never uses Wi-Fi/HTTP.
+      SquatEvent detected;
+      if (squatDetector.process(s, detected)) {
+        enqueueEvent(detected);
+      }
+      frequencySamples++;
+#if CINDYSENSE_RAW_UPLOADS
       if (storeSample(s)) {
         BufferStats stats = getBufferStats();
         if (stats.dropped == 1 || stats.dropped % BATCH_SIZE == 0) {
@@ -449,10 +498,12 @@ void sensorTask(void* parameter) {
                         (unsigned long)stats.dropped, stats.buffered, BUFFER_SIZE);
         }
       }
+#endif
 
       sampleCounter++;
 
-      // Print approximately once per second
+#if CINDYSENSE_SENSOR_VERBOSE
+      // Optional detailed diagnostics; disabled by default to protect the 20 ms loop.
       if (sampleCounter % 50 == 0) {
         float magnitude = sqrtf(
           s.ax * s.ax +
@@ -473,6 +524,7 @@ void sensorTask(void* parameter) {
           magnitude
         );
       }
+#endif
     } else {
       portENTER_CRITICAL(&bufferMutex);
       if (invalidAcceleration) {
@@ -484,45 +536,65 @@ void sensorTask(void* parameter) {
       if (invalidAcceleration) {
         consecutiveI2cFailures = 0;
         consecutiveInvalidAcceleration++;
-        if (consecutiveInvalidAcceleration == 1 ||
-            consecutiveInvalidAcceleration % 50 == 0) {
+        if (consecutiveInvalidAcceleration == 1) {
           Serial.println("ERROR: MPU6050 returned zero acceleration on all axes");
         }
-        if (consecutiveInvalidAcceleration >= 5 &&
+        if (!recoveryWaiting && consecutiveInvalidAcceleration >= 5 &&
             (lastRecovery == 0 || millis() - lastRecovery >= 5000)) {
           lastRecovery = millis();
-          if (!recoverMPU()) {
-            Serial.println("ERROR: MPU6050 recovery failed");
-          }
+          Serial.println("[MPU] recovery reset requested (nonblocking)");
+          recoveryWaiting = writeRegister(0x6B, 0x80);
+          recoveryStarted = millis();
+          if (!recoveryWaiting) Serial.println("[MPU] recovery reset write failed");
           consecutiveInvalidAcceleration = 0;
         }
       } else {
         consecutiveInvalidAcceleration = 0;
         consecutiveI2cFailures++;
-        if (consecutiveI2cFailures == 1 || consecutiveI2cFailures % 50 == 0) {
+        if (consecutiveI2cFailures == 1) {
           Serial.printf("WARNING: MPU6050 I2C read failed (%lu consecutive)\n",
                         (unsigned long)consecutiveI2cFailures);
         }
       }
     }
 
+    // Let the sensor reset while this task continues its regular 20 ms reads.
+    // Register setup skips the old 200 ms settle delay when performed here.
+    if (recoveryWaiting && millis() - recoveryStarted >= 100) {
+      recoveryWaiting = false;
+      if (initializeMPU(false, false)) {
+        Serial.println("[MPU] recovery configuration complete");
+      } else {
+        Serial.println("[MPU] recovery configuration failed");
+      }
+    }
+
     if (millis() - lastDiagnostics >= 1000) {
       lastDiagnostics = millis();
       BufferStats stats = getBufferStats();
-      if (stats.missedSlots != lastReportedMissedSlots) {
-        Serial.printf("WARNING: missed %lu additional 20 ms sample slots\n",
-                      (unsigned long)(stats.missedSlots - lastReportedMissedSlots));
-        lastReportedMissedSlots = stats.missedSlots;
-      }
-      Serial.printf("[SENSOR] buffered=%d/%d peak=%d dropped=%lu dropped_ts=%lu..%lu i2c_failures=%lu "
-                    "invalid_frames=%lu missed_slots=%lu\n",
-                    stats.buffered, BUFFER_SIZE, stats.peak,
-                    (unsigned long)stats.dropped,
-                    (unsigned long)stats.firstDroppedAt,
-                    (unsigned long)stats.lastDroppedAt,
-                    (unsigned long)stats.readFailures,
-                    (unsigned long)stats.invalidFrames,
+      uint32_t elapsed=millis()-lastFrequencyReport;
+#if CINDYSENSE_RAW_UPLOADS
+      Serial.printf("[SENSOR] hz=%lu buffered=%d/%d dropped=%lu i2c=%lu invalid=%lu missed=%lu\n",
+                    elapsed?(unsigned long)(frequencySamples*1000UL/elapsed):0,
+                    stats.buffered,BUFFER_SIZE,(unsigned long)stats.dropped,
+                    (unsigned long)stats.readFailures,(unsigned long)stats.invalidFrames,
                     (unsigned long)stats.missedSlots);
+      Serial.printf("[SQUAT] hz=%lu count=%lu queued=%d confirmed=%lu retries=%lu overflow=%lu calibrated=%d\n",
+                    elapsed?(unsigned long)(frequencySamples*1000UL/elapsed):0,
+                    (unsigned long)squatDetector.count(),queuedEventCount(),
+                    (unsigned long)confirmedEvents,(unsigned long)eventRetries,
+                    (unsigned long)eventQueueOverflows,squatDetector.calibrated());
+#else
+      Serial.printf("[SENSOR] hz=%lu i2c=%lu inv=%lu miss=%lu [SQUAT] n=%lu q=%d ok=%lu retry=%lu ovf=%lu cal=%d\n",
+                    elapsed?(unsigned long)(frequencySamples*1000UL/elapsed):0,
+                    (unsigned long)stats.readFailures,(unsigned long)stats.invalidFrames,
+                    (unsigned long)stats.missedSlots,(unsigned long)squatDetector.count(),
+                    queuedEventCount(),(unsigned long)confirmedEvents,(unsigned long)eventRetries,
+                    (unsigned long)eventQueueOverflows,squatDetector.calibrated());
+#endif
+      if(squatDetector.count()>reportedSquats){Serial.printf("[SQUAT] detected=%lu\n",(unsigned long)squatDetector.count());reportedSquats=squatDetector.count();}
+      if(eventQueueOverflows!=reportedEventOverflows){Serial.printf("[SQUAT] ERROR event queue overflow=%lu\n",(unsigned long)eventQueueOverflows);reportedEventOverflows=eventQueueOverflows;}
+      frequencySamples=0;lastFrequencyReport=millis();
     }
 
     vTaskDelayUntil(&lastWake, period);
@@ -533,6 +605,7 @@ void sensorTask(void* parameter) {
 // 9. BUILD ONEM2M JSON PAYLOAD
 // =====================================
 
+#if CINDYSENSE_RAW_UPLOADS
 String buildPayload(int count, const String &batchName) {
   String data;
   if (!data.reserve(128 + count * 120)) {
@@ -583,6 +656,7 @@ String buildPayload(int count, const String &batchName) {
 
   return payload;
 }
+#endif
 
 // =====================================
 // 10. SEND TO TINYIOT
@@ -592,6 +666,7 @@ String nextRequestId() {
   return "sensor-" + String(bootNonce, HEX) + "-" + String(++requestID);
 }
 
+#if CINDYSENSE_RAW_UPLOADS
 String makeBatchName(uint32_t sequence) {
   char name[48];
   snprintf(name, sizeof(name), "cs-%012llx-%08lx-%08lx",
@@ -726,15 +801,59 @@ int sendToTinyIoT(
 
   return code;
 }
+#endif
 
 
 // =====================================
 // 11. NETWORK TASK
 // =====================================
 
+static String repetitionContainerUrl(){
+  String url(TINYIOT_URL);int slash=url.lastIndexOf('/');
+  if(slash>=0)url=url.substring(0,slash+1)+"RepetitionCount";
+  return url;
+}
+
+static bool deliverRepetitionEvent(const QueuedRepetition &event,bool &needsVerify,int &retryMs){
+  if(WiFi.status()!=WL_CONNECTED)return false;
+  time_t now=time(nullptr);
+  if(now<1700000000)return false; // wait until NTP provides an ISO-8601-capable clock
+  time_t eventTime=event.epochSeconds?event.epochSeconds:now-((millis()-event.timestampMs)/1000);
+  setEventEpoch(event.sequence,(uint32_t)eventTime);
+  struct tm utc;gmtime_r(&eventTime,&utc);
+  char timestamp[32],eventId[40],resource[48],payload[560];
+  strftime(timestamp,sizeof(timestamp),"%Y-%m-%dT%H:%M:%SZ",&utc);
+  uint64_t mac=ESP.getEfuseMac()&0xFFFFFFFFFFFFULL;
+  snprintf(eventId,sizeof(eventId),"%08lx-%04lx-4%03lx-8%03lx-%012llx",
+           (unsigned long)bootNonce,(unsigned long)((event.sequence>>12)&0xffff),
+           (unsigned long)(event.sequence&0xfff),(unsigned long)(mac&0xfff),
+           (unsigned long long)(mac&0xffffffffffffULL));
+  snprintf(resource,sizeof(resource),"esp-%08lx-%08lx",(unsigned long)bootNonce,(unsigned long)event.sequence);
+  snprintf(payload,sizeof(payload),"{\"m2m:cin\":{\"rn\":\"%s\",\"con\":\"{\\\"eventId\\\":\\\"%s\\\",\\\"eventSequence\\\":%lu,\\\"sessionId\\\":\\\"%s\\\",\\\"exercise\\\":\\\"squat\\\",\\\"repetitions\\\":%lu,\\\"round\\\":1,\\\"timestamp\\\":\\\"%s\\\",\\\"source\\\":\\\"mpu6050\\\"}\"}}",
+           resource,eventId,(unsigned long)event.sequence,eventSessionId,(unsigned long)event.repetitions,timestamp);
+  String url=repetitionContainerUrl()+"/"+resource;
+  WiFiClient client;HTTPClient http;http.setTimeout(HTTP_TIMEOUT_MS);http.setConnectTimeout(1500);
+  if(needsVerify){
+    if(!http.begin(client,url))return false;
+    http.addHeader("X-M2M-Origin",ORIGINATOR);http.addHeader("X-M2M-RVI","4");http.addHeader("X-M2M-RI",nextRequestId());
+    int code=http.GET();String body=code==200?http.getString():String();http.end();
+    if(code==200&&body.indexOf(eventId)>=0&&body.indexOf(eventSessionId)>=0&&
+       body.indexOf(String(event.repetitions))>=0){needsVerify=false;confirmEvent(event.sequence);return true;}
+    if(code!=404){eventRetries++;retryMs=min(retryMs*2,MAX_RETRY_DELAY_MS);return false;}
+    needsVerify=false;
+  }
+  if(!http.begin(client,repetitionContainerUrl()))return false;
+  http.addHeader("Content-Type","application/json;ty=4");http.addHeader("Accept","application/json");
+  http.addHeader("X-M2M-Origin",ORIGINATOR);http.addHeader("X-M2M-RVI","4");http.addHeader("X-M2M-RI",nextRequestId());
+  int code=http.POST((uint8_t*)payload,strlen(payload));http.end();
+  if(code==201){confirmEvent(event.sequence);retryMs=RETRY_DELAY_MS;return true;}
+  needsVerify=true;eventRetries++;retryMs=min(retryMs*2,MAX_RETRY_DELAY_MS);return false;
+}
+
 void networkTask(void* parameter) {
   unsigned long lastReconnect = 0;
 
+#if CINDYSENSE_RAW_UPLOADS
   // Keep one batch outside the ring until its storage outcome is known.
   String pendingPayload = "";
   String pendingName = "";
@@ -744,6 +863,8 @@ void networkTask(void* parameter) {
   uint32_t batchSequence = 0;
   uint32_t batchAttempts = 0;
   int retryDelay = RETRY_DELAY_MS;
+#endif
+  bool eventNeedsVerify=false;int eventRetryDelay=RETRY_DELAY_MS;uint32_t eventRetryAt=0;
 
   while (true) {
 
@@ -763,6 +884,16 @@ void networkTask(void* parameter) {
       continue;
     }
 
+    QueuedRepetition queuedEvent;
+    if(peekEvent(queuedEvent)){
+      if(!eventRetryAt||millis()>=eventRetryAt){
+        bool delivered=deliverRepetitionEvent(queuedEvent,eventNeedsVerify,eventRetryDelay);
+        if(!delivered)eventRetryAt=millis()+eventRetryDelay;
+        else eventRetryAt=0;
+      }
+      // Raw uploads remain available by opt-in; event queue gets first service.
+    }
+#if CINDYSENSE_RAW_UPLOADS
     // Only take a new batch if none is pending
     if (!hasPendingBatch) {
       if (getBufferCount() < BATCH_SIZE) {
@@ -851,6 +982,9 @@ void networkTask(void* parameter) {
       vTaskDelay(pdMS_TO_TICKS(retryDelay));
       retryDelay = min(retryDelay * 2, MAX_RETRY_DELAY_MS);
     }
+#else
+    vTaskDelay(pdMS_TO_TICKS(100));
+#endif
   }
 }
 
@@ -866,6 +1000,8 @@ void setup() {
   Serial.println("========================");
   Serial.println("CindySense ESP32 Starting");
   Serial.println("========================");
+  Serial.printf("[FW] version=%s RAW_UPLOADS=%d LOCAL_DETECTOR=1\n",
+                CINDYSENSE_FIRMWARE_VERSION,CINDYSENSE_RAW_UPLOADS);
 
   // Initialize I2C
   Wire.begin(21, 22);
@@ -902,9 +1038,15 @@ void setup() {
     WIFI_PASSWORD
   );
   bootNonce = esp_random();
+  snprintf(eventSessionId,sizeof(eventSessionId),"esp32-%08lx",(unsigned long)bootNonce);
+  configTime(0,0,"pool.ntp.org","time.nist.gov");
+#if CINDYSENSE_RAW_UPLOADS
   Serial.printf("[UPLOAD] Boot nonce: %08lx, buffer capacity: %d samples (%d seconds); batch=%d\n",
                 (unsigned long)bootNonce, BUFFER_SIZE,
                 BUFFER_SIZE / (1000 / SAMPLE_INTERVAL_MS), BATCH_SIZE);
+#else
+  Serial.printf("[EVENT] Session %s; raw sensor buffering and uploads disabled\n",eventSessionId);
+#endif
 
   Serial.println("Connecting to Wi-Fi...");
 

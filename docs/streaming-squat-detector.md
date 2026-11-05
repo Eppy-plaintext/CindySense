@@ -56,3 +56,30 @@ This is a Phase 1 prototype. Causal calibration and filtering differ from
 the offline detector's whole-recording calibration and zero-phase filtering.
 An isolated non-squat movement can still look like one complete squat cycle;
 the module must be validated further before it drives live workout counts.
+
+## ESP32 phase 1
+
+The firmware sketch includes [squat_detector.h](../firmware/cindysense/squat_detector.h).
+`sensorTask` calls it once for each valid MPU6050 frame on core 1, before any
+optional raw buffering. It uses fixed arrays and the same 1.2 Hz causal
+low-pass, an 8-second quiet-sample window, 40 ms gap abort, tilt thresholds,
+cycle timing, and directional gyroscope correlation as the Python
+implementation. Embedded calibration uses a rolling mean instead of Python's
+median and a simpler baseline adaptation. It does not port the
+uncertain-candidate or anomalous-gyro diagnostics; identical counts are not
+guaranteed. The host smoke test exercises synthetic 50 Hz squats in both
+orientations.
+
+Completed repetitions enter a 32-event RAM queue. `networkTask` publishes
+them to the existing `CindySense_AE/RepetitionCount` container using a stable
+resource name. Failed/ambiguous posts leave the queue head pending; ambiguous
+outcomes are checked by CIN readback before retry. Events are retained across
+temporary network failures, but not an ESP32 reboot or queue overflow. The
+queue overflow counter is reported on Serial.
+
+Raw `SensorData` uploads are disabled by default. To enable them for debugging,
+set `CINDYSENSE_RAW_UPLOADS` to `1` in the local ignored
+`firmware/cindysense/config.h`; set it to `0` to disable. Event publishing is
+independent of this setting. The sketch requests NTP time and holds queued
+events until a valid UTC clock is available, because the backend event schema
+requires an ISO 8601 timestamp.

@@ -27,6 +27,14 @@ class SchemaTests(unittest.TestCase):
         self.assertEqual(event.content()['repetitions'], 3)
         self.assertEqual(classify_repetition_content(event.content())[0], 'structured_event')
 
+    def test_optional_device_event_sequence_round_trips(self):
+        event = RepetitionEvent.model_validate(sample_event(eventSequence=7, source='mpu6050'))
+        self.assertEqual(event.content()['eventSequence'], 7)
+
+    def test_webcam_event_source_is_supported(self):
+        event = RepetitionEvent.model_validate(sample_event(source='webcam'))
+        self.assertEqual(event.content()['source'], 'webcam')
+
     def test_rejects_invalid_exercise_count_round_timestamp_and_extra_fields(self):
         for change in (
             {'exercise': 'burpee'}, {'repetitions': -1}, {'repetitions': True},
