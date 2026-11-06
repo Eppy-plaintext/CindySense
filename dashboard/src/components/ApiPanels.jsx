@@ -26,16 +26,30 @@ function ResultMessage({ result, loading, empty }) {
   return <p className="stored-message">{empty}</p>
 }
 
-export function StoredRepetitionPanel({ result }) {
+export function StoredRepetitionPanel({ result, snapshot }) {
   const data = result.data
   const value = data?.latest_repetition_content
   const structured = data?.content_kind === 'structured_event' && data?.structured_event
   const hasValue = data?.available === true && value !== null && value !== undefined && value !== ''
   return <StoredPanelShell eyebrow="TINYIOT SNAPSHOT" title={structured ? 'Latest stored structured event' : 'Latest stored repetition content (unclassified)'}>
+    <div className="live-source-grid" aria-label="Observed live workout counts">
+      {[['webcam', 'Webcam'], ['mpu6050', 'ESP32 / MPU6050']].map(([source, label]) => {
+        const session = snapshot?.sources?.[source]
+        return <div className="live-source" key={source}>
+          <strong>{label}</strong>
+          {session ? <>
+            <span>Pull-ups {session.counts.pullup} · Push-ups {session.counts.pushup} · Squats {session.counts.squat}</span>
+            <span>Completed Cindy rounds: <b>{session.completedRounds}</b></span>
+            <small>Session {session.sessionId}</small>
+          </> : <span>Waiting for an event from this source</span>}
+        </div>
+      })}
+    </div>
+    <p className="stored-caution">Aggregated from retained TinyIoT events by the backend. A complete Cindy round requires 5 pull-ups, 10 push-ups, and 15 squats in the same source and session.</p>
     {result.status === 'success' && hasValue ? <>
       <div className="stored-value">{typeof value === 'object' ? <pre>{JSON.stringify(value, null, 2)}</pre> : String(value)}</div>
       <p className="stored-caption">Retrieved from {data.source || 'backend'}{data.recorded_at ? ` · Stored at ${data.recorded_at}` : ''}</p>
-      <p className="stored-caution">{structured ? 'Stored event only. It does not update the demo counters or reconstruct a complete session; polling is not a live sensor stream.' : 'No exercise, current-session count, or round can be inferred from this value. Refreshed by polling; not a live sensor stream.'}</p>
+      <p className="stored-caution">{structured ? 'The event round field labels the round in progress; it does not mean that a round was completed. The separate demo controls above remain simulated.' : 'No exercise or round can be inferred from this legacy value.'}</p>
     </> : <ResultMessage result={result} loading="Loading stored repetition content…" empty="No stored repetition content is available." />}
   </StoredPanelShell>
 }

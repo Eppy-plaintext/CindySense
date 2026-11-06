@@ -1,6 +1,7 @@
 """oneM2M client. Originators remain server-side; writes require API safeguards."""
 
 import json
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 import httpx
@@ -26,7 +27,7 @@ class TinyIoTClient:
             raise TinyIoTError('invalid_resource_name', 'Simulation resource name is invalid.', 503)
         return await self._request('POST', resource_path, origin, {'m2m:cin': {'rn': resource_name, 'con': content}})
 
-    async def _request(self, method: str, resource_path: str, origin: str, body: dict | None = None) -> dict:
+    async def _request(self, method: str, resource_path: str, origin: str, body: dict | None = None, params: dict | None = None) -> dict:
         if not origin:
             raise TinyIoTError('origin_not_configured', 'The oneM2M originator is not configured.', 503)
         path = resource_path.strip('/')
@@ -44,9 +45,9 @@ class TinyIoTClient:
         try:
             if self._client is None:
                 async with httpx.AsyncClient(timeout=5.0) as client:
-                    response = await client.request(method, url, headers=headers, json=body)
+                    response = await client.request(method, url, headers=headers, json=body, params=params)
             else:
-                response = await self._client.request(method, url, headers=headers, json=body)
+                response = await self._client.request(method, url, headers=headers, json=body, params=params)
         except httpx.RequestError as exc:
             raise TinyIoTError('tinyiot_unreachable', 'TinyIoT could not be reached.', 503) from exc
 
@@ -74,6 +75,50 @@ class TinyIoTClient:
             raise TinyIoTError('invalid_resource', 'The configured resource is not a oneM2M container.', 502)
         latest = await self.retrieve(f'{resource_path.strip("/")}/la', origin)
         return self.parse_content_instance(latest)
+
+    async def list_content_instances(self, resource_path: str, origin: str, page_size: int = 100,
+                                     max_pages: int = 21, stop_at: set[str] | None = None,
+                                     expected_count: int | None = None) -> list[str]:
+        """List newest CINs until a previously seen reference or the retained end."""
+        container = resource_path.strip('/')
+        refs: list[str] = []
+        seen: set[str] = set()
+        for page in range(max_pages):
+            payload = await self._request('GET', container, origin, params={
+                'rcn': 6, 'ty': 4, 'lvl': 1, 'lim': page_size, 'ofst': page * page_size,
+            })
+            rrl = payload.get('m2m:rrl')
+            entries = rrl.get('rrf') if isinstance(rrl, dict) else None
+            if not isinstance(entries, list):
+                raise TinyIoTError('invalid_tinyiot_response', 'CIN listing is missing m2m:rrl.rrf.', 502)
+            for entry in entries:
+                if not isinstance(entry, dict) or entry.get('typ') != 4:
+                    raise TinyIoTError('invalid_tinyiot_response', 'CIN listing contains an invalid reference.', 502)
+                reference = entry.get('val')
+                if not isinstance(reference, str):
+                    raise TinyIoTError('invalid_tinyiot_response', 'CIN listing contains an invalid path.', 502)
+                parsed = urlsplit(reference)
+                base = urlsplit(self.base_url)
+                if (parsed.query or parsed.fragment or (parsed.scheme and not parsed.netloc) or
+                        (parsed.netloc and (parsed.scheme, parsed.netloc) != (base.scheme, base.netloc))):
+                    raise TinyIoTError('invalid_tinyiot_response', 'CIN listing contains an external or invalid path.', 502)
+                path = parsed.path.strip('/')
+                base_prefix = base.path.strip('/')
+                if path.startswith(base_prefix + '/'):
+                    path = path[len(base_prefix) + 1:]
+                if '/' not in path:
+                    path = f'{container}/{path}'
+                if not path.startswith(container + '/') or any(part in ('', '.', '..') for part in path.split('/')):
+                    raise TinyIoTError('invalid_tinyiot_response', 'CIN listing points outside the repetition container.', 502)
+                if path not in seen:
+                    seen.add(path)
+                    refs.append(path)
+                if stop_at is not None and path in stop_at:
+                    return refs
+            if (len(entries) < page_size or
+                    expected_count is not None and len(refs) >= expected_count):
+                return refs
+        raise TinyIoTError('listing_limit', 'Too many retained repetition events for the configured listing limit.', 503)
 
     @staticmethod
     def parse_content_instance(payload: dict) -> tuple[object, dict]:

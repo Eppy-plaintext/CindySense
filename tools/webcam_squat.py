@@ -12,7 +12,7 @@ import cv2
 import mediapipe as mp
 
 from webcam_exercises import (CindyWorkout, ExerciseCounter, body_movement_measurement,
-                              exercise_measurement,
+                              exercise_measurement, pullup_auxiliary_measurement,
                               select_exercise_key, visibility)
 from webcam_tinyiot import PosePublisher, DEFAULT_BASE, DEFAULT_ORIGIN, EVENT_CONTAINER
 
@@ -96,10 +96,15 @@ def main():
                 mp.tasks.vision.PoseLandmarker.create_from_options(options) as landmarker:
             fields = ["timestampUtc", "elapsedMs", "exercise", "kneeAngleDeg", "trackedLeg",
                       "visibility", "phase", "repCount", "angleDeg", "trackedSide",
-                      "confidence", "bodyMovement", "exerciseReps", "rounds", "sessionId"]
+                      "confidence", "bodyMovement", "exerciseReps", "rounds", "sessionId",
+                      "headPosition", "lateralPosition", "detectorReason", "lastRejection",
+                      "eventId", "eventQueueDepth"]
             writer = csv.DictWriter(f, fieldnames=fields)
             writer.writeheader()
             while True:
+                if workout and workout.finished:
+                    print(f"[SESSION] 20-minute Cindy complete; rounds={workout.rounds}")
+                    break
                 ok, frame = camera.read()
                 if not ok:
                     print("Camera frame read failed.")
@@ -114,6 +119,7 @@ def main():
                 result = landmarker.detect_for_video(image, ts_ms)
                 angle, confidence, side = None, 0.0, "NONE"
                 body_movement, body_confidence = None, 0.0
+                head_position = lateral_position = None
                 measurement_reason = "no pose landmarks"
                 movement_reason = "no pose landmarks"
                 if result.pose_landmarks:
@@ -123,10 +129,16 @@ def main():
                         frame_exercise, landmarks, w, h, include_reason=True
                     )
                     body_movement, body_confidence, movement_reason = body_movement_measurement(
-                        frame_exercise, landmarks
+                        frame_exercise, landmarks, side
                     )
+                    if frame_exercise == "pullup":
+                        head_position, lateral_position = pullup_auxiliary_measurement(landmarks)
                 counter = counters[frame_exercise]
-                counted = counter.update(angle, body_movement) if not (workout and workout.finished) else False
+                rejected_before = counter.rejected_candidates
+                counted = counter.update(angle, body_movement, head_position, lateral_position)
+                if counter.rejected_candidates != rejected_before:
+                    print(f"[REJECT] exercise={frame_exercise} reason={counter.last_rejection}")
+                event = None
                 if counted:
                     event_round = workout.rounds + 1 if workout else 1
                     reps_this_mode[frame_exercise] += 1
@@ -135,6 +147,8 @@ def main():
                         total_rounds = workout.record_rep(frame_exercise)
                         reps_this_mode[frame_exercise] = workout.progress[frame_exercise]
                         active = workout.current_exercise
+                        if active != frame_exercise:
+                            counters[active].reset_phase()
                     else:
                         total_rounds = 0
                     event_sequence += 1
@@ -145,7 +159,8 @@ def main():
                         "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
                         "source": "webcam",
                     }
-                    print(f"[REP] {counter.exercise} total={total_reps[counter.exercise]} "
+                    print(f"[REP] detectedAt={event['timestamp']} id={event['eventId']} "
+                          f"{counter.exercise} total={total_reps[counter.exercise]} "
                           f"sessionSeq={event_sequence} rounds={total_rounds}")
                     if publisher:
                         publisher.offer_event(event)
@@ -166,7 +181,7 @@ def main():
                 position_text = f"bodyΔ={body_movement:.3f}" if body_movement is not None else "bodyΔ=none"
                 tracking_confidence = max(confidence, body_confidence)
                 reason = "counted" if counted else (
-                    f"{measurement_reason}; {movement_reason}" if angle is None and body_movement is None
+                    f"{measurement_reason}; {display_counter.last_reason}" if angle is None
                     else display_counter.last_reason
                 )
                 lines = [f"{display_exercise.upper()}  reps {progress_text}  phase {display_counter.phase}",
@@ -197,8 +212,9 @@ def main():
                         "bodyMovement": round(body_movement, 4) if body_movement is not None else None,
                         "visibility": round(tracking_confidence, 3), "phase": counters[display_exercise].phase,
                         "repCount": total_reps[display_exercise], "repEvent": counted,
-                        "rounds": rounds_text,
-                    }, important=counted)
+                        "rounds": rounds_text, "sessionId": session_id,
+                        **publisher.diagnostics(),
+                    })
                 writer.writerow({"timestampUtc": timestamp, "elapsedMs": ts_ms, "exercise": display_exercise,
                                  "kneeAngleDeg": f"{angle:.2f}" if display_exercise == "squat" and angle is not None else "",
                                  "trackedLeg": side if display_exercise == "squat" else "NONE",
@@ -207,14 +223,21 @@ def main():
                                  "bodyMovement": f"{body_movement:.4f}" if body_movement is not None else "",
                                  "trackedSide": side, "confidence": f"{confidence:.3f}",
                                  "phase": counters[display_exercise].phase, "exerciseReps": total_reps[display_exercise],
-                                 "rounds": rounds_text, "sessionId": session_id})
+                                 "rounds": rounds_text, "sessionId": session_id,
+                                 "headPosition": f"{head_position:.4f}" if head_position is not None else "",
+                                 "lateralPosition": f"{lateral_position:.4f}" if lateral_position is not None else "",
+                                 "detectorReason": reason, "lastRejection": display_counter.last_rejection or "",
+                                 "eventId": event["eventId"] if event is not None else "",
+                                 "eventQueueDepth": publisher.diagnostics()["eventQueueDepth"] if publisher else 0})
                 cv2.imshow("CindySense Webcam Workout", frame)
                 key = cv2.waitKey(1) & 0xFF
                 if key in (ord("q"), 27):
                     break
                 selected = select_exercise_key(key, workout)
                 if selected is not None:
-                    active = selected
+                    if active != selected:
+                        active = selected
+                        counters[selected].reset_phase()
                     print(f"[MODE] active exercise changed to {selected}; detector phase={counters[selected].phase}")
                 elif key in (ord("c"), ord("C")) and workout is None:
                     workout = CindyWorkout(max(1, int(args.duration_minutes * 60)))
@@ -225,9 +248,12 @@ def main():
                     reps_this_mode = {name: 0 for name in TARGETS}
                     total_reps = {name: 0 for name in TARGETS}
                     total_rounds = 0
+                    event_sequence = 0
+                    session_id = "webcam-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
                     if workout:
                         workout = CindyWorkout(max(1, int(args.duration_minutes * 60)))
-                    print("Workout counts reset.")
+                        active = workout.current_exercise
+                    print(f"Workout counts reset; new session {session_id}.")
     finally:
         if publisher:
             publisher.close()

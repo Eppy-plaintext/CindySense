@@ -9,6 +9,7 @@
 #include "config.h"
 #include "batch_verification.h"
 #include "squat_detector.h"
+#include "exercise_detector.h"
 #include <time.h>
 
 #ifndef CINDYSENSE_RAW_UPLOADS
@@ -17,7 +18,7 @@
 #ifndef CINDYSENSE_SENSOR_VERBOSE
 #define CINDYSENSE_SENSOR_VERBOSE 0
 #endif
-#define CINDYSENSE_FIRMWARE_VERSION "0.2.1-phase1"
+#define CINDYSENSE_FIRMWARE_VERSION "0.3.0-three-exercises"
 
 // Arduino generates function prototypes before the type definitions below.
 struct BufferStats;
@@ -82,21 +83,34 @@ uint32_t failedAttempts = 0;
 uint32_t bootNonce = 0;
 
 static SquatDetector squatDetector;
-static const int EVENT_QUEUE_CAPACITY = 32;
-struct QueuedRepetition { uint32_t sequence; uint32_t repetitions; uint32_t timestampMs; uint32_t epochSeconds; };
+static VerticalMotionDetector motionDetector;
+static volatile ExerciseMode requestedMode=EX_SQUAT;
+static volatile bool localStressTest=false;
+static ExerciseMode activeMode=EX_SQUAT;
+static uint32_t totalRepetitions=0, eventSequence=0, modeRepetitions[3]={0,0,0};
+static uint32_t stressStarted=0, stressHeapStart=0, stressMinHeap=0;
+static volatile uint32_t recordUntil=0;
+static const int RECORD_CAPACITY=128;
+static SensorSample recordQueue[RECORD_CAPACITY];
+static int recordHead=0,recordTail=0,recordCount=0;
+static uint32_t recordDrops=0;
+static portMUX_TYPE recordMutex=portMUX_INITIALIZER_UNLOCKED;
+static const int EVENT_QUEUE_CAPACITY = 1024;
+struct QueuedRepetition { uint32_t sequence; uint32_t repetitions; uint32_t timestampMs; uint32_t epochSeconds; ExerciseMode exercise; };
 static QueuedRepetition eventQueue[EVENT_QUEUE_CAPACITY];
 static int eventHead=0,eventTail=0,eventCount=0;
 static uint32_t eventQueueOverflows=0,confirmedEvents=0,eventRetries=0;
+static char eventReadback[2049];
 static portMUX_TYPE eventMutex=portMUX_INITIALIZER_UNLOCKED;
 static char eventSessionId[32];
 
-static bool enqueueEvent(const SquatEvent &event) {
+static bool enqueueEvent(uint32_t sequence,uint32_t repetition,uint32_t timestampMs,ExerciseMode exercise) {
   bool ok=false;
   time_t wall=time(nullptr);
   portENTER_CRITICAL(&eventMutex);
   if(eventCount<EVENT_QUEUE_CAPACITY){
     QueuedRepetition &slot=eventQueue[eventHead];
-    slot.sequence=event.eventSequence;slot.repetitions=event.repetition;slot.timestampMs=event.timestampMs;
+    slot.sequence=sequence;slot.repetitions=repetition;slot.timestampMs=timestampMs;slot.exercise=exercise;
     slot.epochSeconds=wall>1700000000?(uint32_t)wall:0;
     eventHead=(eventHead+1)%EVENT_QUEUE_CAPACITY;eventCount++;ok=true;
   } else eventQueueOverflows++;
@@ -466,13 +480,18 @@ void sensorTask(void* parameter) {
   uint32_t lastDiagnostics = millis();
   uint32_t lastFrequencyReport=millis();
   uint32_t frequencySamples=0;
-  uint32_t reportedSquats=0;
   uint32_t reportedEventOverflows=0;
+  uint32_t reportedTotal=0;
 
   while (true) {
+    if (activeMode != requestedMode) {
+      activeMode=requestedMode;
+      squatDetector.recalibrate(); motionDetector.reset(activeMode);
+      Serial.printf("[MODE] %s; hold start posture still for 4 seconds\n",exerciseName(activeMode));
+    }
     uint32_t now = millis();
-    if (lastAttempt && now - lastAttempt > SAMPLE_INTERVAL_MS + 5) {
-      uint32_t missed = (now - lastAttempt - 1) / SAMPLE_INTERVAL_MS;
+    if (lastAttempt && now - lastAttempt >= 2*SAMPLE_INTERVAL_MS) {
+      uint32_t missed = (now - lastAttempt) / SAMPLE_INTERVAL_MS - 1;
       portENTER_CRITICAL(&bufferMutex);
       missedSampleSlots += missed;
       portEXIT_CRITICAL(&bufferMutex);
@@ -485,9 +504,21 @@ void sensorTask(void* parameter) {
       consecutiveInvalidAcceleration = 0;
       consecutiveI2cFailures = 0;
       // Detection is synchronous, fixed-state work on core 1; it never uses Wi-Fi/HTTP.
-      SquatEvent detected;
-      if (squatDetector.process(s, detected)) {
-        enqueueEvent(detected);
+      bool detected=false;
+      if (activeMode==EX_SQUAT) { SquatEvent event; detected=squatDetector.process(s,event); }
+      else detected=motionDetector.process(s);
+      if (detected) {
+        uint32_t exerciseCount=++modeRepetitions[activeMode];
+        ++totalRepetitions;
+        if (!enqueueEvent(++eventSequence,exerciseCount,s.timestamp,activeMode))
+          Serial.printf("[EVENT] ERROR queue full; lost sequence=%lu %s rep=%lu\n",
+                        (unsigned long)eventSequence,exerciseName(activeMode),(unsigned long)exerciseCount);
+      }
+      if (recordUntil && (int32_t)(recordUntil-s.timestamp)>0) {
+        portENTER_CRITICAL(&recordMutex);
+        if(recordCount<RECORD_CAPACITY){recordQueue[recordHead]=s;recordHead=(recordHead+1)%RECORD_CAPACITY;recordCount++;}
+        else recordDrops++;
+        portEXIT_CRITICAL(&recordMutex);
       }
       frequencySamples++;
 #if CINDYSENSE_RAW_UPLOADS
@@ -555,6 +586,14 @@ void sensorTask(void* parameter) {
           Serial.printf("WARNING: MPU6050 I2C read failed (%lu consecutive)\n",
                         (unsigned long)consecutiveI2cFailures);
         }
+        if (!recoveryWaiting && consecutiveI2cFailures >= 5 &&
+            (lastRecovery == 0 || millis()-lastRecovery >= 5000)) {
+          lastRecovery=millis();
+          recoveryWaiting=writeRegister(0x6B,0x80);
+          recoveryStarted=millis();
+          Serial.printf("[MPU] I2C recovery reset %s\n",recoveryWaiting?"requested":"failed");
+          consecutiveI2cFailures=0;
+        }
       }
     }
 
@@ -569,7 +608,7 @@ void sensorTask(void* parameter) {
       }
     }
 
-    if (millis() - lastDiagnostics >= 1000) {
+    if (millis() - lastDiagnostics >= 5000) {
       lastDiagnostics = millis();
       BufferStats stats = getBufferStats();
       uint32_t elapsed=millis()-lastFrequencyReport;
@@ -579,21 +618,31 @@ void sensorTask(void* parameter) {
                     stats.buffered,BUFFER_SIZE,(unsigned long)stats.dropped,
                     (unsigned long)stats.readFailures,(unsigned long)stats.invalidFrames,
                     (unsigned long)stats.missedSlots);
-      Serial.printf("[SQUAT] hz=%lu count=%lu queued=%d confirmed=%lu retries=%lu overflow=%lu calibrated=%d\n",
-                    elapsed?(unsigned long)(frequencySamples*1000UL/elapsed):0,
-                    (unsigned long)squatDetector.count(),queuedEventCount(),
-                    (unsigned long)confirmedEvents,(unsigned long)eventRetries,
-                    (unsigned long)eventQueueOverflows,squatDetector.calibrated());
 #else
-      Serial.printf("[SENSOR] hz=%lu i2c=%lu inv=%lu miss=%lu [SQUAT] n=%lu q=%d ok=%lu retry=%lu ovf=%lu cal=%d\n",
+      Serial.printf("[SENSOR] hz=%lu i2c=%lu inv=%lu miss=%lu\n",
                     elapsed?(unsigned long)(frequencySamples*1000UL/elapsed):0,
                     (unsigned long)stats.readFailures,(unsigned long)stats.invalidFrames,
-                    (unsigned long)stats.missedSlots,(unsigned long)squatDetector.count(),
-                    queuedEventCount(),(unsigned long)confirmedEvents,(unsigned long)eventRetries,
-                    (unsigned long)eventQueueOverflows,squatDetector.calibrated());
+                    (unsigned long)stats.missedSlots);
 #endif
-      if(squatDetector.count()>reportedSquats){Serial.printf("[SQUAT] detected=%lu\n",(unsigned long)squatDetector.count());reportedSquats=squatDetector.count();}
-      if(eventQueueOverflows!=reportedEventOverflows){Serial.printf("[SQUAT] ERROR event queue overflow=%lu\n",(unsigned long)eventQueueOverflows);reportedEventOverflows=eventQueueOverflows;}
+      Serial.printf("[COUNT] mode=%s pullup=%lu pushup=%lu squat=%lu total=%lu q=%d confirmed=%lu retries=%lu overflow=%lu cal=%d heap=%u\n",
+                    exerciseName(activeMode),(unsigned long)modeRepetitions[EX_PULLUP],
+                    (unsigned long)modeRepetitions[EX_PUSHUP],(unsigned long)modeRepetitions[EX_SQUAT],
+                    (unsigned long)totalRepetitions,queuedEventCount(),(unsigned long)confirmedEvents,
+                    (unsigned long)eventRetries,(unsigned long)eventQueueOverflows,
+                    activeMode==EX_SQUAT?squatDetector.calibrated():motionDetector.calibrated(),
+                    (unsigned)ESP.getFreeHeap());
+      if(totalRepetitions>reportedTotal){Serial.printf("[REP] %s total=%lu\n",exerciseName(activeMode),(unsigned long)totalRepetitions);reportedTotal=totalRepetitions;}
+      if(eventQueueOverflows!=reportedEventOverflows){Serial.printf("[EVENT] ERROR event queue overflow=%lu\n",(unsigned long)eventQueueOverflows);reportedEventOverflows=eventQueueOverflows;}
+      if(localStressTest){
+        uint32_t heap=ESP.getFreeHeap();if(heap<stressMinHeap)stressMinHeap=heap;
+        if(millis()-stressStarted>=1200000UL){
+          localStressTest=false;
+          Serial.printf("[STRESS] COMPLETE 20min heap_start=%lu heap_min=%lu heap_end=%lu i2c=%lu missed=%lu total=%lu queue_overflow=%lu record_drops=%lu\n",
+            (unsigned long)stressHeapStart,(unsigned long)stressMinHeap,(unsigned long)heap,
+            (unsigned long)stats.readFailures,(unsigned long)stats.missedSlots,(unsigned long)totalRepetitions,
+            (unsigned long)eventQueueOverflows,(unsigned long)recordDrops);
+        }
+      }
       frequencySamples=0;lastFrequencyReport=millis();
     }
 
@@ -817,7 +866,13 @@ static String repetitionContainerUrl(){
 static bool deliverRepetitionEvent(const QueuedRepetition &event,bool &needsVerify,int &retryMs){
   if(WiFi.status()!=WL_CONNECTED)return false;
   time_t now=time(nullptr);
-  if(now<1700000000)return false; // wait until NTP provides an ISO-8601-capable clock
+  if(now<1700000000){
+    static uint32_t lastClockWarning=0;
+    if(!lastClockWarning || millis()-lastClockWarning>30000){
+      Serial.println("[EVENT] waiting for NTP UTC time; events remain queued");lastClockWarning=millis();
+    }
+    return false;
+  }
   time_t eventTime=event.epochSeconds?event.epochSeconds:now-((millis()-event.timestampMs)/1000);
   setEventEpoch(event.sequence,(uint32_t)eventTime);
   struct tm utc;gmtime_r(&eventTime,&utc);
@@ -829,16 +884,26 @@ static bool deliverRepetitionEvent(const QueuedRepetition &event,bool &needsVeri
            (unsigned long)(event.sequence&0xfff),(unsigned long)(mac&0xfff),
            (unsigned long long)(mac&0xffffffffffffULL));
   snprintf(resource,sizeof(resource),"esp-%08lx-%08lx",(unsigned long)bootNonce,(unsigned long)event.sequence);
-  snprintf(payload,sizeof(payload),"{\"m2m:cin\":{\"rn\":\"%s\",\"con\":\"{\\\"eventId\\\":\\\"%s\\\",\\\"eventSequence\\\":%lu,\\\"sessionId\\\":\\\"%s\\\",\\\"exercise\\\":\\\"squat\\\",\\\"repetitions\\\":%lu,\\\"round\\\":1,\\\"timestamp\\\":\\\"%s\\\",\\\"source\\\":\\\"mpu6050\\\"}\"}}",
-           resource,eventId,(unsigned long)event.sequence,eventSessionId,(unsigned long)event.repetitions,timestamp);
+  unsigned quota=event.exercise==EX_PULLUP?5:event.exercise==EX_PUSHUP?10:15;
+  int payloadLength=snprintf(payload,sizeof(payload),"{\"m2m:cin\":{\"rn\":\"%s\",\"con\":\"{\\\"eventId\\\":\\\"%s\\\",\\\"eventSequence\\\":%lu,\\\"sessionId\\\":\\\"%s\\\",\\\"exercise\\\":\\\"%s\\\",\\\"repetitions\\\":%lu,\\\"round\\\":%lu,\\\"timestamp\\\":\\\"%s\\\",\\\"source\\\":\\\"mpu6050\\\"}\"}}",
+           resource,eventId,(unsigned long)event.sequence,eventSessionId,exerciseName(event.exercise),
+           (unsigned long)event.repetitions,(unsigned long)((event.repetitions-1)/quota+1),timestamp);
+  if(payloadLength<0 || payloadLength>=(int)sizeof(payload)){Serial.println("[EVENT] payload too large; queued for retry");return false;}
   String url=repetitionContainerUrl()+"/"+resource;
   WiFiClient client;HTTPClient http;http.setTimeout(HTTP_TIMEOUT_MS);http.setConnectTimeout(1500);
   if(needsVerify){
     if(!http.begin(client,url))return false;
     http.addHeader("X-M2M-Origin",ORIGINATOR);http.addHeader("X-M2M-RVI","4");http.addHeader("X-M2M-RI",nextRequestId());
-    int code=http.GET();String body=code==200?http.getString():String();http.end();
-    if(code==200&&body.indexOf(eventId)>=0&&body.indexOf(eventSessionId)>=0&&
-       body.indexOf(String(event.repetitions))>=0){needsVerify=false;confirmEvent(event.sequence);return true;}
+    int code=http.GET();int length=http.getSize();int read=0;
+    if(code==200 && length>0 && length<(int)sizeof(eventReadback)){
+      read=http.getStreamPtr()->readBytes(eventReadback,length);
+      eventReadback[read]=0;
+    }
+    http.end();
+    Serial.printf("[EVENT] verify seq=%lu HTTP=%d bytes=%d\n",(unsigned long)event.sequence,code,read);
+    if(code==200 && read==length && strstr(eventReadback,eventId) &&
+       strstr(eventReadback,eventSessionId) && strstr(eventReadback,exerciseName(event.exercise)) &&
+       strstr(eventReadback,"mpu6050")){needsVerify=false;confirmEvent(event.sequence);return true;}
     if(code!=404){eventRetries++;retryMs=min(retryMs*2,MAX_RETRY_DELAY_MS);return false;}
     needsVerify=false;
   }
@@ -846,6 +911,7 @@ static bool deliverRepetitionEvent(const QueuedRepetition &event,bool &needsVeri
   http.addHeader("Content-Type","application/json;ty=4");http.addHeader("Accept","application/json");
   http.addHeader("X-M2M-Origin",ORIGINATOR);http.addHeader("X-M2M-RVI","4");http.addHeader("X-M2M-RI",nextRequestId());
   int code=http.POST((uint8_t*)payload,strlen(payload));http.end();
+  Serial.printf("[EVENT] POST seq=%lu %s HTTP=%d\n",(unsigned long)event.sequence,exerciseName(event.exercise),code);
   if(code==201){confirmEvent(event.sequence);retryMs=RETRY_DELAY_MS;return true;}
   needsVerify=true;eventRetries++;retryMs=min(retryMs*2,MAX_RETRY_DELAY_MS);return false;
 }
@@ -867,6 +933,7 @@ void networkTask(void* parameter) {
   bool eventNeedsVerify=false;int eventRetryDelay=RETRY_DELAY_MS;uint32_t eventRetryAt=0;
 
   while (true) {
+    if(localStressTest){vTaskDelay(pdMS_TO_TICKS(500));continue;}
 
     // Check Wi-Fi
     if (WiFi.status() != WL_CONNECTED) {
@@ -1006,6 +1073,7 @@ void setup() {
   // Initialize I2C
   Wire.begin(21, 22);
   Wire.setClock(100000);
+  Wire.setTimeOut(10);
 
   // Initialize MPU6050
   if (!initializeMPU()) {
@@ -1049,6 +1117,8 @@ void setup() {
 #endif
 
   Serial.println("Connecting to Wi-Fi...");
+  Serial.println("Commands: PULLUP, PUSHUP, SQUAT, RECORD, STRESS, STATUS");
+  Serial.println("[EVENT] RAM-only queue is lost on reboot; no persistent event storage");
 
   // Create sensor acquisition task
   BaseType_t sensorResult =
@@ -1097,6 +1167,45 @@ void setup() {
 
 void loop() {
   static unsigned long lastCheck = 0;
+  static char command[24];static uint8_t commandLength=0;
+  static bool recordFinished=true;
+  while(Serial.available()){
+    char ch=(char)Serial.read();
+    if(ch=='\r'||ch=='\n'){
+      command[commandLength]=0;
+      if(!strcmp(command,"PULLUP"))requestedMode=EX_PULLUP;
+      else if(!strcmp(command,"PUSHUP"))requestedMode=EX_PUSHUP;
+      else if(!strcmp(command,"SQUAT"))requestedMode=EX_SQUAT;
+      else if(!strcmp(command,"RECORD")){
+        portENTER_CRITICAL(&recordMutex);
+        recordHead=recordTail=recordCount=0;recordDrops=0;
+        portEXIT_CRITICAL(&recordMutex);
+        recordUntil=millis()+30000;
+        recordFinished=false;
+        Serial.println("[RECORD] 30 seconds CSV: hold starting posture 4 seconds, then perform 5 controlled reps");
+        Serial.println("t,ax,ay,az,gx,gy,gz");
+      } else if(!strcmp(command,"STRESS")){
+        stressStarted=millis();stressHeapStart=stressMinHeap=ESP.getFreeHeap();localStressTest=true;
+        Serial.println("[STRESS] 20-minute local sampling/detection run started; network paused");
+      } else if(!strcmp(command,"STATUS")){
+        Serial.printf("[STATUS] mode=%s total=%lu queued=%d confirmed=%lu retries=%lu overflow=%lu heap=%u\n",
+          exerciseName(activeMode),(unsigned long)totalRepetitions,queuedEventCount(),
+          (unsigned long)confirmedEvents,(unsigned long)eventRetries,
+          (unsigned long)eventQueueOverflows,(unsigned)ESP.getFreeHeap());
+      } else if(commandLength) Serial.println("[CMD] Unknown command");
+      commandLength=0;
+    } else if(commandLength<sizeof(command)-1) command[commandLength++]=(char)toupper((unsigned char)ch);
+  }
+  SensorSample row;bool haveRow=false;
+  portENTER_CRITICAL(&recordMutex);
+  if(recordCount){row=recordQueue[recordTail];recordTail=(recordTail+1)%RECORD_CAPACITY;recordCount--;haveRow=true;}
+  portEXIT_CRITICAL(&recordMutex);
+  if(haveRow)Serial.printf("%lu,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+    (unsigned long)row.timestamp,row.ax,row.ay,row.az,row.gx,row.gy,row.gz);
+  if(!recordFinished && (int32_t)(millis()-recordUntil)>=0 && !recordCount){
+    recordFinished=true;recordUntil=0;
+    Serial.printf("[RECORD] complete dropped=%lu (repeat if nonzero)\n",(unsigned long)recordDrops);
+  }
 
   if (millis() - lastCheck >= 5000) {
     lastCheck = millis();
@@ -1114,6 +1223,6 @@ void loop() {
     }
   }
 
-  delay(100);
+  delay(recordCount?1:20);
 }
 

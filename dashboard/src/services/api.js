@@ -28,5 +28,7 @@ async function getJson(path, { signal } = {}) {
 
 export const getBackendHealth = (options) => getJson('/api/health', options)
 export const getLatestRepetition = (options) => getJson('/api/workout/live', options)
+export const getWorkoutSnapshot = (options) => getJson('/api/workout/snapshot', options)
+export const getWebcamStatus = (options) => getJson('/api/workout/webcam-status', options)
 export const getWorkoutHistory = (options) => getJson('/api/workout/history', options)
 export const getCindyPtRecommendations = (options) => getJson('/api/cindypt/recommendations', options)

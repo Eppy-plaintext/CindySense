@@ -52,6 +52,8 @@ def exercise_measurement(exercise, landmarks, width, height, include_reason=Fals
         confidence, angle, label = max(candidates, key=lambda item: item[0])
         return result(angle, confidence, label, "knee landmarks visible")
 
+    if exercise not in ("pushup", "pullup"):
+        raise ValueError(f"Unknown exercise: {exercise}")
     candidates = []
     rejected = []
     for shoulder, elbow, wrist, hip, ankle, side in (
@@ -63,36 +65,27 @@ def exercise_measurement(exercise, landmarks, width, height, include_reason=Fals
         if elbow_angle is None:
             rejected.append(f"{side} elbow visibility {confidence:.2f} < {MIN_VISIBILITY:.2f}")
             continue
-        alignment_missing = False
         if exercise == "pushup":
-            # Use body alignment when visible. At the bottom of a push-up the ankles
-            # are often occluded; do not discard a usable elbow angle for that alone.
             alignment, align_conf = _visible_angle(
                 landmarks, (shoulder, hip, ankle), width, height
             )
-            if alignment is not None and alignment < 145.0:
+            if alignment is None:
+                rejected.append(f"{side} shoulder/hip/ankle visibility {align_conf:.2f} < {MIN_VISIBILITY:.2f}")
+                continue
+            if alignment < 145.0:
                 rejected.append(f"{side} body alignment {alignment:.0f}<145 deg")
                 continue
-            if alignment is not None:
-                confidence = min(confidence, align_conf)
-            else:
-                alignment_missing = True
-        elif exercise == "pullup":
-            # At extension, wrists should be above shoulders (image y decreases upward).
-            if elbow_angle >= 140.0 and landmarks[wrist].y > landmarks[shoulder].y + 0.12:
-                rejected.append(f"{side} extended wrists not above shoulders")
-                continue
-        candidates.append((confidence, elbow_angle, side, alignment_missing))
+            confidence = min(confidence, align_conf)
+        # Pull-ups require the elbow triplet. Wrist image height and nose
+        # visibility vary by view; full-cycle vertical motion is checked later.
+        candidates.append((confidence, elbow_angle, side))
     if not candidates:
         return result(None, 0.0, "NONE", "; ".join(rejected) or "no usable arm landmarks")
-    confidence, angle, side, alignment_missing = max(candidates, key=lambda item: item[0])
-    reason = "elbow landmarks visible"
-    if exercise == "pushup" and alignment_missing:
-        reason = "ankle/hip alignment occluded; using elbow angle"
-    return result(angle, confidence, side, reason)
+    confidence, angle, side = max(candidates, key=lambda item: item[0])
+    return result(angle, confidence, side, "elbow and exercise posture visible")
 
 
-def body_movement_measurement(exercise, landmarks):
+def body_movement_measurement(exercise, landmarks, tracked_side=None):
     """Return normalized vertical torso position, visibility, and signal description.
 
     A fixed camera is assumed. Squat/push-up descent moves hips/shoulders down in
@@ -102,11 +95,11 @@ def body_movement_measurement(exercise, landmarks):
         indices = (23, 24)
         label = "hip midpoint"
     elif exercise == "pushup":
-        indices = (11, 12)
+        indices = (11,) if tracked_side == "LEFT" else (12,) if tracked_side == "RIGHT" else (11, 12)
         label = "shoulder midpoint"
     elif exercise == "pullup":
-        indices = (11, 12, 23, 24)
-        label = "torso midpoint"
+        indices = (11,) if tracked_side == "LEFT" else (12,) if tracked_side == "RIGHT" else (11, 12)
+        label = "shoulder midpoint"
     else:
         raise ValueError(f"Unknown exercise: {exercise}")
     visible = [landmarks[index] for index in indices if visibility(landmarks[index]) >= MIN_VISIBILITY]
@@ -118,14 +111,28 @@ def body_movement_measurement(exercise, landmarks):
     return position, confidence, label
 
 
+def pullup_auxiliary_measurement(landmarks):
+    """Optional head height and shoulder horizontal position for pull-up evidence."""
+    head_y = float(landmarks[0].y) if visibility(landmarks[0]) >= MIN_VISIBILITY else None
+    shoulders = [landmarks[i] for i in (11, 12)
+                 if visibility(landmarks[i]) >= MIN_VISIBILITY]
+    shoulder_x = (sum(float(point.x) for point in shoulders) / 2
+                  if len(shoulders) == 2 else None)
+    return head_y, shoulder_x
+
+
 class ExerciseCounter:
-    """A complete low-angle then extended-angle cycle increments one repetition."""
+    """Count a complete joint-angle cycle with exercise-specific posture evidence."""
     CONFIG = {
         "squat": (115.0, 155.0),
         "pushup": (95.0, 155.0),
         "pullup": (100.0, 150.0),
     }
-    MAX_MISSING_FRAMES = 300  # 10 seconds at 30 fps; retain a known phase across occlusion.
+    MAX_MISSING_FRAMES = 8
+    COOLDOWN_FRAMES = 10
+    MOVEMENT_DOWN = {"pushup": 0.035, "pullup": 0.04}
+    ARM_DOWN = {"pushup": 95.0, "pullup": 120.0}
+    ARM_UP = {"pushup": 155.0, "pullup": 145.0}
 
     def __init__(self, exercise):
         if exercise not in self.CONFIG:
@@ -140,20 +147,51 @@ class ExerciseCounter:
         self.body_descent_seen = False
         self.position_calibration_frames = 0
         self.missing_frames = 0
+        self.cooldown_frames = 0
         self.last_reason = "waiting_for_extended_pose"
+        self.last_rejection = None
+        self.rejected_candidates = 0
+        self.arm_peak = 0.0
+        self.head_baseline = self.head_peak = None
+        self.lateral_baseline = None
+        self.max_lateral = 0.0
+        self.extended_frames = 0
+        self.arm_phase_frames = 0
+        self.arm_start_angle = None
+        self.last_raw_position = self.last_head_position = None
 
-    def update(self, angle, movement=None):
-        if angle is None and movement is None:
+    def reset_phase(self):
+        """Re-arm after a mode switch without changing the accumulated count."""
+        self.phase = "UNKNOWN"
+        self.down_frames = self.up_frames = self.missing_frames = 0
+        self.smoothed_angle = self.smoothed_movement = self.movement_baseline = None
+        self.body_descent_seen = False
+        self.position_calibration_frames = 0
+        self.cooldown_frames = 0
+        self.last_reason = "waiting_for_extended_pose"
+        self.last_rejection = None
+        self.arm_peak = 0.0
+        self.head_baseline = self.head_peak = None
+        self.lateral_baseline = None
+        self.max_lateral = 0.0
+        self.extended_frames = 0
+        self.arm_phase_frames = 0
+        self.arm_start_angle = None
+        self.last_raw_position = self.last_head_position = None
+
+    def update(self, angle, movement=None, head_position=None, lateral_position=None):
+        if self.exercise != "squat":
+            return self._update_arm(angle, movement, head_position, lateral_position)
+        if angle is None or (self.exercise != "squat" and movement is None):
             self.down_frames = self.up_frames = 0
             self.smoothed_angle = None
             self.smoothed_movement = None
             self.missing_frames += 1
-            if (self.exercise == "pullup" or self.phase == "UNKNOWN"
-                    or self.missing_frames >= self.MAX_MISSING_FRAMES):
+            if self.missing_frames >= self.MAX_MISSING_FRAMES:
                 self.phase = "UNKNOWN"
-                if self.missing_frames >= self.MAX_MISSING_FRAMES:
-                    self.movement_baseline = None
-                    self.position_calibration_frames = 0
+                self.movement_baseline = None
+                self.position_calibration_frames = 0
+                self.body_descent_seen = False
             self.last_reason = (
                 "awaiting_first_visible_extended_pose" if self.phase == "UNKNOWN"
                 else f"no_measurement; preserving {self.phase} through occlusion"
@@ -176,7 +214,7 @@ class ExerciseCounter:
         movement_delta = None
         if self.smoothed_movement is not None and self.movement_baseline is not None:
             movement_delta = movement_sign * (self.smoothed_movement - self.movement_baseline)
-        if movement_delta is not None and movement_delta >= BODY_DOWN_DELTA:
+        if movement_delta is not None and movement_delta >= self.MOVEMENT_DOWN.get(self.exercise, BODY_DOWN_DELTA):
             self.body_descent_seen = True
         if self.phase == "UNKNOWN":
             angle_calibrated = self.smoothed_angle is not None and self.smoothed_angle >= up
@@ -185,35 +223,23 @@ class ExerciseCounter:
                 if self.smoothed_movement is not None:
                     self.movement_baseline = self.smoothed_movement
                 self.last_reason = "extended angle calibrated"
-            elif self.smoothed_angle is None and self.smoothed_movement is not None:
-                if self.movement_baseline is None:
-                    self.movement_baseline = self.smoothed_movement
-                    self.position_calibration_frames = 1
-                else:
-                    self.position_calibration_frames += 1
-                if self.position_calibration_frames >= STABLE_FRAMES:
-                    self.phase = "UP"
-                    self.last_reason = "body position baseline calibrated"
-                else:
-                    self.last_reason = f"calibrating body position ({self.position_calibration_frames}/{STABLE_FRAMES})"
             else:
-                self.last_reason = (
-                    f"waiting for extended angle>={up:.0f}; body-only calibration requires no angle"
-                    if self.smoothed_angle is not None
-                    else f"waiting for extended angle>={up:.0f} or visible body position"
-                )
+                self.last_reason = f"waiting for extended angle>={up:.0f} and required landmarks"
+            return False
+        if self.cooldown_frames:
+            self.cooldown_frames -= 1
+            self.last_reason = "cooldown"
             return False
         if self.phase == "UP":
             angle_down = self.smoothed_angle is not None and self.smoothed_angle <= down
-            position_down = movement_delta is not None and movement_delta >= BODY_DOWN_DELTA
-            self.down_frames = self.down_frames + 1 if angle_down or position_down else 0
+            position_down = movement_delta is not None and movement_delta >= self.MOVEMENT_DOWN.get(self.exercise, BODY_DOWN_DELTA)
+            accepted_down = angle_down and (self.exercise == "squat" or position_down)
+            self.down_frames = self.down_frames + 1 if accepted_down else 0
             if self.down_frames >= STABLE_FRAMES:
                 self.phase, self.down_frames = "DOWN", 0
-                self.last_reason = "down transition accepted by " + (
-                    "body movement" if position_down and not angle_down else "joint angle/body movement"
-                )
+                self.last_reason = "down transition accepted by joint angle and posture"
             else:
-                signal = "body movement" if self.smoothed_angle is None else f"angle<={down:.0f} or body movement"
+                signal = f"angle<={down:.0f}" + (" and torso motion" if self.exercise != "squat" else "")
                 self.last_reason = f"waiting for down {signal} ({self.down_frames}/{STABLE_FRAMES})"
             if self.down_frames == 0 and self.smoothed_movement is not None:
                 self.movement_baseline = 0.98 * self.movement_baseline + 0.02 * self.smoothed_movement
@@ -221,19 +247,171 @@ class ExerciseCounter:
             angle_up = self.smoothed_angle is not None and self.smoothed_angle >= up
             position_up = (self.body_descent_seen and movement_delta is not None
                            and movement_delta <= BODY_RETURN_DELTA)
-            self.up_frames = self.up_frames + 1 if angle_up or position_up else 0
+            accepted_up = angle_up and (self.exercise == "squat" or position_up)
+            self.up_frames = self.up_frames + 1 if accepted_up else 0
             if self.up_frames >= STABLE_FRAMES:
                 self.phase, self.up_frames = "UP", 0
                 self.reps += 1
-                self.last_reason = "full cycle counted by " + (
-                    "body movement" if position_up and not angle_up else "joint angle/body movement"
-                )
+                self.cooldown_frames = self.COOLDOWN_FRAMES
+                self.last_reason = "full joint-angle cycle with posture return"
                 if self.smoothed_movement is not None:
                     self.movement_baseline = self.smoothed_movement
                 self.body_descent_seen = False
                 return True
-            signal = "body movement" if self.smoothed_angle is None else f"angle>={up:.0f} or body return"
+            signal = f"angle>={up:.0f}" + (" and torso return" if self.exercise != "squat" else "")
             self.last_reason = f"waiting for up {signal} ({self.up_frames}/{STABLE_FRAMES})"
+        return False
+
+
+    def _reject_arm(self, reason, angle, movement, head, lateral):
+        self.rejected_candidates += 1
+        self.last_rejection = reason
+        self.last_reason = f"rejected candidate: {reason}"
+        self.phase = "UP" if angle is not None and angle >= self.ARM_UP[self.exercise] else "UNKNOWN"
+        self.arm_start_angle = angle if self.phase == "UP" else None
+        self.movement_baseline = movement if self.phase == "UP" else None
+        self.head_baseline = head if self.phase == "UP" else None
+        self.last_raw_position = movement
+        self.last_head_position = head
+        self.lateral_baseline = lateral if self.phase == "UP" else None
+        self.arm_peak = 0.0
+        self.head_peak = None
+        self.max_lateral = 0.0
+        self.down_frames = self.up_frames = self.extended_frames = self.arm_phase_frames = 0
+        self.cooldown_frames = 5
+        if self.phase == "UNKNOWN":
+            self.smoothed_angle = self.smoothed_movement = None
+
+    def _update_arm(self, angle, movement, head, lateral):
+        pullup = self.exercise == "pullup"
+        if angle is None or (movement is None and (not pullup or head is None)):
+            self.missing_frames += 1
+            if self.missing_frames > 3:
+                self.down_frames = self.up_frames = 0
+            if self.missing_frames >= self.MAX_MISSING_FRAMES:
+                if self.phase == "DOWN":
+                    self._reject_arm("landmarks missing too long", None, None, None, None)
+                else:
+                    self.phase = "UNKNOWN"
+                    self.movement_baseline = self.head_baseline = None
+                    self.last_raw_position = self.last_head_position = None
+                    self.smoothed_angle = self.smoothed_movement = None
+                    self.last_reason = "landmarks missing; recalibrating start"
+                return False
+            self.last_reason = f"brief landmark loss {self.missing_frames}/{self.MAX_MISSING_FRAMES}; preserving {self.phase}"
+            return False
+        if (movement is not None and self.last_raw_position is not None
+                and abs(movement - self.last_raw_position) > 0.15 + 0.03 * self.missing_frames):
+            self._update_arm(None, None, None, None)
+            self.last_reason = f"implausible shoulder tracking jump; preserving {self.phase}"
+            return False
+        if (head is not None and self.last_head_position is not None
+                and abs(head - self.last_head_position) > 0.15 + 0.03 * self.missing_frames):
+            head = None
+            self.head_baseline = self.head_peak = None
+        self.missing_frames = 0
+        self.last_raw_position = movement
+        if head is not None:
+            self.last_head_position = head
+        self.smoothed_angle = angle if self.smoothed_angle is None else 0.45 * angle + 0.55 * self.smoothed_angle
+        if movement is not None:
+            self.smoothed_movement = (movement if self.smoothed_movement is None else
+                                      0.45 * movement + 0.55 * self.smoothed_movement)
+        position = self.smoothed_movement
+        down_sign = -1.0 if pullup else 1.0
+        delta = (down_sign * (position - self.movement_baseline)
+                 if position is not None and self.movement_baseline is not None else None)
+        head_delta = (self.head_baseline - head if head is not None and self.head_baseline is not None else None)
+        up = self.ARM_UP[self.exercise]
+        if self.phase == "UNKNOWN":
+            if self.smoothed_angle >= up and position is not None:
+                self.phase = "UP"
+                self.movement_baseline = position
+                self.head_baseline = head
+                self.lateral_baseline = lateral
+                self.arm_start_angle = self.smoothed_angle
+                self.last_reason = "extended starting pose calibrated"
+            else:
+                self.last_reason = f"waiting for extended angle>={up:.0f} and shoulder position"
+            return False
+        if self.cooldown_frames:
+            self.cooldown_frames -= 1
+            self.last_reason = "cooldown"
+            return False
+        if self.phase == "UP":
+            down = min(self.ARM_DOWN["pullup"], self.arm_start_angle - 35.0) if pullup else self.ARM_DOWN["pushup"]
+            angle_down = self.smoothed_angle <= down
+            # Shallow elbow flexion needs stronger whole-body travel than a
+            # clearly flexed elbow; this admits camera-angle variation without
+            # making an arm gesture alone look like a pull-up.
+            shoulder_threshold = (0.070 if self.smoothed_angle > 100 else 0.040) if pullup else 0.035
+            head_threshold = 0.080 if self.smoothed_angle > 100 else 0.050
+            shoulder_down = delta is not None and delta >= shoulder_threshold
+            head_down = pullup and head_delta is not None and head_delta >= head_threshold
+            accepted = angle_down and (shoulder_down or head_down)
+            self.down_frames = self.down_frames + 1 if accepted else 0
+            if self.down_frames >= STABLE_FRAMES:
+                self.phase = "DOWN"
+                self.down_frames = self.up_frames = self.extended_frames = self.arm_phase_frames = 0
+                self.arm_peak = max(0.0, delta or 0.0)
+                self.head_peak = max(0.0, head_delta or 0.0) if pullup else None
+                self.max_lateral = 0.0
+                self.last_reason = "flexion and vertical travel accepted; waiting for return"
+            else:
+                self.last_reason = (f"waiting for flexion<={down:.0f} and vertical travel "
+                                    f"(shoulder={delta if delta is not None else 0:.3f}, "
+                                    f"head={head_delta if head_delta is not None else 0:.3f}; "
+                                    f"{self.down_frames}/{STABLE_FRAMES})")
+                if self.smoothed_angle >= up and position is not None:
+                    # Calibrate only while fully extended, never during descent.
+                    self.movement_baseline = 0.95 * self.movement_baseline + 0.05 * position
+                    self.arm_start_angle = 0.9 * self.arm_start_angle + 0.1 * self.smoothed_angle
+                    if head is not None:
+                        self.head_baseline = head if self.head_baseline is None else 0.95 * self.head_baseline + 0.05 * head
+                    if lateral is not None:
+                        self.lateral_baseline = lateral if self.lateral_baseline is None else 0.95 * self.lateral_baseline + 0.05 * lateral
+            return False
+
+        self.arm_phase_frames += 1
+        self.arm_peak = max(self.arm_peak, delta or 0.0)
+        if pullup and head_delta is not None:
+            self.head_peak = max(self.head_peak or 0.0, head_delta)
+        if pullup and lateral is not None and self.lateral_baseline is not None:
+            self.max_lateral = max(self.max_lateral, abs(lateral - self.lateral_baseline))
+        shoulder_return = (delta is not None and self.arm_peak >= (0.030 if pullup else 0.035)
+                           and self.arm_peak - delta >= max(0.020, 0.65 * self.arm_peak))
+        head_return = (pullup and head_delta is not None and (self.head_peak or 0) >= 0.040
+                       and self.head_peak - head_delta >= max(0.025, 0.65 * self.head_peak))
+        returned = shoulder_return or head_return
+        angle_up = self.smoothed_angle >= up
+        self.extended_frames = self.extended_frames + 1 if angle_up else 0
+        self.up_frames = self.up_frames + 1 if angle_up and returned else 0
+        if self.up_frames >= STABLE_FRAMES:
+            if pullup and self.max_lateral >= 0.10:
+                self._reject_arm(f"lateral swing {self.max_lateral:.3f} >= 0.100", self.smoothed_angle, position, head, lateral)
+                return False
+            self.reps += 1
+            self.phase = "UP"
+            self.cooldown_frames = self.COOLDOWN_FRAMES
+            self.movement_baseline = position
+            self.head_baseline = head
+            self.lateral_baseline = lateral
+            self.arm_start_angle = self.smoothed_angle
+            self.arm_peak = 0.0
+            self.head_peak = None
+            self.up_frames = self.extended_frames = self.arm_phase_frames = 0
+            self.last_reason = "complete flexion, vertical travel, and stable return"
+            return True
+        if self.extended_frames >= 20 or self.arm_phase_frames >= 300:
+            reason = (f"extended elbows but insufficient torso return; peak={self.arm_peak:.3f}, "
+                      f"current={delta if delta is not None else 0:.3f}"
+                      if self.extended_frames >= 20 else "candidate timed out before return")
+            self._reject_arm(reason, self.smoothed_angle, position, head, lateral)
+            return False
+        self.last_reason = (f"waiting for extended angle>={up:.0f} and rise from candidate peak "
+                            f"(angle={self.smoothed_angle:.0f}, peak={self.arm_peak:.3f}, "
+                            f"current={delta if delta is not None else 0:.3f}; "
+                            f"{self.up_frames}/{STABLE_FRAMES})")
         return False
 
 

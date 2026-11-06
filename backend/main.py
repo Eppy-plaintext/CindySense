@@ -1,6 +1,9 @@
 """CindySense API: React -> FastAPI -> TinyIoT."""
 
 import secrets
+import httpx
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,9 +12,16 @@ from .config import settings
 from .events import RepetitionEvent, classify_repetition_content
 from .simulation import SimulationPublisher
 from .tinyiot import TinyIoTClient, TinyIoTError
+from .workout_snapshot import WorkoutSnapshot
 
 
-app = FastAPI(title='CindySense API', version='0.1.0')
+@asynccontextmanager
+async def lifespan(app):
+    yield
+    await tinyiot._client.aclose()
+
+
+app = FastAPI(title='CindySense API', version='0.1.0', lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=['http://localhost:5173', 'http://127.0.0.1:5173'],
@@ -20,8 +30,11 @@ app.add_middleware(
     allow_headers=['*'],
 )
 
-tinyiot = TinyIoTClient(settings.base_url)
+tinyiot = TinyIoTClient(settings.base_url, httpx.AsyncClient(timeout=5.0))
 simulation_publisher = SimulationPublisher()
+workout_snapshot = WorkoutSnapshot()
+
+
 
 
 def api_error(exc: TinyIoTError) -> HTTPException:
@@ -61,6 +74,36 @@ async def live_workout():
             'structured_event': event.content() if event else None,
             'legacy_content': legacy,
             'recorded_at': instance.get('ct'),
+        }
+    except TinyIoTError as exc:
+        raise api_error(exc) from exc
+
+
+@app.get('/api/workout/snapshot')
+async def live_workout_snapshot():
+    try:
+        return await workout_snapshot.read(tinyiot, settings.repetition_resource, settings.workout_origin)
+    except TinyIoTError as exc:
+        raise api_error(exc) from exc
+
+
+@app.get('/api/workout/webcam-status')
+async def webcam_status():
+    try:
+        content, instance = await tinyiot.latest_content('Webcam_AE/PoseData', settings.webcam_origin)
+        if not isinstance(content, dict) or content.get('source') != 'webcam_live':
+            raise TinyIoTError('invalid_content', 'Latest webcam pose status is unavailable.', 502)
+        return {
+            'sessionId': content.get('sessionId'),
+            'exercise': content.get('exercise'),
+            'detectedRepetitions': content.get('repCount'),
+            'eventQueueDepth': content.get('eventQueueDepth'),
+            'eventConfirmed': content.get('eventConfirmed'),
+            'eventRetries': content.get('eventRetries'),
+            'eventOverflow': content.get('eventOverflow'),
+            'detectedAt': content.get('timestampUtc'),
+            'storedAt': instance.get('ct'),
+            'retrievedAt': datetime.now(timezone.utc).isoformat(timespec='milliseconds'),
         }
     except TinyIoTError as exc:
         raise api_error(exc) from exc

@@ -1,10 +1,19 @@
 import unittest
+import json
 from unittest.mock import patch
+import os
 
 import httpx
 
 from backend import main
+from backend.config import tinyiot_base_url
 from backend.tinyiot import TinyIoTClient
+
+
+class ConfigTests(unittest.TestCase):
+    def test_tinyiot_base_path_keeps_required_case(self):
+        with patch.dict(os.environ, {'TINYIOT_BASE_URL': 'http://localhost:3000/tinyiot/'}):
+            self.assertEqual(tinyiot_base_url(), 'http://localhost:3000/TinyIoT')
 
 
 class APITests(unittest.IsolatedAsyncioTestCase):
@@ -68,6 +77,22 @@ class APITests(unittest.IsolatedAsyncioTestCase):
         response = await self.api.get('/api/workout/live')
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()['latest_repetition_content'], 11)
+
+    async def test_webcam_json_string_squat_event_is_parsed_without_round_inference(self):
+        event = {
+            'eventId': 'a18a9ce4-684d-45bc-944e-81dc7442828c',
+            'eventSequence': 1, 'sessionId': 'webcam-20261106T120000Z',
+            'exercise': 'squat', 'repetitions': 1, 'round': 1,
+            'timestamp': '2026-11-06T12:00:00Z', 'source': 'webcam',
+        }
+        self.workout_content = json.dumps(event)
+        response = await self.api.get('/api/workout/live')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['content_kind'], 'structured_event')
+        self.assertEqual(response.json()['structured_event'], event)
+        self.assertEqual(response.json()['latest_repetition_content'], event)
+        self.assertNotIn('roundsCompleted', response.json())
+        self.assertTrue(all('/TinyIoT/' in str(request.url) for request in self.requests))
 
     async def test_recommendations_use_separate_origin(self):
         response = await self.api.get('/api/cindypt/recommendations')
