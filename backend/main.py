@@ -9,10 +9,12 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import settings
+from .cindypt import Goal, analyze, read_goal, read_summaries, recommend
 from .events import RepetitionEvent, classify_repetition_content
 from .simulation import SimulationPublisher
 from .tinyiot import TinyIoTClient, TinyIoTError
 from .workout_snapshot import WorkoutSnapshot
+from .weekly_plan import PlanPreferences, SavePlanRequest, generate_weekly_plan
 
 
 @asynccontextmanager
@@ -26,7 +28,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=['http://localhost:5173', 'http://127.0.0.1:5173'],
     allow_credentials=False,
-    allow_methods=['GET'],
+    allow_methods=['GET', 'POST'],
     allow_headers=['*'],
 )
 
@@ -142,7 +144,17 @@ async def workout_history():
 @app.get('/api/cindypt/recommendations')
 async def recommendations():
     try:
-        content, instance = await tinyiot.latest_content(settings.recommendations_resource, settings.cindypt_origin)
+        try:
+            content, instance = await tinyiot.latest_content(settings.recommendations_resource, settings.cindypt_origin)
+        except TinyIoTError as exc:
+            if exc.code != 'resource_not_found':
+                raise
+            container = await tinyiot.retrieve(settings.recommendations_resource, settings.cindypt_origin)
+            if 'm2m:cnt' not in container:
+                raise TinyIoTError('invalid_resource', 'Recommendation resource is not a container.', 502) from exc
+            return {'available': False, 'source': 'TinyIoT',
+                    'resource_path': settings.recommendations_resource, 'recommendations': None,
+                    'recorded_at': None}
         if not isinstance(content, (dict, list, str)):
             raise TinyIoTError('invalid_content', 'Latest recommendation content has an unsupported format.', 502)
         return {
@@ -152,5 +164,146 @@ async def recommendations():
             'recommendations': content,
             'recorded_at': instance.get('ct'),
         }
+    except TinyIoTError as exc:
+        raise api_error(exc) from exc
+
+
+@app.get('/api/cindypt/goal')
+async def cindypt_goal():
+    try:
+        goal = await read_goal(tinyiot, settings.target_plan_resource, settings.cindypt_origin)
+        return {'available': goal is not None, 'goal': goal, 'source': 'TinyIoT'}
+    except TinyIoTError as exc:
+        raise api_error(exc) from exc
+
+
+@app.post('/api/cindypt/goal', status_code=201)
+async def set_cindypt_goal(goal: Goal):
+    try:
+        await tinyiot.create_content(settings.target_plan_resource, settings.cindypt_origin, goal.model_dump())
+        return {'goal': goal.model_dump(), 'resource_path': settings.target_plan_resource}
+    except TinyIoTError as exc:
+        raise api_error(exc) from exc
+
+
+async def _cindypt_progress():
+    goal = await read_goal(tinyiot, settings.target_plan_resource, settings.cindypt_origin)
+    if goal is None:
+        return {'available': False, 'goal': None, 'workout': None, 'message': 'No Cindy goal is stored.'}
+    summaries = await read_summaries(tinyiot, settings.workout_summary_resource, settings.cindypt_origin)
+    return analyze(goal, summaries[0] if summaries else None)
+
+
+@app.get('/api/cindypt/progress')
+async def cindypt_progress():
+    try:
+        return await _cindypt_progress()
+    except TinyIoTError as exc:
+        raise api_error(exc) from exc
+
+
+@app.post('/api/cindypt/recommendations/generate', status_code=201)
+async def generate_cindypt_recommendation():
+    try:
+        progress = await _cindypt_progress()
+        if not progress['available']:
+            raise HTTPException(status_code=409, detail={'code': 'insufficient_data', 'message': progress['message']})
+        advice = recommend(progress)
+        await tinyiot.create_content(settings.recommendations_resource, settings.cindypt_origin, advice)
+        return {'recommendations': advice, 'resource_path': settings.recommendations_resource}
+    except TinyIoTError as exc:
+        raise api_error(exc) from exc
+
+
+async def _weekly_preview(preferences: PlanPreferences):
+    goal = await read_goal(tinyiot, settings.target_plan_resource, settings.cindypt_origin)
+    if goal is None:
+        raise HTTPException(status_code=409, detail={'code': 'missing_goal', 'message': 'Save a Cindy goal before planning.'})
+    summaries = await read_summaries(tinyiot, settings.workout_summary_resource, settings.cindypt_origin)
+    return generate_weekly_plan(goal, summaries, preferences)
+
+
+@app.post('/api/cindypt/plans/preview')
+async def preview_weekly_plan(preferences: PlanPreferences):
+    try:
+        return {'preview': True, 'plan': await _weekly_preview(preferences)}
+    except TinyIoTError as exc:
+        raise api_error(exc) from exc
+
+
+@app.post('/api/cindypt/plans', status_code=201)
+async def save_weekly_plan(request: SavePlanRequest):
+    try:
+        plan = await _weekly_preview(request.preferences)
+        if plan['planId'] != request.planId:
+            raise HTTPException(status_code=409, detail={'code': 'stale_preview', 'message': 'The plan changed. Preview it again before saving.'})
+        resources = (settings.training_plans_resource, settings.workout_schedule_resource,
+                     settings.recovery_resource)
+        for resource in resources:
+            container = await tinyiot.retrieve(resource, settings.cindypt_origin)
+            if 'm2m:cnt' not in container:
+                raise TinyIoTError('invalid_resource', 'A plan resource is not a oneM2M container.', 502)
+        name = 'plan-' + plan['planId']
+        records = (plan,
+                   {'planId': plan['planId'], 'weekStart': plan['weekStart'],
+                    'timezone': plan['timezone'], 'days': plan['days']},
+                   {'planId': plan['planId'], 'weekStart': plan['weekStart'],
+                    'timezone': plan['timezone'], 'items': plan['recoveryRecommendations']})
+        created = []
+        for resource, content in zip(resources, records):
+            created.append(await tinyiot.create_named_content(resource, settings.cindypt_origin,
+                                                               name, content))
+        return {'plan': plan, 'alreadySaved': not any(created), 'source': 'TinyIoT'}
+    except TinyIoTError as exc:
+        raise api_error(exc) from exc
+
+
+async def _latest_optional(resource: str):
+    try:
+        return await tinyiot.latest_content(resource, settings.cindypt_origin)
+    except TinyIoTError as exc:
+        if exc.code != 'resource_not_found':
+            raise
+        container = await tinyiot.retrieve(resource, settings.cindypt_origin)
+        if 'm2m:cnt' not in container:
+            raise TinyIoTError('invalid_resource', 'A plan resource is not a oneM2M container.', 502) from exc
+        return None
+
+
+@app.get('/api/cindypt/plans')
+async def get_saved_weekly_plan():
+    try:
+        result = await _latest_optional(settings.training_plans_resource)
+        if result is None:
+            return {'available': False, 'plan': None, 'source': 'TinyIoT'}
+        plan, instance = result
+        if not isinstance(plan, dict) or not isinstance(plan.get('planId'), str):
+            raise TinyIoTError('invalid_content', 'Stored weekly plan is malformed.', 502)
+        name = 'plan-' + plan['planId']
+        for resource in (settings.workout_schedule_resource, settings.recovery_resource):
+            try:
+                content, _ = tinyiot.parse_content_instance(
+                    await tinyiot.retrieve(f'{resource}/{name}', settings.cindypt_origin))
+            except TinyIoTError as exc:
+                if exc.code == 'resource_not_found':
+                    return {'available': False, 'plan': None, 'incomplete': True, 'source': 'TinyIoT'}
+                raise
+            if not isinstance(content, dict) or content.get('planId') != plan['planId']:
+                raise TinyIoTError('invalid_content', 'Stored weekly plan records disagree.', 502)
+        return {'available': True, 'plan': plan, 'recordedAt': instance.get('ct'), 'source': 'TinyIoT'}
+    except TinyIoTError as exc:
+        raise api_error(exc) from exc
+
+
+@app.get('/api/cindypt/recovery')
+async def get_saved_recovery():
+    try:
+        result = await _latest_optional(settings.recovery_resource)
+        if result is None:
+            return {'available': False, 'recovery': None, 'source': 'TinyIoT'}
+        content, instance = result
+        if not isinstance(content, dict) or not isinstance(content.get('items'), list):
+            raise TinyIoTError('invalid_content', 'Stored recovery guidance is malformed.', 502)
+        return {'available': True, 'recovery': content, 'recordedAt': instance.get('ct'), 'source': 'TinyIoT'}
     except TinyIoTError as exc:
         raise api_error(exc) from exc

@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { ConnectionStatus, HistoryAvailability, StoredRecommendationPanel, StoredRepetitionPanel } from './components/ApiPanels.jsx'
+import { ConnectionStatus, HistoryAvailability, StoredRepetitionPanel } from './components/ApiPanels.jsx'
+import { CindyPtPage } from './components/CindyPtPage.jsx'
 import { usePolling } from './hooks/usePolling.js'
-import { getBackendHealth, getCindyPtRecommendations, getLatestRepetition, getWebcamStatus, getWorkoutHistory, getWorkoutSnapshot } from './services/api.js'
+import { getBackendHealth, getLatestRepetition, getWebcamStatus, getWorkoutHistory, getWorkoutSnapshot } from './services/api.js'
 import { acceptSnapshot, liveDisplay } from './services/workoutDisplay.js'
 import './App.css'
 
@@ -50,7 +51,6 @@ function App() {
   const liveResult = usePolling(getLatestRepetition, { enabled: activePage === 'dashboard' })
   const snapshotResult = usePolling(getLiveSnapshot, { enabled: activePage === 'dashboard', intervalMs: 750 })
   const webcamStatus = usePolling(getWebcamStatus, { enabled: activePage === 'dashboard' && displayMode === 'webcam', intervalMs: 1500 })
-  const recommendationResult = usePolling(getCindyPtRecommendations, { enabled: activePage === 'pt' })
   const historyResult = usePolling(getWorkoutHistory, { enabled: activePage === 'history', intervalMs: null })
 
   useEffect(() => {
@@ -122,7 +122,7 @@ function App() {
       <nav className="mobile-nav" aria-label="Mobile navigation">{[['dashboard', 'Dashboard'], ['history', 'History'], ['pt', 'Cindy PT']].map(([page, label]) => <button key={page} className={activePage === page ? 'active' : ''} onClick={() => setActivePage(page)}>{label}</button>)}</nav>
       {activePage === 'dashboard' && <Dashboard secondsLeft={secondsLeft} formatTime={formatTime} timerProgress={timerProgress} workoutState={workoutState} setWorkoutState={setWorkoutState} resetWorkout={resetWorkout} reps={reps} rounds={rounds} activeExercise={activeExercise} setActiveExercise={setActiveExercise} incrementRep={incrementRep} currentExercise={currentExercise} autoSimulate={autoSimulate} setAutoSimulate={setAutoSimulate} liveResult={liveResult} snapshotResult={snapshotResult} webcamStatus={webcamStatus} lastSnapshot={lastSnapshot} displayMode={displayMode} setDisplayMode={setDisplayMode} now={now} />}
       {activePage === 'history' && <><div className="view-data-slot"><HistoryAvailability result={historyResult} /><p className="demo-section-label">SIMULATED HISTORY EXAMPLES BELOW</p></div><HistoryPage /></>}
-      {activePage === 'pt' && <><div className="view-data-slot"><StoredRecommendationPanel result={recommendationResult} /></div><CindyPtPage /></>}
+      {activePage === 'pt' && <CindyPtPage />}
     </main>
   </div>
 }
@@ -174,11 +174,6 @@ function Dashboard({ secondsLeft, formatTime, timerProgress, workoutState, setWo
 function HistoryPage() {
   const sessions = [['Oct 25, 2026', 'Sunday', '5 rounds + 12 reps', '19:42', 'Completed'], ['Oct 23, 2026', 'Friday', '4 rounds + 21 reps', '20:00', 'Completed'], ['Oct 21, 2026', 'Wednesday', '3 rounds + 28 reps', '20:00', 'Completed'], ['Oct 19, 2026', 'Monday', '4 rounds + 5 reps', '17:36', 'Stopped early']]
   return <div className="page-wrap"><section className="page-heading"><div><p className="eyebrow">PERFORMANCE LOG</p><h1>Workout history</h1><p className="subheading">A clear view of your work, one session at a time.</p></div><button className="outline-btn"><span>↗</span> Export data</button></section><section className="history-summary">{[['orange', '◒', 'SESSIONS THIS MONTH', '14', '+3 vs. last month'], ['blue', '↗', 'AVERAGE ROUNDS', '4.2', '+0.6 round improvement'], ['violet', '✦', 'BEST SESSION', '5.4', 'Oct 25, 2026']].map((item) => <div className="summary-card panel" key={item[2]}><span className={`summary-symbol ${item[0]}`}>{item[1]}</span><div><small>{item[2]}</small><strong>{item[3]}</strong><span>{item[4]}</span></div></div>)}</section><section className="panel history-panel"><div className="panel-header"><div><p className="eyebrow">RECENT SESSIONS</p><h2>Your training rhythm</h2></div><span className="history-filter">Last 30 days <Icon name="chevron" size={14} /></span></div><div className="history-table"><div className="history-row history-head"><span>DATE</span><span>RESULT</span><span>DURATION</span><span>STATUS</span><span></span></div>{sessions.map((session) => <div className="history-row" key={session[0]}><span><strong>{session[0]}</strong><small>{session[1]}</small></span><span className="result">{session[2]}</span><span className="duration">{session[3]}</span><span><em className={`status-chip ${session[4] === 'Completed' ? 'complete' : 'stopped'}`}>{session[4]}</em></span><button aria-label={`View ${session[0]} workout details`}><Icon name="chevron" size={16} /></button></div>)}</div></section></div>
-}
-
-function CindyPtPage() {
-  const schedule = [['MON', 'Technique + mobility', 'Done', 'done'], ['TUE', 'Cindy AMRAP', 'Today', 'today'], ['WED', 'Active recovery', 'Next', 'next'], ['THU', 'Strength base', 'Upcoming', 'next']]
-  return <div className="page-wrap"><section className="page-heading"><div><p className="eyebrow">YOUR DIGITAL COACH</p><h1>Cindy PT <span>✦</span></h1><p className="subheading">Small, smart adjustments that keep your training moving forward.</p></div><span className="coach-badge"><span className="pulse-dot"></span> SIMULATED COACH</span></section><div className="pt-grid"><section className="goal-card panel"><div className="goal-orb">↗</div><p className="eyebrow">CURRENT FITNESS GOAL</p><h2>Build your engine</h2><p>Complete 5 rounds of Cindy unbroken by the end of November.</p><div className="goal-progress"><div><span>Progress</span><strong>68%</strong></div><div className="progress-track"><span style={{ width: '68%' }}></span></div></div><span className="simulated-label">SIMULATED RECOMMENDATION</span></section><section className="panel schedule-card"><div className="panel-header"><div><p className="eyebrow">THIS WEEK</p><h2>Training schedule</h2></div><span className="week-label">Week 44</span></div><div className="schedule-list">{schedule.map((item) => <div className="schedule-item" key={item[0]}><strong>{item[0]}</strong><span>{item[1]}</span><em className={item[3]}>{item[2]}</em></div>)}</div></section><section className="panel rest-card"><div className="rest-icon">☼</div><div><p className="eyebrow">NEXT REST DAY</p><h2>Wednesday, October 28</h2><p>20 min walk · 10 min shoulder mobility · hydrate well</p></div></section><section className="panel recommendations"><div className="panel-header"><div><p className="eyebrow">COACH'S NOTES</p><h2>Recommendations for you</h2></div><span className="simulated-label">ALL SIMULATED</span></div><div className="recommendation-list"><div><span className="recommendation-number">01</span><p><strong>Break your push-ups into 5 + 5.</strong><br />You’ll preserve your shoulder rhythm for later rounds.</p><Icon name="chevron" size={16} /></div><div><span className="recommendation-number">02</span><p><strong>Try a 90-second warm-up.</strong><br />Prime your hips and wrists before the clock starts.</p><Icon name="chevron" size={16} /></div></div></section></div></div>
 }
 
 export default App

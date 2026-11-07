@@ -11,7 +11,8 @@ PowerShell:
 ```
 
 Click the camera window. Press `1` for PULLUP, `2` for PUSHUP, `3` for SQUAT,
-`C` for the Cindy order, `R` for a new session, and `Q` to quit. Switching
+`C` for the Cindy order, `S` to stop and save a Cindy workout early, `R` for a
+new session, and `Q` to quit without saving. Switching
 exercise modes preserves counts and re-arms the selected detector. The overlay
 shows mode, count, phase, and the 20-minute AMRAP clock. The CSV under
 `data/recordings/` records measurements locally.
@@ -33,6 +34,22 @@ sequence, session ID, UTC timestamp, exercise, and that exercise's cumulative
 count. Stable CIN names and exact readback prevent a retry from creating a
 second event. ESP32 events have `source=mpu6050`; keep sources separate when
 comparing accuracy. The dashboard selects one source at a time.
+
+When a Cindy session reaches its timer or the operator presses `S`, the runner
+posts one completed snapshot to the existing `CindySense_AE/WorkoutSummary`
+container after flushing repetition events. It includes `sessionId`,
+`status: "completed"`, `completionReason`, final `pullups`, `pushups`, `squats`,
+`rounds`, and `durationSeconds`. A manual-mode session is not summarized.
+`Q`, reset, camera failure, and unexpected exceptions do not produce a
+completed summary. The writer uses a stable name derived from the session ID,
+reads back the exact content, and retries transient failures up to three times.
+The terminal prints `PERSISTED` only after readback; `PERSISTENCE UNCONFIRMED`
+means the named CIN needs a read-only check before any manual retry. The optional
+`--tinyiot-summary-origin` defaults to `--tinyiot-event-origin`; configure it
+separately if an approved dedicated summary writer is available. The optional
+`--summary-container` changes only the target path; it never creates a
+container. CindyPT reads the new completed snapshot on its next progress GET,
+while recommendation generation still requires the dashboard button.
 
 The camera thread never waits for TinyIoT. Pose readings use a five-slot
 queue and stale readings are discarded. Repetition events use a 1,024-slot

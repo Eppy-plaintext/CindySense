@@ -1,3 +1,5 @@
+import { isTestGoal, recommendationMatchesProgress } from '../services/cindyptDisplay.js'
+
 function StatusItem({ label, state, detail }) {
   return <span className={`connection-item ${state}`}><span className="connection-dot" aria-hidden="true" /><span><strong>{label}</strong><small>{detail}</small></span></span>
 }
@@ -53,24 +55,28 @@ export function StoredRepetitionPanel({ result, snapshot }) {
     </> : <ResultMessage result={result} loading="Loading stored repetition content…" empty="No stored repetition content is available." />}
   </StoredPanelShell>
 }
-
-export function StoredRecommendationPanel({ result }) {
+export function StoredRecommendationPanel({ result, progress }) {
   const data = result.data
   const stored = data?.recommendations
   const details = stored && typeof stored === 'object' && !Array.isArray(stored) ? stored : null
   const advice = typeof stored === 'string' ? stored : details?.recommendation
   const hasAdvice = data?.available === true && typeof advice === 'string' && advice.trim() !== ''
+  const savedForCurrentGoal = recommendationMatchesProgress(details, progress)
   return <StoredPanelShell eyebrow="TINYIOT · STORED ADVICE" title="Latest saved recommendation">
     {result.status === 'success' && hasAdvice ? <>
+      {isTestGoal(details?.goal) && <p className="pt-test-label">TEST DATA — saved for the integration test goal.</p>}
+      <p className="pt-advice-label">TRAINING · {details?.source === 'rule-based' ? 'RULE-BASED' : 'STORED'}</p>
       <p className="stored-advice">{advice}</p>
+      <p className="pt-advice-label">RECOVERY</p>
+      <p className="stored-advice">{details?.recoveryRecommendation || 'No stored recovery recommendation is available.'}</p>
       <div className="stored-metadata">
         {details?.source != null && <span>Advice source <strong>{String(details.source)}</strong></span>}
         {details?.roundsCompleted != null && <span>Stored rounds <strong>{String(details.roundsCompleted)}</strong></span>}
         {details?.durationSeconds != null && <span>Stored duration <strong>{String(details.durationSeconds)}s</strong></span>}
       </div>
       <p className="stored-caption">Retrieved from {data.source || 'backend'}{data.recorded_at ? ` · Stored at ${data.recorded_at}` : ''}</p>
-      <p className="stored-caution">Saved advice only. It is separate from the simulated training plan below.</p>
-    </> : <ResultMessage result={result} loading="Loading stored recommendation…" empty="No displayable stored recommendation is available." />}
+      {progress?.available && !savedForCurrentGoal && <p className="stored-caution">This advice was saved for an earlier workout or goal. Generate new advice for the current completed workout when ready.</p>}
+    </> : <ResultMessage result={result} loading="Loading stored recommendation…" empty="No saved recommendation is available yet." />}
   </StoredPanelShell>
 }
 

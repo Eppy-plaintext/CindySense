@@ -1,14 +1,14 @@
 # CindySense
 
-CindySense is a three-person university hackathon prototype for IoT workout tracking. An ESP32 with an MPU6050 sends sensor readings to TinyIoT (oneM2M). FastAPI reads stored oneM2M content and serves a React/Vite dashboard. A separate Cindy PT script produces rule-based recommendations.
+CindySense is a three-person university hackathon prototype for IoT workout tracking. An ESP32 with an MPU6050 sends sensor readings to TinyIoT (oneM2M). FastAPI reads stored oneM2M content and serves a React/Vite dashboard. Its Cindy PT backend produces rule-based recommendations from completed workout summaries.
 
-**Current state:** the dashboard's timer, exercise counters, rounds, history examples, and training-plan examples are demo data. Its TinyIoT panels show stored snapshots through FastAPI, polled every five seconds; they are not a live sensor stream. The firmware sends sensor readings but does not yet implement the promised exercise recognition or repetition counting.
+**Current state:** the dashboard's timer, exercise counters, rounds, and history examples include demo data. Its TinyIoT panels show stored snapshots through FastAPI, polled every five seconds; they are not a live sensor stream. The Cindy PT page reads stored goals, completed-workout progress, and rule-based recommendations through FastAPI. The firmware sends sensor readings but does not yet implement the promised exercise recognition or repetition counting.
 
 ## Components
 
 | Folder | Purpose |
 | --- | --- |
-| [backend](backend/) | FastAPI bridge, oneM2M client, tests, and separate Cindy PT script |
+| [backend](backend/) | FastAPI bridge, oneM2M client, Cindy PT logic, and tests |
 | [dashboard](dashboard/) | React/Vite user interface |
 | [firmware](firmware/) | ESP32/MPU6050 Arduino sketch |
 | [docs](docs/) | Architecture, API, TinyIoT setup, and team workflow |
@@ -59,7 +59,11 @@ Copy [config.example.h](firmware/config.example.h) to `firmware/config.h`, fill 
 
 ### Cindy PT
 
-[cindypt.py](backend/cindypt.py) is copied unchanged from the WSL prototype. It is a **standalone script with a write side effect**: running it reads `CindySense_AE/WorkoutSummary/la` and posts a recommendation to `CindyPT_AE/AIRecommendations`. It is not imported by FastAPI and is not run by the instructions above. Its loopback TinyIoT address and required oneM2M resources need review before a teammate runs it.
+[cindypt.py](backend/cindypt.py) provides rule-based coaching through FastAPI. Configure `TINYIOT_CINDYPT_ORIGIN` server-side for `CindySense_AE/WorkoutSummary`, `CindyPT_AE/FitnessGoals`, and `CindyPT_AE/AIRecommendations`. These containers already exist on the inspected TinyIoT server; the backend only appends content instances. The Cindy PT dashboard page lets users save a goal, view progress from explicitly completed workout summaries, and confirm an explicit recommendation write. The test integration goal remains visibly labeled until a user saves a new goal.
+
+The webcam runner now prepares one idempotently named completed summary when its Cindy timer ends or the operator explicitly stops the workout. It does not save interrupted sessions. Mocked tests cover delivery and Cindy PT ingestion; a live webcam summary write has not yet been approved or tested. See [webcam workflow](docs/webcam-three-exercise.md).
+
+Cindy PT also offers a rule-based seven-day schedule preview using the stored goal, completed workout history, chosen training days, experience level, and browser timezone. Preview reads TinyIoT only. A separately confirmed save writes named content instances to the existing `CindyPT_AE/TrainingPlans`, `WorkoutSchedule`, and `RecoveryRecommendations` containers. No live plan write has been attempted. See [API contract](docs/api.md).
 
 ## Checks
 

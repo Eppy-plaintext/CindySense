@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 
 /** One request at a time; schedule the next poll only after the current one settles. */
-export function usePolling(request, { enabled = true, intervalMs = 5000 } = {}) {
+export function usePolling(request, { enabled = true, intervalMs = 5000, refreshKey = 0 } = {}) {
   const [result, setResult] = useState({ status: 'idle', data: null, error: null })
 
   useEffect(() => {
@@ -13,7 +13,7 @@ export function usePolling(request, { enabled = true, intervalMs = 5000 } = {}) 
     const poll = async () => {
       controller = new AbortController()
       try {
-        const data = await request({ signal: controller.signal })
+        const data = await request({ signal: controller.signal, refreshKey })
         if (active) setResult({ status: 'success', data, error: null })
       } catch (error) {
         if (active && error.name !== 'AbortError') {
@@ -33,7 +33,7 @@ export function usePolling(request, { enabled = true, intervalMs = 5000 } = {}) 
       window.clearTimeout(timeoutId)
       controller?.abort()
     }
-  }, [request, enabled, intervalMs])
+  }, [request, enabled, intervalMs, refreshKey])
 
   return result
 }

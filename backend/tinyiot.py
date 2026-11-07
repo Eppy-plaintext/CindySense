@@ -27,7 +27,53 @@ class TinyIoTClient:
             raise TinyIoTError('invalid_resource_name', 'Simulation resource name is invalid.', 503)
         return await self._request('POST', resource_path, origin, {'m2m:cin': {'rn': resource_name, 'con': content}})
 
-    async def _request(self, method: str, resource_path: str, origin: str, body: dict | None = None, params: dict | None = None) -> dict:
+    async def create_content(self, resource_path: str, origin: str, content: dict) -> dict:
+        """Append a server-named CIN to an existing container."""
+        container = await self.retrieve(resource_path, origin)
+        if 'm2m:cnt' not in container:
+            raise TinyIoTError('invalid_resource', 'The configured resource is not a oneM2M container.', 502)
+        return await self._request('POST', resource_path, origin, {
+            'm2m:cin': {'cnf': 'application/json:0', 'con': json.dumps(content, separators=(',', ':'))},
+        }, content_type='application/json;ty=4')
+
+    async def create_named_content(self, resource_path: str, origin: str,
+                                   resource_name: str, content: dict) -> bool:
+        """Create a plan CIN once; verify exact content after retries or lost replies."""
+        if not resource_name.startswith('plan-') or len(resource_name) != 69:
+            raise TinyIoTError('invalid_resource_name', 'Plan resource name is invalid.', 503)
+        container = await self.retrieve(resource_path, origin)
+        if 'm2m:cnt' not in container:
+            raise TinyIoTError('invalid_resource', 'The configured resource is not a oneM2M container.', 502)
+        child = f'{resource_path.strip("/")}/{resource_name}'
+
+        async def verify() -> bool:
+            try:
+                stored = await self.retrieve(child, origin)
+            except TinyIoTError as exc:
+                if exc.code == 'resource_not_found':
+                    return False
+                raise
+            parsed, instance = self.parse_content_instance(stored)
+            if instance.get('rn', resource_name) != resource_name or parsed != content:
+                raise TinyIoTError('plan_conflict', 'A saved plan ID has different content.', 409)
+            return True
+
+        if await verify():
+            return False
+        body = {'m2m:cin': {'rn': resource_name, 'cnf': 'application/json:0',
+                            'con': json.dumps(content, separators=(',', ':'))}}
+        try:
+            await self._request('POST', resource_path, origin, body, content_type='application/json;ty=4')
+        except TinyIoTError as exc:
+            if exc.code not in ('resource_conflict', 'tinyiot_error', 'tinyiot_unreachable') or not await verify():
+                raise
+            return False
+        if not await verify():
+            raise TinyIoTError('plan_unconfirmed', 'Plan write succeeded but readback was unavailable.', 502)
+        return True
+
+    async def _request(self, method: str, resource_path: str, origin: str, body: dict | None = None,
+                       params: dict | None = None, content_type: str | None = None) -> dict:
         if not origin:
             raise TinyIoTError('origin_not_configured', 'The oneM2M originator is not configured.', 503)
         path = resource_path.strip('/')
@@ -40,7 +86,7 @@ class TinyIoTClient:
             'Accept': 'application/json',
         }
         if method == 'POST':
-            headers['Content-Type'] = 'application/vnd.onem2m-res+json;ty=4'
+            headers['Content-Type'] = content_type or 'application/vnd.onem2m-res+json;ty=4'
         url = f'{self.base_url}/{path}' if path else self.base_url
         try:
             if self._client is None:

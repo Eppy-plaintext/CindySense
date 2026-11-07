@@ -28,9 +28,18 @@ DEFAULT_ORIGIN = os.environ.get("CINDYSENSE_TINYIOT_ORIGIN", "CAdmin")
 AE_NAME = "Webcam_AE"
 CNT_NAME = "PoseData"
 EVENT_CONTAINER = "CindySense_AE/RepetitionCount"
+SUMMARY_CONTAINER = "CindySense_AE/WorkoutSummary"
 
 
 class TinyIoTError(RuntimeError):
+    pass
+
+
+class TinyIoTConnectionError(TinyIoTError):
+    pass
+
+
+class RetryableSummaryError(TinyIoTError):
     pass
 
 
@@ -81,7 +90,7 @@ class TinyIoTClient:
             return response.status, response.getheader("X-M2M-RSC"), data
         except (OSError, http.client.HTTPException) as exc:
             self.close()
-            raise TinyIoTError(f"Cannot reach TinyIoT at {self.base}: {exc}") from exc
+            raise TinyIoTConnectionError(f"Cannot reach TinyIoT at {self.base}: {exc}") from exc
 
     @staticmethod
     def _check(status, rsc, data, expected, action):
@@ -204,6 +213,60 @@ class TinyIoTClient:
                 self._verify_event(check_body, event, item_path)
                 return "verified"
         self._check(status, rsc, data, 201, "POST repetition event CIN")
+
+    def publish_summary(self, summary, container=SUMMARY_CONTAINER):
+        """Store one named CIN per session, with exact readback after ambiguous writes."""
+        path = "/" + container.strip("/")
+        name = "webcam-summary-" + summary["sessionId"]
+        item_path = f"{path}/{name}"
+        status, rsc, data = self._request("GET", path)
+        self._check_summary(status, rsc, data, 200, "GET workout summary container")
+        if "m2m:cnt" not in data:
+            raise TinyIoTError("Workout summary resource is not a container")
+        status, rsc, data = self._request("GET", item_path)
+        if status == 200:
+            self._check_summary(status, rsc, data, 200, "GET workout summary CIN")
+            self._verify_summary(data, summary, name)
+            return "verified"
+        if status != 404:
+            self._check_summary(status, rsc, data, 404, "GET workout summary CIN")
+        body = {"m2m:cin": {"rn": name, "cnf": "application/json:0",
+                            "con": json.dumps(summary, separators=(",", ":"), allow_nan=False)}}
+        status, rsc, data = self._request("POST", path, body, ty=4)
+        if status not in (201, 409, 500, 502, 503, 504):
+            self._check_summary(status, rsc, data, 201, "POST workout summary CIN")
+        # A successful or ambiguous POST is only confirmed by the named resource.
+        check_status, check_rsc, check_data = self._request("GET", item_path)
+        if check_status == 200:
+            self._check_summary(check_status, check_rsc, check_data, 200,
+                                "VERIFY workout summary CIN")
+            self._verify_summary(check_data, summary, name)
+            return "created" if status == 201 else "verified"
+        if check_status != 404:
+            self._check_summary(check_status, check_rsc, check_data, 200, "VERIFY workout summary CIN")
+        if status == 201:
+            raise RetryableSummaryError("Workout summary POST succeeded but readback was not found")
+        raise RetryableSummaryError(f"Workout summary POST returned HTTP {status} without readable CIN")
+
+    @staticmethod
+    def _check_summary(status, rsc, data, expected, action):
+        if status in (500, 502, 503, 504):
+            raise RetryableSummaryError(f"{action} returned HTTP {status}, oneM2M RSC={rsc}")
+        TinyIoTClient._check(status, rsc, data, expected, action)
+        expected_rsc = {200: "2000", 201: "2001"}.get(expected)
+        if expected_rsc and rsc and rsc != expected_rsc:
+            raise TinyIoTError(f"{action} returned unexpected oneM2M RSC={rsc}")
+
+    @staticmethod
+    def _verify_summary(data, summary, name):
+        cin = data.get("m2m:cin", {})
+        content = cin.get("con")
+        try:
+            content = json.loads(content) if isinstance(content, str) else content
+        except json.JSONDecodeError:
+            pass
+        if cin.get("rn", name) != name or content != summary:
+            raise TinyIoTError(f"Workout summary readback mismatch for session {summary['sessionId']}")
 
     @staticmethod
     def _verify_event(data, event, path):

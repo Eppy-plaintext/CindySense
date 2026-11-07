@@ -14,7 +14,9 @@ import mediapipe as mp
 from webcam_exercises import (CindyWorkout, ExerciseCounter, body_movement_measurement,
                               exercise_measurement, pullup_auxiliary_measurement,
                               select_exercise_key, visibility)
-from webcam_tinyiot import PosePublisher, DEFAULT_BASE, DEFAULT_ORIGIN, EVENT_CONTAINER
+from webcam_tinyiot import (PosePublisher, TinyIoTClient, TinyIoTError, DEFAULT_BASE,
+                            DEFAULT_ORIGIN, EVENT_CONTAINER, SUMMARY_CONTAINER)
+from workout_summary import SummaryPublisher, completed_summary
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_MODEL = PROJECT_ROOT / "models" / "pose_landmarker_lite.task"
@@ -52,6 +54,10 @@ def main():
                         help="Originator with create access to CindySense_AE/RepetitionCount")
     parser.add_argument("--event-container", default=EVENT_CONTAINER,
                         help="Existing oneM2M container path, e.g. CindySense_AE/RepetitionCount")
+    parser.add_argument("--tinyiot-summary-origin",
+                        help="Originator with create and retrieve access to WorkoutSummary; defaults to event origin")
+    parser.add_argument("--summary-container", default=SUMMARY_CONTAINER,
+                        help="Existing oneM2M workout summary container path")
     args = parser.parse_args()
     if not args.model.is_file():
         sys.exit(f"Model missing: {args.model}\nDownload pose_landmarker_lite.task into models/ first.")
@@ -83,14 +89,21 @@ def main():
     publisher = (PosePublisher(args.tinyiot_base, args.tinyiot_origin,
                                event_container=args.event_container,
                                event_origin=args.tinyiot_event_origin) if args.tinyiot else None)
+    summary_client = (TinyIoTClient(args.tinyiot_base,
+                                   args.tinyiot_summary_origin or args.tinyiot_event_origin)
+                      if args.tinyiot else None)
+    summary_publisher = (SummaryPublisher(summary_client, args.summary_container)
+                         if summary_client else None)
     print(f"Webcam session {session_id}; mode={args.exercise}; TinyIoT={'on' if publisher else 'off'}")
     print("Click the webcam window before pressing keys.")
-    print("Manual modes: 1 pull-up | 2 push-up | 3 squat | C Cindy | R reset counts | Q quit")
+    print("Manual modes: 1 pull-up | 2 push-up | 3 squat | C Cindy | S stop and save | R reset | Q quit without saving")
     print("Pull-ups need upper body and hands visible; bar/chin are not model landmarks.")
     print(f"Saving measurements to: {csv_path}")
     reps_this_mode = {name: 0 for name in TARGETS}
     total_reps = {name: 0 for name in TARGETS}
     total_rounds = 0
+    session_baseline = dict(total_reps)
+    end_reason = None
     try:
         with open(csv_path, "w", newline="", encoding="utf-8") as f, \
                 mp.tasks.vision.PoseLandmarker.create_from_options(options) as landmarker:
@@ -104,6 +117,7 @@ def main():
             while True:
                 if workout and workout.finished:
                     print(f"[SESSION] 20-minute Cindy complete; rounds={workout.rounds}")
+                    end_reason = "timer"
                     break
                 ok, frame = camera.read()
                 if not ok:
@@ -155,7 +169,8 @@ def main():
                     event = {
                         "eventId": str(uuid.uuid4()), "eventSequence": event_sequence,
                         "sessionId": session_id, "exercise": counter.exercise,
-                        "repetitions": total_reps[counter.exercise], "round": event_round,
+                        "repetitions": total_reps[counter.exercise] - session_baseline[counter.exercise],
+                        "round": event_round,
                         "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
                         "source": "webcam",
                     }
@@ -211,7 +226,8 @@ def main():
                         "jointAngleDeg": round(angle, 2) if angle is not None else None,
                         "bodyMovement": round(body_movement, 4) if body_movement is not None else None,
                         "visibility": round(tracking_confidence, 3), "phase": counters[display_exercise].phase,
-                        "repCount": total_reps[display_exercise], "repEvent": counted,
+                        "repCount": total_reps[display_exercise] - session_baseline[display_exercise],
+                        "repEvent": counted,
                         "rounds": rounds_text, "sessionId": session_id,
                         **publisher.diagnostics(),
                     })
@@ -231,6 +247,13 @@ def main():
                                  "eventQueueDepth": publisher.diagnostics()["eventQueueDepth"] if publisher else 0})
                 cv2.imshow("CindySense Webcam Workout", frame)
                 key = cv2.waitKey(1) & 0xFF
+                if workout and workout.finished:
+                    end_reason = "timer"
+                    break
+                if key in (ord("s"), ord("S")) and workout:
+                    end_reason = "explicit_stop"
+                    print(f"[SESSION] Cindy stopped explicitly; rounds={workout.rounds}")
+                    break
                 if key in (ord("q"), 27):
                     break
                 selected = select_exercise_key(key, workout)
@@ -241,12 +264,16 @@ def main():
                     print(f"[MODE] active exercise changed to {selected}; detector phase={counters[selected].phase}")
                 elif key in (ord("c"), ord("C")) and workout is None:
                     workout = CindyWorkout(max(1, int(args.duration_minutes * 60)))
+                    session_id = "webcam-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
+                    session_baseline = dict(total_reps)
+                    event_sequence = 0
                     active = workout.current_exercise
-                    print("Started Cindy AMRAP timer.")
+                    print(f"Started Cindy AMRAP timer; session {session_id}.")
                 elif key in (ord("r"), ord("R")):
                     counters = {name: ExerciseCounter(name) for name in TARGETS}
                     reps_this_mode = {name: 0 for name in TARGETS}
                     total_reps = {name: 0 for name in TARGETS}
+                    session_baseline = dict(total_reps)
                     total_rounds = 0
                     event_sequence = 0
                     session_id = "webcam-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
@@ -257,6 +284,21 @@ def main():
     finally:
         if publisher:
             publisher.close()
+        if end_reason and workout:
+            final_totals = {name: total_reps[name] - session_baseline[name] for name in TARGETS}
+            summary = completed_summary(session_id, workout, final_totals, end_reason)
+            if summary_publisher:
+                try:
+                    result = summary_publisher.publish(summary)
+                    print(f"[TinyIoT] Workout summary PERSISTED session={session_id} result={result}")
+                except TinyIoTError as exc:
+                    print(f"[TinyIoT] Workout summary PERSISTENCE UNCONFIRMED session={session_id}: {exc}")
+            else:
+                print(f"[SESSION] Completed locally; TinyIoT summary not enabled for session={session_id}")
+        elif workout:
+            print(f"[SESSION] Interrupted session={session_id}; no completed summary published")
+        if summary_client:
+            summary_client.close()
         camera.release()
         cv2.destroyAllWindows()
     print(f"Completed. Local repetitions: {total_reps}; rounds={workout.rounds if workout else total_rounds}. CSV: {csv_path}")
