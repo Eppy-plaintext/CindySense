@@ -96,7 +96,7 @@ export function CindyPtPage() {
         <StoredRecommendationPanel result={recommendationResult} progress={progress} />
       </section>
     </div>
-    <WeeklyPlanPanel key={refresh} />
+    <WeeklyPlanPanel key={refresh} progressResult={progressResult} />
     {action.status !== 'idle' && <p className={action.status === 'error' ? 'pt-action pt-error' : 'pt-action'} role={action.status === 'error' ? 'alert' : 'status'}>{action.message}</p>}
   </div>
 }
