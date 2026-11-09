@@ -313,10 +313,14 @@ class ExerciseCounter:
         self.last_raw_position = movement
         if head is not None:
             self.last_head_position = head
-        self.smoothed_angle = angle if self.smoothed_angle is None else 0.45 * angle + 0.55 * self.smoothed_angle
+        # Push-ups can reverse direction in only a few camera frames. Follow
+        # their measured motion faster while retaining two-frame confirmation.
+        smoothing = 0.45 if pullup else 0.65
+        required_frames = STABLE_FRAMES if pullup else 2
+        self.smoothed_angle = angle if self.smoothed_angle is None else smoothing * angle + (1 - smoothing) * self.smoothed_angle
         if movement is not None:
             self.smoothed_movement = (movement if self.smoothed_movement is None else
-                                      0.45 * movement + 0.55 * self.smoothed_movement)
+                                      smoothing * movement + (1 - smoothing) * self.smoothed_movement)
         position = self.smoothed_movement
         down_sign = -1.0 if pullup else 1.0
         delta = (down_sign * (position - self.movement_baseline)
@@ -350,7 +354,7 @@ class ExerciseCounter:
             head_down = pullup and head_delta is not None and head_delta >= head_threshold
             accepted = angle_down and (shoulder_down or head_down)
             self.down_frames = self.down_frames + 1 if accepted else 0
-            if self.down_frames >= STABLE_FRAMES:
+            if self.down_frames >= required_frames:
                 self.phase = "DOWN"
                 self.down_frames = self.up_frames = self.extended_frames = self.arm_phase_frames = 0
                 self.arm_peak = max(0.0, delta or 0.0)
@@ -361,7 +365,7 @@ class ExerciseCounter:
                 self.last_reason = (f"waiting for flexion<={down:.0f} and vertical travel "
                                     f"(shoulder={delta if delta is not None else 0:.3f}, "
                                     f"head={head_delta if head_delta is not None else 0:.3f}; "
-                                    f"{self.down_frames}/{STABLE_FRAMES})")
+                                    f"{self.down_frames}/{required_frames})")
                 if self.smoothed_angle >= up and position is not None:
                     # Calibrate only while fully extended, never during descent.
                     self.movement_baseline = 0.95 * self.movement_baseline + 0.05 * position
@@ -384,15 +388,24 @@ class ExerciseCounter:
                        and self.head_peak - head_delta >= max(0.025, 0.65 * self.head_peak))
         returned = shoulder_return or head_return
         angle_up = self.smoothed_angle >= up
+        if not pullup and not angle_up:
+            # In the recorded fast set the shoulder returned to its start
+            # height repeatedly, but MediaPipe held the elbow near 140-150°.
+            # Accept that alternate top only after substantial descent and
+            # near-complete torso return, never from elbow angle alone.
+            angle_up = (self.smoothed_angle >= 135.0 and self.arm_peak >= 0.08
+                        and delta is not None and abs(delta) <= 0.035)
         self.extended_frames = self.extended_frames + 1 if angle_up else 0
         self.up_frames = self.up_frames + 1 if angle_up and returned else 0
-        if self.up_frames >= STABLE_FRAMES:
+        if self.up_frames >= required_frames:
             if pullup and self.max_lateral >= 0.10:
                 self._reject_arm(f"lateral swing {self.max_lateral:.3f} >= 0.100", self.smoothed_angle, position, head, lateral)
                 return False
             self.reps += 1
             self.phase = "UP"
-            self.cooldown_frames = self.COOLDOWN_FRAMES
+            # A fresh DOWN state still has to be earned before another rep.
+            # Ten ignored frames cost about a third of a second at 30 fps.
+            self.cooldown_frames = self.COOLDOWN_FRAMES if pullup else 2
             self.movement_baseline = position
             self.head_baseline = head
             self.lateral_baseline = lateral
@@ -411,7 +424,7 @@ class ExerciseCounter:
         self.last_reason = (f"waiting for extended angle>={up:.0f} and rise from candidate peak "
                             f"(angle={self.smoothed_angle:.0f}, peak={self.arm_peak:.3f}, "
                             f"current={delta if delta is not None else 0:.3f}; "
-                            f"{self.up_frames}/{STABLE_FRAMES})")
+                            f"{self.up_frames}/{required_frames})")
         return False
 
 

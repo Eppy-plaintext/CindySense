@@ -316,6 +316,74 @@ class ExerciseCounterTests(unittest.TestCase):
         self.assertEqual((counter.reps, detected), (60, 60))
         self.assertEqual(counter.phase, "UP")
 
+    def test_fast_pushups_count_once_per_full_cycle(self):
+        counter = ExerciseCounter("pushup")
+        detected = 0
+        for _ in range(8):
+            detected += counter.update(170, .40)
+        for _ in range(10):
+            for angle, position, frames in ((75, .52, 4), (170, .40, 4)):
+                for _ in range(frames):
+                    detected += counter.update(angle, position)
+        self.assertEqual((counter.reps, detected), (10, 10))
+
+    def test_slow_pushups_still_count_once_each(self):
+        counter = ExerciseCounter("pushup")
+        detected = 0
+        for _ in range(8):
+            detected += counter.update(170, .40)
+        for _ in range(5):
+            for angle, position, frames in ((75, .52, 15), (170, .40, 18)):
+                for _ in range(frames):
+                    detected += counter.update(angle, position)
+        self.assertEqual((counter.reps, detected), (5, 5))
+
+    def test_pushup_noise_and_partial_return_do_not_count(self):
+        counter = ExerciseCounter("pushup")
+        detected = 0
+        for _ in range(8):
+            counter.update(170, .40)
+        for _ in range(15):
+            detected += counter.update(75, .52)
+            for _ in range(5):
+                detected += counter.update(170, .40)
+        self.assertEqual(detected, 0)
+        # A bent elbow with shoulder descent but no shoulder return is partial.
+        for angle, position, frames in ((75, .52, 8), (170, .52, 25)):
+            for _ in range(frames):
+                detected += counter.update(angle, position)
+        self.assertEqual(detected, 0)
+
+    def test_pushup_brief_landmark_loss_preserves_candidate(self):
+        counter = ExerciseCounter("pushup")
+        detected = 0
+        for angle, position, frames in ((170, .40, 8), (75, .52, 6)):
+            for _ in range(frames):
+                detected += counter.update(angle, position)
+        self.assertEqual(counter.phase, "DOWN")
+        for _ in range(2):
+            detected += counter.update(None, None)
+        for _ in range(8):
+            detected += counter.update(170, .40)
+        self.assertEqual((counter.reps, detected), (1, 1))
+
+    def test_pushup_recorded_style_top_angle_needs_full_torso_return(self):
+        counter = ExerciseCounter("pushup")
+        detected = 0
+        for _ in range(8):
+            counter.update(170, .40)
+        # The recorded fast set has strong descent but its estimated top
+        # elbow angle often plateaus near 140-150 degrees.
+        for _ in range(2):
+            for angle, position, frames in ((65, .62, 7), (145, .40, 7)):
+                for _ in range(frames):
+                    detected += counter.update(angle, position)
+        self.assertEqual((counter.reps, detected), (2, 2))
+        for angle, position, frames in ((65, .62, 7), (145, .49, 12)):
+            for _ in range(frames):
+                detected += counter.update(angle, position)
+        self.assertEqual((counter.reps, detected), (2, 2))
+
     def test_pushup_stalled_down_candidate_rearms_without_false_count(self):
         counter = ExerciseCounter("pushup")
         for angle, position, frames in ((170, .40, 8), (80, .52, 12), (170, .52, 30)):

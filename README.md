@@ -65,6 +65,18 @@ The webcam runner now prepares one idempotently named completed summary when its
 
 Cindy PT also offers a rule-based seven-day schedule preview using the stored goal, completed workout history, chosen training days, experience level, and browser timezone. Preview reads TinyIoT only. A separately confirmed save writes named content instances to the existing `CindyPT_AE/TrainingPlans`, `WorkoutSchedule`, and `RecoveryRecommendations` containers. No live plan write has been attempted. See [API contract](docs/api.md).
 
+### Local webcam Voice Coach
+
+Run the webcam runner in Cindy mode and open the dashboard on the **same computer** at `http://localhost:5173`. The runner exposes confirmed repetition and workout progression events on loopback port 8765; the browser speaks them with the Web Speech API. The dashboard's Voice Coach controls set ON/OFF, volume, and speed, saved in browser storage. Speech is active only for a running webcam Cindy session. Browser audio may require one click on the page before it starts. The local stream works even if TinyIoT is disconnected; the existing TinyIoT publisher continues independently. Use `--voice-events-port 0` to disable the local stream, or set another port and update the dashboard EventSource URL if 8765 is occupied. A dashboard on another computer cannot receive this loopback stream.
+
+```sh
+python tools/webcam_squat.py --exercise cindy --tinyiot
+```
+
+To check with a camera and speaker, start the runner and dashboard, click the page once, then complete five pull-ups, ten push-ups, and fifteen squats. Check that only confirmed reps speak, transitions and the new round speak once, Voice Coach OFF stops speech, and `R` clears it. Use a short `--duration-minutes` value to check completion; the 10/5/1 minute reminders are emitted only when that duration reaches each threshold. The runner's existing `S` and `Q` controls still stop or discard the session. The browser voice controls currently apply to the local webcam source; ESP32 live and dashboard demo modes remain visual only.
+
+For push-up and voice timing checks, perform ten slow and ten fast full push-ups. The runner logs `[PUSHUP]` state changes with frame gaps, pose processing time, angle, shoulder position, and rejection reason. Its CSV also records `frameGapMs` and `poseMs` on every frame. `[VOICE]` logs confirmation to local publication; browser DevTools logs `[CindySense voice latency]` with local publication to dashboard receipt and receipt to speech start. Compare those values to find whether delay is in detection, local delivery, or browser speech. The browser's `onstart` timestamp is an approximation of audible onset; verify the speaker by ear.
+
 ## Checks
 
 ```sh

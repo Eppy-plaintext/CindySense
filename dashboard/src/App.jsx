@@ -4,6 +4,7 @@ import { CindyPtPage } from './components/CindyPtPage.jsx'
 import { usePolling } from './hooks/usePolling.js'
 import { getBackendHealth, getLatestRepetition, getWebcamStatus, getWorkoutHistory, getWorkoutSnapshot } from './services/api.js'
 import { acceptSnapshot, liveDisplay } from './services/workoutDisplay.js'
+import { VoiceCoach, handleLocalVoiceEvent } from './services/voiceCoach.js'
 import './App.css'
 
 const WORKOUT_SECONDS = 20 * 60
@@ -41,6 +42,24 @@ function App() {
   const [lastSnapshot, setLastSnapshot] = useState(null)
   const [displayMode, setDisplayMode] = useState('webcam')
   const [now, setNow] = useState(() => Date.now())
+  const [voicePreferences, setVoicePreferences] = useState(() => {
+    try { return { enabled: true, volume: 0.8, rate: 1, ...JSON.parse(localStorage.getItem('cindysense.voice') || '{}') } }
+    catch { return { enabled: true, volume: 0.8, rate: 1 } }
+  })
+  const [voiceCoach] = useState(() => new VoiceCoach(globalThis.speechSynthesis, globalThis.SpeechSynthesisUtterance))
+  useEffect(() => {
+    voiceCoach.configure(voicePreferences)
+    try { localStorage.setItem('cindysense.voice', JSON.stringify(voicePreferences)) } catch { /* optional storage */ }
+  }, [voiceCoach, voicePreferences])
+  useEffect(() => {
+    if (displayMode !== 'webcam') { voiceCoach.reset(); return undefined }
+    const stream = new EventSource('http://127.0.0.1:8765/events')
+    stream.onmessage = ({ data }) => {
+      const receivedAtEpochMs = Date.now()
+      try { handleLocalVoiceEvent(voiceCoach, { ...JSON.parse(data), receivedAtEpochMs }) } catch { /* optional voice stream */ }
+    }
+    return () => { stream.close(); voiceCoach.reset() }
+  }, [displayMode, voiceCoach])
   const currentExercise = useMemo(() => EXERCISES.find((exercise) => exercise.key === activeExercise), [activeExercise])
   const getLiveSnapshot = useCallback(async ({ signal }) => {
     const data = await getWorkoutSnapshot({ signal })
@@ -120,14 +139,14 @@ function App() {
     <main className="main-content">
       <header className="topbar"><div className="mobile-brand"><div className="brand-mark"><span></span><span></span><span></span></div><strong>Cindy<span>Sense</span></strong></div><div className="breadcrumb"><span>Workspace</span><span>/</span><strong>{activePage === 'dashboard' ? 'Workout dashboard' : activePage === 'history' ? 'Workout history' : 'Cindy PT'}</strong></div><ConnectionStatus result={healthResult} /></header>
       <nav className="mobile-nav" aria-label="Mobile navigation">{[['dashboard', 'Dashboard'], ['history', 'History'], ['pt', 'Cindy PT']].map(([page, label]) => <button key={page} className={activePage === page ? 'active' : ''} onClick={() => setActivePage(page)}>{label}</button>)}</nav>
-      {activePage === 'dashboard' && <Dashboard secondsLeft={secondsLeft} formatTime={formatTime} timerProgress={timerProgress} workoutState={workoutState} setWorkoutState={setWorkoutState} resetWorkout={resetWorkout} reps={reps} rounds={rounds} activeExercise={activeExercise} setActiveExercise={setActiveExercise} incrementRep={incrementRep} currentExercise={currentExercise} autoSimulate={autoSimulate} setAutoSimulate={setAutoSimulate} liveResult={liveResult} snapshotResult={snapshotResult} webcamStatus={webcamStatus} lastSnapshot={lastSnapshot} displayMode={displayMode} setDisplayMode={setDisplayMode} now={now} />}
+      {activePage === 'dashboard' && <Dashboard secondsLeft={secondsLeft} formatTime={formatTime} timerProgress={timerProgress} workoutState={workoutState} setWorkoutState={setWorkoutState} resetWorkout={resetWorkout} reps={reps} rounds={rounds} activeExercise={activeExercise} setActiveExercise={setActiveExercise} incrementRep={incrementRep} currentExercise={currentExercise} autoSimulate={autoSimulate} setAutoSimulate={setAutoSimulate} liveResult={liveResult} snapshotResult={snapshotResult} webcamStatus={webcamStatus} lastSnapshot={lastSnapshot} displayMode={displayMode} setDisplayMode={setDisplayMode} now={now} voicePreferences={voicePreferences} setVoicePreferences={setVoicePreferences} voiceCoach={voiceCoach} />}
       {activePage === 'history' && <><div className="view-data-slot"><HistoryAvailability result={historyResult} /><p className="demo-section-label">SIMULATED HISTORY EXAMPLES BELOW</p></div><HistoryPage /></>}
       {activePage === 'pt' && <CindyPtPage />}
     </main>
   </div>
 }
 
-function Dashboard({ secondsLeft, formatTime, timerProgress, workoutState, setWorkoutState, resetWorkout, reps, rounds, activeExercise, setActiveExercise, incrementRep, currentExercise, autoSimulate, setAutoSimulate, liveResult, snapshotResult, webcamStatus, lastSnapshot, displayMode, setDisplayMode, now }) {
+function Dashboard({ secondsLeft, formatTime, timerProgress, workoutState, setWorkoutState, resetWorkout, reps, rounds, activeExercise, setActiveExercise, incrementRep, currentExercise, autoSimulate, setAutoSimulate, liveResult, snapshotResult, webcamStatus, lastSnapshot, displayMode, setDisplayMode, now, voicePreferences, setVoicePreferences, voiceCoach }) {
   const demo = displayMode === 'demo'
   const live = liveDisplay(lastSnapshot, displayMode, now)
   const poseStatus = webcamStatus.data
@@ -163,6 +182,7 @@ function Dashboard({ secondsLeft, formatTime, timerProgress, workoutState, setWo
       {[['webcam', 'Webcam live'], ['mpu6050', 'ESP32 live'], ['demo', 'Demo Mode']].map(([mode, label]) => <button key={mode} className={displayMode === mode ? 'active' : ''} onClick={() => setDisplayMode(mode)} aria-pressed={displayMode === mode}>{label}</button>)}
       {!demo && <span>{snapshotResult.status === 'error' ? `Connection lost: ${snapshotResult.error}. Showing last verified session.` : live ? `Session ${live.sessionId}${live.startInferred ? ' · timer starts at first stored event' : ''}${!live.coverageComplete ? ' · partial exercise coverage' : ''}` : 'Waiting for a stored session'}</span>}
     </div>
+    <section className="voice-controls panel" aria-label="Voice Coach controls"><div><p className="eyebrow">AUDIO FEEDBACK</p><h2>Voice Coach</h2><small>{displayMode === 'webcam' ? 'Local webcam events · open this dashboard on the webcam computer' : 'Voice feedback currently uses the local webcam event stream'}</small></div><label><input type="checkbox" checked={voicePreferences.enabled} onChange={(event) => { if (!event.target.checked) voiceCoach.clear(); setVoicePreferences((old) => ({ ...old, enabled: event.target.checked })) }} /> ON</label><label>Volume <input aria-label="Voice volume" type="range" min="0" max="1" step="0.1" value={voicePreferences.volume} onChange={(event) => setVoicePreferences((old) => ({ ...old, volume: Number(event.target.value) }))} /></label><label>Speed <input aria-label="Voice speed" type="range" min="0.7" max="1.3" step="0.1" value={voicePreferences.rate} onChange={(event) => setVoicePreferences((old) => ({ ...old, rate: Number(event.target.value) }))} /></label></section>
     <div className="hero-grid"><section className="timer-card panel"><div className="panel-header"><div><p className="eyebrow">CINDY AMRAP</p><h2>20-minute engine</h2></div><span className={`session-badge ${demo ? workoutState : live?.complete ? 'complete' : live ? 'running' : 'idle'}`}><span className="status-dot"></span>{statusLabel}</span></div><div className="timer-display"><div className="timer-ring" style={{ '--progress': `${shownProgress * 3.6}deg` }}><div><span>{formatTime(shownSeconds)}</span><small>{shownSeconds === 0 ? 'DONE' : 'REMAINING'}</small></div></div></div><div className="timer-controls">{demo ? <>{workoutState === 'running' ? <button className="control-btn primary" onClick={() => setWorkoutState('paused')}><Icon name="pause" size={16} /> Pause</button> : <button className="control-btn primary" onClick={() => setWorkoutState('running')}><Icon name="play" size={16} /> {workoutState === 'paused' ? 'Resume' : 'Start workout'}</button>}<button className="control-btn secondary" onClick={resetWorkout}><Icon name="rotate" size={16} /> Reset</button></> : <span className="live-timer-note">Timer follows the selected source session</span>}</div><div className="timer-meta"><span><b>20:00</b> target</span><span><b>{Math.round(shownProgress)}%</b> elapsed</span><span><b>AMRAP</b> format</span></div></section>
       <section className="round-card panel"><div className="panel-header"><div><p className="eyebrow">SESSION SCORE</p><h2>Round tracker</h2></div><div className="round-number"><span>ROUND</span><strong>{String(shownRounds + 1).padStart(2, '0')}</strong></div></div><div className="round-progress"><div className="round-progress-top"><span>Current round</span><strong>{Math.round((totalReps / 30) * 100)}%</strong></div><div className="progress-track"><span style={{ width: `${(totalReps / 30) * 100}%` }}></span></div></div><div className="exercise-list">{EXERCISES.map((exercise) => <button className={`exercise-row ${activeExercise === exercise.key ? 'selected' : ''}`} key={exercise.key} onClick={() => setActiveExercise(exercise.key)}><span className={`exercise-icon ${exercise.color}`}>{exercise.icon}</span><span className="exercise-name"><strong>{exercise.label}</strong><small>{shownReps[exercise.key] >= exercise.target ? 'Complete' : `${exercise.target - shownReps[exercise.key]} reps to go`}</small></span><span className="exercise-count"><b>{String(shownReps[exercise.key]).padStart(2, '0')}</b><i>/{exercise.target}</i></span>{shownReps[exercise.key] >= exercise.target && <Icon name="check" size={16} />}</button>)}</div><div className="round-total"><span>Completed rounds</span><strong>{shownRounds}</strong></div></section></div>
     {demo && <section className="rep-console panel"><div className="panel-header"><div><p className="eyebrow">DEMO CONTROLS</p><h2>Simulate movement</h2></div><label className="toggle-label"><span>Auto simulate</span><button className={`toggle ${autoSimulate ? 'on' : ''}`} onClick={() => setAutoSimulate(!autoSimulate)} aria-label="Toggle auto simulate"><span></span></button></label></div><div className="rep-console-body"><div className="focus-exercise"><span className={`exercise-icon ${currentExercise.color}`}>{currentExercise.icon}</span><div><small>ACTIVE MOVEMENT</small><strong>{currentExercise.label}</strong></div></div><button className="rep-btn" onClick={() => incrementRep()} disabled={reps[currentExercise.key] >= currentExercise.target}><span>+1</span> Add {currentExercise.label} rep</button><div className="exercise-shortcuts">{EXERCISES.map((exercise) => <button key={exercise.key} className={activeExercise === exercise.key ? 'active' : ''} onClick={() => { setActiveExercise(exercise.key); incrementRep(exercise.key) }}><span className={`mini-dot ${exercise.color}`}></span>{exercise.label}</button>)}</div></div><p className="demo-note"><Icon name="zap" size={14} /> Timer, exercise counters, and round score are simulated. Stored TinyIoT content below is read-only and does not update this session.</p></section>}

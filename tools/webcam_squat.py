@@ -17,6 +17,7 @@ from webcam_exercises import (CindyWorkout, ExerciseCounter, body_movement_measu
 from webcam_tinyiot import (PosePublisher, TinyIoTClient, TinyIoTError, DEFAULT_BASE,
                             DEFAULT_ORIGIN, EVENT_CONTAINER, SUMMARY_CONTAINER)
 from workout_summary import SummaryPublisher, completed_summary
+from local_voice_events import LocalVoiceEvents
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_MODEL = PROJECT_ROOT / "models" / "pose_landmarker_lite.task"
@@ -58,6 +59,8 @@ def main():
                         help="Originator with create and retrieve access to WorkoutSummary; defaults to event origin")
     parser.add_argument("--summary-container", default=SUMMARY_CONTAINER,
                         help="Existing oneM2M workout summary container path")
+    parser.add_argument("--voice-events-port", type=int, default=8765,
+                        help="Local browser voice event stream port; 0 disables it")
     args = parser.parse_args()
     if not args.model.is_file():
         sys.exit(f"Model missing: {args.model}\nDownload pose_landmarker_lite.task into models/ first.")
@@ -94,6 +97,16 @@ def main():
                       if args.tinyiot else None)
     summary_publisher = (SummaryPublisher(summary_client, args.summary_container)
                          if summary_client else None)
+    voice_events = None
+    if args.voice_events_port:
+        try:
+            voice_events = LocalVoiceEvents(args.voice_events_port)
+        except OSError as exc:
+            print(f"[VOICE] Local event stream unavailable: {exc}")
+    def announce(kind, **details):
+        if voice_events and workout:
+            return voice_events.emit({"type": kind, "sessionId": session_id, **details})
+        return None
     print(f"Webcam session {session_id}; mode={args.exercise}; TinyIoT={'on' if publisher else 'off'}")
     print("Click the webcam window before pressing keys.")
     print("Manual modes: 1 pull-up | 2 push-up | 3 squat | C Cindy | S stop and save | R reset | Q quit without saving")
@@ -104,20 +117,23 @@ def main():
     total_rounds = 0
     session_baseline = dict(total_reps)
     end_reason = None
+    timer_announced = set()
     try:
+        announce("start", round=1)
         with open(csv_path, "w", newline="", encoding="utf-8") as f, \
                 mp.tasks.vision.PoseLandmarker.create_from_options(options) as landmarker:
             fields = ["timestampUtc", "elapsedMs", "exercise", "kneeAngleDeg", "trackedLeg",
                       "visibility", "phase", "repCount", "angleDeg", "trackedSide",
                       "confidence", "bodyMovement", "exerciseReps", "rounds", "sessionId",
                       "headPosition", "lateralPosition", "detectorReason", "lastRejection",
-                      "eventId", "eventQueueDepth"]
+                      "eventId", "eventQueueDepth", "frameGapMs", "poseMs"]
             writer = csv.DictWriter(f, fieldnames=fields)
             writer.writeheader()
             while True:
                 if workout and workout.finished:
                     print(f"[SESSION] 20-minute Cindy complete; rounds={workout.rounds}")
                     end_reason = "timer"
+                    announce("complete")
                     break
                 ok, frame = camera.read()
                 if not ok:
@@ -129,8 +145,11 @@ def main():
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
                 ts_ms = max(int((time.monotonic() - start) * 1000), last_ts_ms + 1)
+                frame_gap_ms = ts_ms - last_ts_ms if last_ts_ms >= 0 else 0
                 last_ts_ms = ts_ms
+                pose_started = time.monotonic()
                 result = landmarker.detect_for_video(image, ts_ms)
+                pose_ms = round((time.monotonic() - pose_started) * 1000, 1)
                 angle, confidence, side = None, 0.0, "NONE"
                 body_movement, body_confidence = None, 0.0
                 head_position = lateral_position = None
@@ -149,12 +168,22 @@ def main():
                         head_position, lateral_position = pullup_auxiliary_measurement(landmarks)
                 counter = counters[frame_exercise]
                 rejected_before = counter.rejected_candidates
+                phase_before = counter.phase
                 counted = counter.update(angle, body_movement, head_position, lateral_position)
+                confirmed_at_ms = time.time_ns() // 1_000_000 if counted else None
+                counted = counted and not (workout and workout.finished)
+                if frame_exercise == "pushup" and (counter.phase != phase_before or counter.rejected_candidates != rejected_before):
+                    print(f"[PUSHUP] t={ts_ms}ms {phase_before}->{counter.phase} "
+                          f"angle={angle if angle is not None else 'missing'} "
+                          f"shoulder={body_movement if body_movement is not None else 'missing'} "
+                          f"visibility={confidence:.2f} gap={frame_gap_ms}ms pose={pose_ms}ms "
+                          f"reason={counter.last_reason}")
                 if counter.rejected_candidates != rejected_before:
                     print(f"[REJECT] exercise={frame_exercise} reason={counter.last_rejection}")
                 event = None
                 if counted:
                     event_round = workout.rounds + 1 if workout else 1
+                    spoken_count = workout.progress[frame_exercise] + 1 if workout else reps_this_mode[frame_exercise] + 1
                     reps_this_mode[frame_exercise] += 1
                     total_reps[frame_exercise] += 1
                     if workout:
@@ -177,6 +206,14 @@ def main():
                     print(f"[REP] detectedAt={event['timestamp']} id={event['eventId']} "
                           f"{counter.exercise} total={total_reps[counter.exercise]} "
                           f"sessionSeq={event_sequence} rounds={total_rounds}")
+                    published_at_ms = announce("rep", eventId=event["eventId"], eventSequence=event_sequence,
+                             confirmedAtEpochMs=confirmed_at_ms,
+                             exercise=frame_exercise, count=spoken_count,
+                             nextExercise=active if active != frame_exercise else None,
+                             roundComplete=bool(workout and active != frame_exercise and active == "pullup"),
+                             round=workout.rounds + 1 if workout else 1)
+                    if published_at_ms is not None:
+                        print(f"[VOICE] id={event['eventId']} confirmToLocalPublishMs={published_at_ms - confirmed_at_ms}")
                     if publisher:
                         publisher.offer_event(event)
 
@@ -185,6 +222,10 @@ def main():
                 display_counter = counters[display_exercise]
                 if workout:
                     remaining = workout.remaining
+                    for threshold, label in ((600, "10"), (300, "5"), (60, "1")):
+                        if workout.duration_seconds >= threshold and remaining <= threshold and label not in timer_announced:
+                            timer_announced.add(label)
+                            announce("timer", minutes=label)
                     clock_text = f"{int(remaining//60):02d}:{int(remaining%60):02d}"
                     rounds_text = workout.rounds
                     progress_text = f"{workout.progress[display_exercise]}/{TARGETS[display_exercise]}"
@@ -244,17 +285,21 @@ def main():
                                  "lateralPosition": f"{lateral_position:.4f}" if lateral_position is not None else "",
                                  "detectorReason": reason, "lastRejection": display_counter.last_rejection or "",
                                  "eventId": event["eventId"] if event is not None else "",
-                                 "eventQueueDepth": publisher.diagnostics()["eventQueueDepth"] if publisher else 0})
+                                 "eventQueueDepth": publisher.diagnostics()["eventQueueDepth"] if publisher else 0,
+                                 "frameGapMs": frame_gap_ms, "poseMs": pose_ms})
                 cv2.imshow("CindySense Webcam Workout", frame)
                 key = cv2.waitKey(1) & 0xFF
                 if workout and workout.finished:
                     end_reason = "timer"
+                    announce("complete")
                     break
                 if key in (ord("s"), ord("S")) and workout:
                     end_reason = "explicit_stop"
+                    announce("stop")
                     print(f"[SESSION] Cindy stopped explicitly; rounds={workout.rounds}")
                     break
                 if key in (ord("q"), 27):
+                    announce("reset")
                     break
                 selected = select_exercise_key(key, workout)
                 if selected is not None:
@@ -269,7 +314,10 @@ def main():
                     event_sequence = 0
                     active = workout.current_exercise
                     print(f"Started Cindy AMRAP timer; session {session_id}.")
+                    timer_announced = set()
+                    announce("start", round=1)
                 elif key in (ord("r"), ord("R")):
+                    announce("reset")
                     counters = {name: ExerciseCounter(name) for name in TARGETS}
                     reps_this_mode = {name: 0 for name in TARGETS}
                     total_reps = {name: 0 for name in TARGETS}
@@ -280,8 +328,12 @@ def main():
                     if workout:
                         workout = CindyWorkout(max(1, int(args.duration_minutes * 60)))
                         active = workout.current_exercise
+                        timer_announced = set()
+                        announce("start", round=1)
                     print(f"Workout counts reset; new session {session_id}.")
     finally:
+        if voice_events:
+            voice_events.close()
         if publisher:
             publisher.close()
         if end_reason and workout:
