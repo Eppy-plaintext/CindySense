@@ -30,6 +30,20 @@ class APITests(unittest.IsolatedAsyncioTestCase):
         def handle(request):
             self.requests.append(request)
             path = request.url.path
+            if path.endswith('/WorkoutPerformance_TS') and request.url.params.get('fu') == '1':
+                return httpx.Response(200, headers={'X-M2M-RSC': '2000'},
+                                      json={'m2m:uril': ['TinyIoT/CindySense_AE/WorkoutPerformance_TS/workout_test']})
+            if path.endswith('/WorkoutPerformance_TS'):
+                return httpx.Response(200, headers={'X-M2M-RSC': '2000'}, json={'m2m:ts': {'ty': 29}})
+            if path.endswith('/WorkoutPerformance_TS/workout_test'):
+                return httpx.Response(200, headers={'X-M2M-RSC': '2000'},
+                                      json={'m2m:tsi': {'dgt': '20261111T120000',
+                                                        'con': '{"workoutId":"session-1","rounds":1}'}})
+            if request.url.params.get('fu') == '1':
+                return httpx.Response(200, headers={'X-M2M-RSC': '2000'},
+                                      json={'m2m:uril': [
+                                          'TinyIoT/CindySense_AE/RepetitionCount',
+                                          'TinyIoT/CindySense_AE/WorkoutSummary']})
             if path.endswith('/RepetitionCount') or path.endswith('/AIRecommendations'):
                 return httpx.Response(200, headers={'X-M2M-RSC': '2000'}, json={'m2m:cnt': {'rn': path.rsplit('/', 1)[-1]}})
             if path.endswith('/RepetitionCount/la'):
@@ -44,6 +58,7 @@ class APITests(unittest.IsolatedAsyncioTestCase):
         self.settings_patch = patch.object(main, 'settings', main.settings.__class__(
             base_url='http://localhost:3000/TinyIoT',
             workout_origin='authorized-workout-origin',
+            discovery_origin='authorized-discovery-origin',
             cindypt_origin='authorized-pt-origin',
             repetition_resource='CindySense_AE/RepetitionCount',
             recommendations_resource='CindyPT_AE/AIRecommendations',
@@ -71,6 +86,15 @@ class APITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.requests[0].headers['X-M2M-Origin'], 'authorized-workout-origin')
         self.assertEqual(self.requests[0].headers['X-M2M-RVI'], '4')
         self.assertTrue(self.requests[0].headers['X-M2M-RI'].startswith('cindysense-'))
+
+    async def test_workout_timeseries_history_is_read_only_and_scoped(self):
+        response = await self.api.get('/api/onem2m/workout-timeseries')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['count'], 1)
+        self.assertEqual(response.json()['workouts'][0]['content']['workoutId'], 'session-1')
+        self.assertEqual([request.method for request in self.requests], ['GET', 'GET', 'GET'])
+        self.assertTrue(all(request.headers['X-M2M-Origin'] == 'CDashboard'
+                            for request in self.requests))
 
     async def test_numeric_string_repetition_content(self):
         self.workout_content = '11'
@@ -118,6 +142,19 @@ class APITests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(response.json()['backend']['available'])
         self.assertTrue(response.json()['tinyiot']['reachable'])
         self.assertTrue(response.json()['tinyiot']['resource_verified'])
+
+    async def test_discovery_uses_onem2m_filter_usage_and_returns_authorized_containers(self):
+        response = await self.api.get('/api/onem2m/discovery')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['resource_type'], 3)
+        self.assertEqual(response.json()['resources'], [
+            'TinyIoT/CindySense_AE/RepetitionCount',
+            'TinyIoT/CindySense_AE/WorkoutSummary'])
+        request = self.requests[0]
+        self.assertEqual(request.url.params['fu'], '1')
+        self.assertEqual(request.url.params['rcn'], '11')
+        self.assertEqual(request.url.params['ty'], '3')
+        self.assertEqual(request.headers['X-M2M-Origin'], 'authorized-discovery-origin')
 
     async def test_cors_allows_both_local_vite_origins(self):
         for origin in ('http://localhost:5173', 'http://127.0.0.1:5173'):

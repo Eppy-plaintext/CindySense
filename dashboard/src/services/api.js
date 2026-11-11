@@ -35,6 +35,7 @@ export const getWorkoutSnapshot = (options) => getJson('/api/workout/snapshot', 
 export const getWebcamStatus = (options) => getJson('/api/workout/webcam-status', options)
 export const getWorkoutHistory = (options) => getJson('/api/workout/history', options)
 export const getCindyPtRecommendations = (options) => getJson('/api/cindypt/recommendations', options)
+export const getCurrentCindyPtRecommendation = (options) => getJson('/api/cindypt/recommendations/current', options)
 export const getCindyPtGoal = (options) => getJson('/api/cindypt/goal', options)
 export const getCindyPtProgress = (options) => getJson('/api/cindypt/progress', options)
 export const saveCindyPtGoal = (goal) => getJson('/api/cindypt/goal', { method: 'POST', body: goal })
@@ -43,3 +44,4 @@ export const previewCindyPtPlan = (preferences) => getJson('/api/cindypt/plans/p
 export const saveCindyPtPlan = (request) => getJson('/api/cindypt/plans', { method: 'POST', body: request })
 export const getSavedCindyPtPlan = (options) => getJson('/api/cindypt/plans', options)
 export const getCindyPtRecovery = (options) => getJson('/api/cindypt/recovery', options)
+export const integrationEventUrl = `${API_BASE_URL}/api/integration/events`

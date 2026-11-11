@@ -306,7 +306,8 @@ class PosePublisher:
         self.shutdown_grace = shutdown_grace
         self.last_queued = 0.0
         self.pending = queue.Queue(maxsize=5)
-        self.events = queue.Queue(maxsize=1024)
+        # A full 20-minute offline Cindy session must fit while retries continue.
+        self.events = queue.Queue(maxsize=20000)
         self.event_spool = Path(event_spool) if event_spool else Path(__file__).resolve().parent.parent / "data" / "recordings" / "webcam_pending_events.json"
         self.event_overflow = 0
         self.event_confirmed = 0
@@ -317,7 +318,7 @@ class PosePublisher:
         if self.event_spool.is_file():
             try:
                 pending = json.loads(self.event_spool.read_text(encoding="utf-8"))
-                if not isinstance(pending, list) or len(pending) > 1025:
+                if not isinstance(pending, list) or len(pending) > 20001:
                     raise ValueError("spool is not a bounded event list")
                 self.events.maxsize = max(self.events.maxsize, len(pending))
                 for event in pending:

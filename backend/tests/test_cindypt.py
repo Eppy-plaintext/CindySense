@@ -81,6 +81,9 @@ class CindyPTTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.recommendations[0]['source'], 'rule-based')
         self.assertEqual(self.recommendations[0]['sourceWorkoutId'], 'w2')
         self.assertEqual((await self.api.get('/api/cindypt/recommendations')).json()['recommendations'], self.recommendations[0])
+        repeated = await self.api.post('/api/cindypt/recommendations/generate')
+        self.assertTrue(repeated.json()['alreadySaved'])
+        self.assertEqual(len(self.recommendations), 1)
         self.assertTrue(all(call.headers['X-M2M-Origin'] == 'pt-origin' for call in self.calls))
         self.assertFalse(any(call.url.path.endswith(('/CindyPT_AE', '/CindySense_AE')) and call.method == 'POST' for call in self.calls))
 
@@ -110,6 +113,15 @@ class CindyPTTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.recommendations[-1]['sourceWorkoutId'], 'new-session')
         self.assertEqual(self.recommendations[-1]['roundsCompleted'], 6)
         self.assertEqual((await self.api.get('/api/cindypt/recommendations')).json()['recommendations'], self.recommendations[-1])
+
+    async def test_current_advice_is_a_read_only_preview_for_latest_summary(self):
+        self.goal = {'targetRounds': 7, 'durationSeconds': 1200}
+        self.summaries = [{'sessionId': 'webcam-session', 'rounds': 2,
+                           'durationSeconds': 1200, 'status': 'completed'}]
+        response = await self.api.get('/api/cindypt/recommendations/current')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['recommendations']['sourceWorkoutId'], 'webcam-session')
+        self.assertEqual(self.recommendations, [])
 
     async def test_missing_goal_or_summary_does_not_generate_data(self):
         self.assertFalse((await self.api.get('/api/cindypt/goal')).json()['available'])

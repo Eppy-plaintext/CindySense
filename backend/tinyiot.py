@@ -1,10 +1,13 @@
 """oneM2M client. Originators remain server-side; writes require API safeguards."""
 
 import json
+import logging
 from urllib.parse import urlsplit
 from uuid import uuid4
 
 import httpx
+
+log = logging.getLogger(__name__)
 
 
 class TinyIoTError(Exception):
@@ -21,6 +24,71 @@ class TinyIoTClient:
 
     async def retrieve(self, resource_path: str, origin: str) -> dict:
         return await self._request('GET', resource_path, origin)
+
+    async def discover(self, resource_path: str, origin: str, resource_type: int | None = None) -> list[str]:
+        """Return authorized descendant URIs through TinyIoT discovery."""
+        params = {'fu': 1, 'rcn': 11}
+        if resource_type is not None:
+            params['ty'] = resource_type
+        payload = await self._request('GET', resource_path, origin, params=params)
+        references = payload.get('m2m:uril')
+        if not isinstance(references, list) or any(not isinstance(item, str) for item in references):
+            raise TinyIoTError('invalid_tinyiot_response', 'Discovery response is missing m2m:uril.', 502)
+        return references
+
+    async def create_subscription(self, resource_path: str, origin: str, name: str, notification_uri: str) -> dict:
+        return await self._request('POST', resource_path, origin, {
+            'm2m:sub': {'rn': name, 'nu': [notification_uri], 'enc': {'net': [3]}, 'nct': 1},
+        }, content_type='application/json;ty=23')
+
+    async def create_group(self, parent_path: str, origin: str, name: str,
+                           member_paths: list[str], member_type: int = 3,
+                           consistency: int = 2) -> dict:
+        """Create a typed oneM2M GRP with existing member references."""
+        if not name or '/' in name or name in ('.', '..'):
+            raise TinyIoTError('invalid_resource_name', 'Group resource name is invalid.', 503)
+        base_prefix = urlsplit(self.base_url).path.strip('/')
+        members = [path.strip('/') for path in member_paths]
+        # TinyIoT expects SP-relative member references during GRP validation.
+        # Keep the public helper convenient by accepting repository-style paths.
+        members = [path if path == base_prefix or path.startswith(base_prefix + '/')
+                   else f'{base_prefix}/{path}' for path in members]
+        if not members or any(not path or any(part in ('', '.', '..') for part in path.split('/'))
+                              for path in members):
+            raise TinyIoTError('invalid_group_members', 'Group member paths are invalid.', 503)
+        return await self._request('POST', parent_path, origin, {
+            'm2m:grp': {'rn': name, 'mt': member_type, 'mid': members,
+                        'mnm': len(members), 'csy': consistency},
+        }, content_type='application/json;ty=9')
+
+    async def group_members(self, group_path: str, origin: str) -> list[str]:
+        payload = await self.retrieve(group_path, origin)
+        group = payload.get('m2m:grp')
+        members = group.get('mid') if isinstance(group, dict) else None
+        if not isinstance(members, list) or any(not isinstance(item, str) for item in members):
+            raise TinyIoTError('invalid_tinyiot_response', 'Group representation is missing mid.', 502)
+        return members
+
+    async def fanout_retrieve(self, group_path: str, origin: str) -> dict:
+        """Retrieve group members through TinyIoT's fanout point (read-only)."""
+        return await self.retrieve(f'{group_path.strip('/')}/fopt', origin)
+
+    async def update_subscription(self, resource_path: str, origin: str, notification_uri: str) -> dict:
+        return await self._request('PUT', resource_path, origin, {
+            'm2m:sub': {'nu': [notification_uri], 'enc': {'net': [3]}, 'nct': 1},
+        }, content_type='application/json')
+
+    async def embedded_subscriptions(self, resource_path: str, origin: str) -> list[dict]:
+        payload = await self._request('GET', resource_path, origin, params={'rcn': 4})
+        container = payload.get('m2m:cnt')
+        if not isinstance(container, dict):
+            raise TinyIoTError('invalid_tinyiot_response', 'Container child representation is malformed.', 502)
+        children = container.get('m2m:sub', [])
+        if isinstance(children, dict):
+            children = [children]
+        if not isinstance(children, list) or any(not isinstance(child, dict) for child in children):
+            raise TinyIoTError('invalid_tinyiot_response', 'Embedded subscriptions are malformed.', 502)
+        return children
 
     async def create_content_instance(self, resource_path: str, origin: str, resource_name: str, content: dict) -> dict:
         if not resource_name.startswith('sim-') or len(resource_name) != 36:
@@ -85,7 +153,7 @@ class TinyIoTClient:
             'X-M2M-RVI': '4',
             'Accept': 'application/json',
         }
-        if method == 'POST':
+        if method in ('POST', 'PUT'):
             headers['Content-Type'] = content_type or 'application/vnd.onem2m-res+json;ty=4'
         url = f'{self.base_url}/{path}' if path else self.base_url
         try:
@@ -98,6 +166,10 @@ class TinyIoTClient:
             raise TinyIoTError('tinyiot_unreachable', 'TinyIoT could not be reached.', 503) from exc
 
         rsc = response.headers.get('X-M2M-RSC')
+        if response.is_error or (rsc and not rsc.startswith('2')):
+            # Never log the request body or notification URI: it carries a token.
+            log.warning('oneM2M request failed method=%s resource=%s http=%s rsc=%s',
+                        method, path, response.status_code, rsc or 'absent')
         if response.status_code == 403 or rsc == '4103':
             raise TinyIoTError('tinyiot_forbidden', 'The configured oneM2M originator has no privilege for this resource.', 403)
         if response.status_code == 404 or rsc == '4004':

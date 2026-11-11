@@ -1,16 +1,21 @@
 """CindySense API: React -> FastAPI -> TinyIoT."""
 
 import secrets
+import asyncio
+import json
+import logging
 import httpx
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import settings
 from .cindypt import Goal, analyze, read_goal, read_summaries, recommend
 from .events import RepetitionEvent, classify_repetition_content
+from .notifications import NotificationHub
 from .simulation import SimulationPublisher
 from .tinyiot import TinyIoTClient, TinyIoTError
 from .workout_snapshot import WorkoutSnapshot
@@ -19,8 +24,27 @@ from .weekly_plan import PlanPreferences, SavePlanRequest, generate_weekly_plan
 
 @asynccontextmanager
 async def lifespan(app):
-    yield
-    await tinyiot._client.aclose()
+    subscription_task = None
+    if settings.notification_url:
+        async def maintain_subscriptions():
+            while True:
+                try:
+                    await notification_hub.ensure(tinyiot, settings)
+                    return
+                except (TinyIoTError, ValueError) as exc:
+                    logging.getLogger(__name__).error('oneM2M subscription setup failed: %s', exc)
+                    await asyncio.sleep(30)
+        subscription_task = asyncio.create_task(maintain_subscriptions())
+    try:
+        yield
+    finally:
+        if subscription_task:
+            subscription_task.cancel()
+            try:
+                await subscription_task
+            except asyncio.CancelledError:
+                pass
+        await tinyiot._client.aclose()
 
 
 app = FastAPI(title='CindySense API', version='0.1.0', lifespan=lifespan)
@@ -35,6 +59,55 @@ app.add_middleware(
 tinyiot = TinyIoTClient(settings.base_url, httpx.AsyncClient(timeout=5.0))
 simulation_publisher = SimulationPublisher()
 workout_snapshot = WorkoutSnapshot()
+notification_hub = NotificationHub()
+recommendation_lock = asyncio.Lock()
+
+
+@app.post('/api/onem2m/notify/{token}')
+async def onem2m_notification(token: str, request: Request):
+    if request.headers.get('content-type', '').split(';', 1)[0] not in (
+            'application/json', 'application/vnd.onem2m-ntfy+json'):
+        notification_hub.rejected_callbacks += 1
+        raise HTTPException(status_code=415, detail='Unsupported notification representation.')
+    try:
+        body = await request.json()
+        kind, rqi = await notification_hub.receive(body, request.headers, token, tinyiot, settings)
+    except (ValueError, TypeError) as exc:
+        notification_hub.rejected_callbacks += 1
+        logging.getLogger(__name__).warning('Rejected oneM2M notification: %s', exc)
+        status = 403 if str(exc) in ('invalid notification token', 'unexpected oneM2M origin') else 400
+        raise HTTPException(status_code=status, detail=str(exc)) from exc
+    except TinyIoTError as exc:
+        notification_hub.rejected_callbacks += 1
+        raise api_error(exc) from exc
+    return JSONResponse({'m2m:rsp': {'rsc': 2000, 'rqi': rqi}},
+                        headers={'X-M2M-RSC': '2000', 'X-M2M-RI': rqi, 'X-M2M-RVI': '4'})
+
+
+@app.get('/api/integration/events')
+async def integration_events():
+    async def stream():
+        listener = asyncio.Queue(maxsize=16)
+        notification_hub.listeners.add(listener)
+        try:
+            yield 'event: reconcile\ndata: {}\n\n'
+            while True:
+                try:
+                    kind, data = await asyncio.wait_for(listener.get(), timeout=15)
+                    if kind == 'repetition':
+                        data = {**data, 'sseEmittedAt': datetime.now(timezone.utc).isoformat(timespec='milliseconds')}
+                    yield f'event: {kind}\ndata: {json.dumps(data, separators=(",", ":"))}\n\n'
+                except asyncio.TimeoutError:
+                    yield ': keepalive\n\n'
+        finally:
+            notification_hub.listeners.discard(listener)
+    return StreamingResponse(stream(), media_type='text/event-stream',
+                             headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
+
+
+@app.get('/api/integration/metrics')
+async def integration_metrics():
+    return notification_hub.metrics()
 
 
 
@@ -46,17 +119,74 @@ def api_error(exc: TinyIoTError) -> HTTPException:
 @app.get('/api/health')
 async def health():
     try:
-        await tinyiot.retrieve('', settings.workout_origin or 'CindySense-health-probe')
-    except TinyIoTError as exc:
-        if exc.code == 'tinyiot_unreachable':
-            return {'backend': {'available': True}, 'tinyiot': {'reachable': False, 'resource_verified': False, 'code': exc.code, 'message': str(exc)}}
-        if exc.code not in ('tinyiot_forbidden', 'resource_not_found'):
-            return {'backend': {'available': True}, 'tinyiot': {'reachable': True, 'resource_verified': False, 'code': exc.code, 'message': str(exc)}}
-    try:
         await tinyiot.retrieve(settings.repetition_resource, settings.workout_origin)
         return {'backend': {'available': True}, 'tinyiot': {'reachable': True, 'resource_verified': True}}
     except TinyIoTError as exc:
         return {'backend': {'available': True}, 'tinyiot': {'reachable': exc.code != 'tinyiot_unreachable', 'resource_verified': False, 'code': exc.code, 'message': str(exc)}}
+
+
+@app.get('/api/onem2m/discovery')
+async def onem2m_discovery():
+    """Discover authorized CindySense containers through the CSE."""
+    try:
+        origin = settings.discovery_origin
+        if not origin:
+            raise TinyIoTError('origin_not_configured', 'A discovery originator is not configured.', 503)
+        resources = await tinyiot.discover('CindySense_AE', origin, resource_type=3)
+        return {'source': 'TinyIoT', 'resource_path': 'CindySense_AE', 'resource_type': 3,
+                'resources': resources}
+    except TinyIoTError as exc:
+        raise api_error(exc) from exc
+
+
+@app.get('/api/onem2m/workout-timeseries')
+async def workout_timeseries_history():
+    """Read bounded workout history directly from TinyIoT; never write or alter CindyPT."""
+    origin = settings.workout_ts_read_origin
+    resource = settings.workout_ts_resource.strip('/')
+    try:
+        parent = await tinyiot.retrieve(resource, origin)
+        ts = parent.get('m2m:ts')
+        if not isinstance(ts, dict) or ts.get('ty') != 29:
+            raise TinyIoTError('invalid_tinyiot_response', 'Workout history resource is not a TS.', 502)
+        refs = await tinyiot.discover(resource, origin, resource_type=30)
+        prefix = f'TinyIoT/{resource}/'
+        if len(refs) > 100 or any(not ref.startswith(prefix) or '/' in ref[len(prefix):]
+                                  for ref in refs):
+            raise TinyIoTError('invalid_tinyiot_response', 'Workout history discovery is invalid or too large.', 502)
+        workouts = []
+        for ref in refs:
+            record = await tinyiot.retrieve(ref[len('TinyIoT/'):], origin)
+            instance = record.get('m2m:tsi')
+            if not isinstance(instance, dict):
+                raise TinyIoTError('invalid_tinyiot_response', 'Workout history instance is malformed.', 502)
+            content = instance.get('con')
+            try:
+                content = json.loads(content) if isinstance(content, str) else content
+            except ValueError as exc:
+                raise TinyIoTError('invalid_tinyiot_response', 'Workout history content is not JSON.', 502) from exc
+            if not isinstance(content, dict):
+                raise TinyIoTError('invalid_tinyiot_response', 'Workout history content is malformed.', 502)
+            workouts.append({'resource_path': ref[len('TinyIoT/'):],
+                             'dataGenerationTime': instance.get('dgt'), 'content': content})
+        return {'source': 'TinyIoT', 'resource_path': resource, 'count': len(workouts),
+                'workouts': workouts}
+    except TinyIoTError as exc:
+        raise api_error(exc) from exc
+
+
+@app.get('/api/onem2m/group/workout-monitoring')
+async def workout_monitoring_group():
+    """Read the configured monitoring GRP and its members through fan-out."""
+    try:
+        if not settings.group_origin:
+            raise TinyIoTError('origin_not_configured', 'A group originator is not configured.', 503)
+        members = await tinyiot.group_members(settings.group_resource, settings.group_origin)
+        fanout = await tinyiot.fanout_retrieve(settings.group_resource, settings.group_origin)
+        return {'source': 'TinyIoT', 'resource_path': settings.group_resource,
+                'members': members, 'fanout': fanout}
+    except TinyIoTError as exc:
+        raise api_error(exc) from exc
 
 
 @app.get('/api/workout/live')
@@ -202,15 +332,36 @@ async def cindypt_progress():
         raise api_error(exc) from exc
 
 
-@app.post('/api/cindypt/recommendations/generate', status_code=201)
-async def generate_cindypt_recommendation():
+@app.get('/api/cindypt/recommendations/current')
+async def current_cindypt_recommendation():
+    """Preview advice for the latest completed summary without changing saved plans."""
     try:
         progress = await _cindypt_progress()
         if not progress['available']:
-            raise HTTPException(status_code=409, detail={'code': 'insufficient_data', 'message': progress['message']})
-        advice = recommend(progress)
-        await tinyiot.create_content(settings.recommendations_resource, settings.cindypt_origin, advice)
-        return {'recommendations': advice, 'resource_path': settings.recommendations_resource}
+            return {'available': False, 'recommendations': None, 'message': progress['message']}
+        return {'available': True, 'recommendations': recommend(progress), 'source': 'rule-based-preview'}
+    except TinyIoTError as exc:
+        raise api_error(exc) from exc
+
+
+@app.post('/api/cindypt/recommendations/generate', status_code=201)
+async def generate_cindypt_recommendation():
+    try:
+        async with recommendation_lock:
+            progress = await _cindypt_progress()
+            if not progress['available']:
+                raise HTTPException(status_code=409, detail={'code': 'insufficient_data', 'message': progress['message']})
+            advice = recommend(progress)
+            try:
+                existing, _ = await tinyiot.latest_content(settings.recommendations_resource, settings.cindypt_origin)
+            except TinyIoTError as exc:
+                if exc.code != 'resource_not_found':
+                    raise
+                existing = None
+            if existing != advice:
+                await tinyiot.create_content(settings.recommendations_resource, settings.cindypt_origin, advice)
+            return {'recommendations': advice, 'resource_path': settings.recommendations_resource,
+                    'alreadySaved': existing == advice}
     except TinyIoTError as exc:
         raise api_error(exc) from exc
 

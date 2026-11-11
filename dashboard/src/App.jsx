@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { ConnectionStatus, HistoryAvailability, StoredRepetitionPanel } from './components/ApiPanels.jsx'
 import { CindyPtPage } from './components/CindyPtPage.jsx'
 import { usePolling } from './hooks/usePolling.js'
-import { getBackendHealth, getLatestRepetition, getWebcamStatus, getWorkoutHistory, getWorkoutSnapshot } from './services/api.js'
+import { getBackendHealth, getLatestRepetition, getWebcamStatus, getWorkoutHistory, getWorkoutSnapshot, integrationEventUrl } from './services/api.js'
 import { acceptSnapshot, liveDisplay } from './services/workoutDisplay.js'
 import { VoiceCoach, handleLocalVoiceEvent } from './services/voiceCoach.js'
 import './App.css'
@@ -40,6 +40,8 @@ function App() {
   const [activeExercise, setActiveExercise] = useState('pullUps')
   const [autoSimulate, setAutoSimulate] = useState(false)
   const [lastSnapshot, setLastSnapshot] = useState(null)
+  const [repetitionRevision, setRepetitionRevision] = useState(0)
+  const [summaryRevision, setSummaryRevision] = useState(0)
   const [displayMode, setDisplayMode] = useState('webcam')
   const [now, setNow] = useState(() => Date.now())
   const [voicePreferences, setVoicePreferences] = useState(() => {
@@ -68,9 +70,21 @@ function App() {
   }, [])
   const healthResult = usePolling(getBackendHealth)
   const liveResult = usePolling(getLatestRepetition, { enabled: activePage === 'dashboard' })
-  const snapshotResult = usePolling(getLiveSnapshot, { enabled: activePage === 'dashboard', intervalMs: 750 })
+  const snapshotResult = usePolling(getLiveSnapshot, { enabled: activePage === 'dashboard', intervalMs: 2000, refreshKey: repetitionRevision })
   const webcamStatus = usePolling(getWebcamStatus, { enabled: activePage === 'dashboard' && displayMode === 'webcam', intervalMs: 1500 })
   const historyResult = usePolling(getWorkoutHistory, { enabled: activePage === 'history', intervalMs: null })
+
+  useEffect(() => {
+    if (typeof EventSource === 'undefined') return undefined
+    const stream = new EventSource(integrationEventUrl)
+    stream.addEventListener('repetition', () => setRepetitionRevision((value) => value + 1))
+    stream.addEventListener('summary', () => setSummaryRevision((value) => value + 1))
+    stream.addEventListener('reconcile', () => {
+      setRepetitionRevision((value) => value + 1)
+      setSummaryRevision((value) => value + 1)
+    })
+    return () => stream.close()
+  }, [])
 
   useEffect(() => {
     const interval = window.setInterval(() => setNow(Date.now()), 1000)
@@ -141,7 +155,7 @@ function App() {
       <nav className="mobile-nav" aria-label="Mobile navigation">{[['dashboard', 'Dashboard'], ['history', 'History'], ['pt', 'Cindy PT']].map(([page, label]) => <button key={page} className={activePage === page ? 'active' : ''} onClick={() => setActivePage(page)}>{label}</button>)}</nav>
       {activePage === 'dashboard' && <Dashboard secondsLeft={secondsLeft} formatTime={formatTime} timerProgress={timerProgress} workoutState={workoutState} setWorkoutState={setWorkoutState} resetWorkout={resetWorkout} reps={reps} rounds={rounds} activeExercise={activeExercise} setActiveExercise={setActiveExercise} incrementRep={incrementRep} currentExercise={currentExercise} autoSimulate={autoSimulate} setAutoSimulate={setAutoSimulate} liveResult={liveResult} snapshotResult={snapshotResult} webcamStatus={webcamStatus} lastSnapshot={lastSnapshot} displayMode={displayMode} setDisplayMode={setDisplayMode} now={now} voicePreferences={voicePreferences} setVoicePreferences={setVoicePreferences} voiceCoach={voiceCoach} />}
       {activePage === 'history' && <><div className="view-data-slot"><HistoryAvailability result={historyResult} /><p className="demo-section-label">SIMULATED HISTORY EXAMPLES BELOW</p></div><HistoryPage /></>}
-      {activePage === 'pt' && <CindyPtPage />}
+      {activePage === 'pt' && <CindyPtPage summaryRevision={summaryRevision} />}
     </main>
   </div>
 }

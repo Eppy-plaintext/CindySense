@@ -17,9 +17,14 @@ def tinyiot_base_url() -> str:
 class Settings:
     base_url: str = tinyiot_base_url()
     workout_origin: str = os.getenv('TINYIOT_WORKOUT_ORIGIN', '')
+    discovery_origin: str = os.getenv('TINYIOT_DISCOVERY_ORIGIN', '')
+    group_origin: str = os.getenv('TINYIOT_GROUP_ORIGIN', '')
+    group_resource: str = os.getenv('TINYIOT_GROUP_RESOURCE', 'CindySense_AE/WorkoutMonitoring_GRP')
     cindypt_origin: str = os.getenv('TINYIOT_CINDYPT_ORIGIN', '')
     repetition_resource: str = os.getenv('TINYIOT_REPETITION_RESOURCE', 'CindySense_AE/RepetitionCount')
     workout_summary_resource: str = os.getenv('TINYIOT_WORKOUT_SUMMARY_RESOURCE', 'CindySense_AE/WorkoutSummary')
+    workout_ts_resource: str = os.getenv('TINYIOT_WORKOUT_TS_RESOURCE', 'CindySense_AE/WorkoutPerformance_TS')
+    workout_ts_read_origin: str = os.getenv('TINYIOT_WORKOUT_TS_READ_ORIGIN', 'CDashboard')
     target_plan_resource: str = os.getenv('TINYIOT_TARGET_PLAN_RESOURCE', 'CindyPT_AE/FitnessGoals')
     webcam_origin: str = os.getenv('TINYIOT_WEBCAM_ORIGIN', 'CWebcam')
     recommendations_resource: str = os.getenv('TINYIOT_RECOMMENDATIONS_RESOURCE', 'CindyPT_AE/AIRecommendations')
@@ -29,6 +34,11 @@ class Settings:
     simulation_writes_enabled: bool = os.getenv('CINDYSENSE_ENABLE_SIMULATION_WRITES', 'false').lower() == 'true'
     simulation_token: str = os.getenv('CINDYSENSE_SIMULATION_TOKEN', '')
     simulation_origin: str = os.getenv('TINYIOT_SIMULATION_ORIGIN', '')
+    # Use a Windows host address reachable from WSL, never WSL's localhost.
+    notification_url: str = os.getenv('CINDYSENSE_NOTIFICATION_URL', '')
+    notification_token: str = os.getenv('CINDYSENSE_NOTIFICATION_TOKEN', '')
+    subscription_origin: str = os.getenv('TINYIOT_SUBSCRIPTION_ORIGIN', '')
+    notification_origin: str = os.getenv('TINYIOT_NOTIFICATION_ORIGIN', '')
 
 
 settings = Settings()

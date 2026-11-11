@@ -17,6 +17,7 @@ from webcam_exercises import (CindyWorkout, ExerciseCounter, body_movement_measu
 from webcam_tinyiot import (PosePublisher, TinyIoTClient, TinyIoTError, DEFAULT_BASE,
                             DEFAULT_ORIGIN, EVENT_CONTAINER, SUMMARY_CONTAINER)
 from workout_summary import SummaryPublisher, completed_summary
+from workout_timeseries import WorkoutTimeSeries
 from local_voice_events import LocalVoiceEvents
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -59,6 +60,10 @@ def main():
                         help="Originator with create and retrieve access to WorkoutSummary; defaults to event origin")
     parser.add_argument("--summary-container", default=SUMMARY_CONTAINER,
                         help="Existing oneM2M workout summary container path")
+    parser.add_argument("--workout-ts-origin",
+                        help="Optional dedicated originator for WorkoutPerformance_TS; defaults to summary origin")
+    parser.add_argument("--no-workout-timeseries", action="store_true",
+                        help="Keep WorkoutSummary publishing but skip optional TimeSeries mirroring")
     parser.add_argument("--voice-events-port", type=int, default=8765,
                         help="Local browser voice event stream port; 0 disables it")
     args = parser.parse_args()
@@ -97,6 +102,12 @@ def main():
                       if args.tinyiot else None)
     summary_publisher = (SummaryPublisher(summary_client, args.summary_container)
                          if summary_client else None)
+    ts_client = (TinyIoTClient(args.tinyiot_base,
+                              args.workout_ts_origin or args.tinyiot_summary_origin or args.tinyiot_event_origin,
+                              timeout=1.5)
+                 if summary_client and not args.no_workout_timeseries else None)
+    ts_publisher = (WorkoutTimeSeries(ts_client)
+                    if summary_client and not args.no_workout_timeseries else None)
     voice_events = None
     if args.voice_events_port:
         try:
@@ -169,7 +180,8 @@ def main():
                 counter = counters[frame_exercise]
                 rejected_before = counter.rejected_candidates
                 phase_before = counter.phase
-                counted = counter.update(angle, body_movement, head_position, lateral_position)
+                counted = counter.update(angle, body_movement, head_position, lateral_position,
+                                         timestamp_ms=ts_ms)
                 confirmed_at_ms = time.time_ns() // 1_000_000 if counted else None
                 counted = counted and not (workout and workout.finished)
                 if frame_exercise == "pushup" and (counter.phase != phase_before or counter.rejected_candidates != rejected_before):
@@ -343,6 +355,15 @@ def main():
                 try:
                     result = summary_publisher.publish(summary)
                     print(f"[TinyIoT] Workout summary PERSISTED session={session_id} result={result}")
+                    if ts_publisher:
+                        try:
+                            source_path = f"{args.summary_container.strip('/')}/webcam-summary-{session_id}"
+                            ts_result, _ = ts_publisher.mirror_source(source_path)
+                            print(f"[TinyIoT] Workout TimeSeries {ts_result} session={session_id}")
+                        except TinyIoTError as exc:
+                            # The confirmed WorkoutSummary remains authoritative; repair
+                            # the optional TS through the explicit reconcile command.
+                            print(f"[TinyIoT] Optional TimeSeries mirror failed for session={session_id}: {exc}")
                 except TinyIoTError as exc:
                     print(f"[TinyIoT] Workout summary PERSISTENCE UNCONFIRMED session={session_id}: {exc}")
             else:
@@ -351,6 +372,8 @@ def main():
             print(f"[SESSION] Interrupted session={session_id}; no completed summary published")
         if summary_client:
             summary_client.close()
+        if ts_client:
+            ts_client.close()
         camera.release()
         cv2.destroyAllWindows()
     print(f"Completed. Local repetitions: {total_reps}; rounds={workout.rounds if workout else total_rounds}. CSV: {csv_path}")

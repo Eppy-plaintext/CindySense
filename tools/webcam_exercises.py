@@ -7,6 +7,11 @@ MIN_VISIBILITY = 0.50
 STABLE_FRAMES = 3
 BODY_DOWN_DELTA = 0.05
 BODY_RETURN_DELTA = 0.02
+SQUAT_FAST_TRAVEL = 0.05
+SQUAT_FAST_RETURN = 0.03
+FAST_FRAME_GAP_MS = 80
+FAST_MOTION_WINDOW_MS = 250
+SQUAT_COOLDOWN_FRAMES = 4
 
 
 def visibility(point):
@@ -141,6 +146,12 @@ class ExerciseCounter:
         self.reps = 0
         self.phase = "UNKNOWN"
         self.down_frames = self.up_frames = 0
+        self.fast_down_frames = self.fast_up_frames = 0
+        self.last_sample_ms = self.fast_motion_until_ms = None
+        self.last_squat_angle = self.last_squat_position = None
+        self.fast_squat_cycle = False
+        self.last_raw_angle = None
+        self.fast_arm_candidate = False
         self.smoothed_angle = None
         self.smoothed_movement = None
         self.movement_baseline = None
@@ -164,6 +175,12 @@ class ExerciseCounter:
         """Re-arm after a mode switch without changing the accumulated count."""
         self.phase = "UNKNOWN"
         self.down_frames = self.up_frames = self.missing_frames = 0
+        self.fast_down_frames = self.fast_up_frames = 0
+        self.last_sample_ms = self.fast_motion_until_ms = None
+        self.last_squat_angle = self.last_squat_position = None
+        self.fast_squat_cycle = False
+        self.last_raw_angle = None
+        self.fast_arm_candidate = False
         self.smoothed_angle = self.smoothed_movement = self.movement_baseline = None
         self.body_descent_seen = False
         self.position_calibration_frames = 0
@@ -179,11 +196,14 @@ class ExerciseCounter:
         self.arm_start_angle = None
         self.last_raw_position = self.last_head_position = None
 
-    def update(self, angle, movement=None, head_position=None, lateral_position=None):
+    def update(self, angle, movement=None, head_position=None, lateral_position=None, timestamp_ms=None):
         if self.exercise != "squat":
-            return self._update_arm(angle, movement, head_position, lateral_position)
+            return self._update_arm(angle, movement, head_position, lateral_position, timestamp_ms)
         if angle is None or (self.exercise != "squat" and movement is None):
             self.down_frames = self.up_frames = 0
+            self.fast_down_frames = self.fast_up_frames = 0
+            self.last_squat_angle = self.last_squat_position = None
+            self.fast_motion_until_ms = None
             self.smoothed_angle = None
             self.smoothed_movement = None
             self.missing_frames += 1
@@ -192,19 +212,33 @@ class ExerciseCounter:
                 self.movement_baseline = None
                 self.position_calibration_frames = 0
                 self.body_descent_seen = False
+                self.fast_squat_cycle = False
             self.last_reason = (
                 "awaiting_first_visible_extended_pose" if self.phase == "UNKNOWN"
                 else f"no_measurement; preserving {self.phase} through occlusion"
             )
             return False
         self.missing_frames = 0
+        fast_sample = (timestamp_ms is not None and self.last_sample_ms is not None
+                       and 0 < timestamp_ms - self.last_sample_ms <= FAST_FRAME_GAP_MS
+                       and movement is not None and self.last_squat_position is not None
+                       and self.last_squat_angle is not None
+                       and 25 <= abs(angle - self.last_squat_angle) <= 80
+                       and 0.02 <= abs(movement - self.last_squat_position) <= 0.08)
+        if fast_sample:
+            self.fast_motion_until_ms = timestamp_ms + FAST_MOTION_WINDOW_MS
+        fast_window = (timestamp_ms is not None and self.fast_motion_until_ms is not None
+                       and timestamp_ms <= self.fast_motion_until_ms)
+        self.last_sample_ms = timestamp_ms
+        self.last_squat_angle, self.last_squat_position = angle, movement
+        smoothing = 0.65 if fast_window else 0.4
         if angle is not None:
             self.smoothed_angle = angle if self.smoothed_angle is None else (
-                0.4 * angle + 0.6 * self.smoothed_angle
+                smoothing * angle + (1 - smoothing) * self.smoothed_angle
             )
         if movement is not None:
             self.smoothed_movement = movement if self.smoothed_movement is None else (
-                0.4 * movement + 0.6 * self.smoothed_movement
+                smoothing * movement + (1 - smoothing) * self.smoothed_movement
             )
         down, up = self.CONFIG[self.exercise]
         movement_sign = -1.0 if self.exercise == "pullup" else 1.0
@@ -235,24 +269,39 @@ class ExerciseCounter:
             position_down = movement_delta is not None and movement_delta >= self.MOVEMENT_DOWN.get(self.exercise, BODY_DOWN_DELTA)
             accepted_down = angle_down and (self.exercise == "squat" or position_down)
             self.down_frames = self.down_frames + 1 if accepted_down else 0
-            if self.down_frames >= STABLE_FRAMES:
+            fast_down = (fast_window and accepted_down and angle <= 90
+                         and movement_delta is not None and movement_delta >= SQUAT_FAST_TRAVEL)
+            self.fast_down_frames = self.fast_down_frames + 1 if fast_down else 0
+            accelerated = self.fast_down_frames >= 2
+            if self.down_frames >= STABLE_FRAMES or accelerated:
                 self.phase, self.down_frames = "DOWN", 0
+                self.fast_down_frames = self.fast_up_frames = 0
+                self.fast_squat_cycle = accelerated
                 self.last_reason = "down transition accepted by joint angle and posture"
             else:
                 signal = f"angle<={down:.0f}" + (" and torso motion" if self.exercise != "squat" else "")
                 self.last_reason = f"waiting for down {signal} ({self.down_frames}/{STABLE_FRAMES})"
-            if self.down_frames == 0 and self.smoothed_movement is not None:
+            if (self.down_frames == 0 and self.smoothed_movement is not None
+                    and self.smoothed_angle is not None and self.smoothed_angle >= up):
                 self.movement_baseline = 0.98 * self.movement_baseline + 0.02 * self.smoothed_movement
         else:
             angle_up = self.smoothed_angle is not None and self.smoothed_angle >= up
             position_up = (self.body_descent_seen and movement_delta is not None
                            and movement_delta <= BODY_RETURN_DELTA)
-            accepted_up = angle_up and (self.exercise == "squat" or position_up)
+            fast_squat_return = (self.fast_squat_cycle and self.body_descent_seen
+                                 and movement_delta is not None
+                                 and movement_delta <= SQUAT_FAST_RETURN)
+            accepted_up = angle_up and (position_up if self.exercise != "squat"
+                                       else not self.fast_squat_cycle or fast_squat_return)
             self.up_frames = self.up_frames + 1 if accepted_up else 0
-            if self.up_frames >= STABLE_FRAMES:
+            fast_up = self.fast_squat_cycle and fast_window and accepted_up
+            self.fast_up_frames = self.fast_up_frames + 1 if fast_up else 0
+            if self.up_frames >= STABLE_FRAMES or self.fast_up_frames >= 2:
                 self.phase, self.up_frames = "UP", 0
+                self.fast_down_frames = self.fast_up_frames = 0
                 self.reps += 1
-                self.cooldown_frames = self.COOLDOWN_FRAMES
+                self.cooldown_frames = 0 if self.fast_squat_cycle else SQUAT_COOLDOWN_FRAMES
+                self.fast_squat_cycle = False
                 self.last_reason = "full joint-angle cycle with posture return"
                 if self.smoothed_movement is not None:
                     self.movement_baseline = self.smoothed_movement
@@ -279,10 +328,12 @@ class ExerciseCounter:
         self.max_lateral = 0.0
         self.down_frames = self.up_frames = self.extended_frames = self.arm_phase_frames = 0
         self.cooldown_frames = 5
+        self.fast_arm_candidate = False
+        self.last_raw_angle = None
         if self.phase == "UNKNOWN":
             self.smoothed_angle = self.smoothed_movement = None
 
-    def _update_arm(self, angle, movement, head, lateral):
+    def _update_arm(self, angle, movement, head, lateral, timestamp_ms=None):
         pullup = self.exercise == "pullup"
         if angle is None or (movement is None and (not pullup or head is None)):
             self.missing_frames += 1
@@ -296,6 +347,8 @@ class ExerciseCounter:
                     self.movement_baseline = self.head_baseline = None
                     self.last_raw_position = self.last_head_position = None
                     self.smoothed_angle = self.smoothed_movement = None
+                    self.fast_arm_candidate = False
+                    self.last_raw_angle = None
                     self.last_reason = "landmarks missing; recalibrating start"
                 return False
             self.last_reason = f"brief landmark loss {self.missing_frames}/{self.MAX_MISSING_FRAMES}; preserving {self.phase}"
@@ -309,13 +362,20 @@ class ExerciseCounter:
                 and abs(head - self.last_head_position) > 0.15 + 0.03 * self.missing_frames):
             head = None
             self.head_baseline = self.head_peak = None
+        fast_sample = (not pullup and timestamp_ms is not None and self.last_sample_ms is not None
+                       and 0 < timestamp_ms - self.last_sample_ms <= FAST_FRAME_GAP_MS
+                       and self.last_raw_angle is not None and self.last_raw_position is not None
+                       and movement is not None and 40 <= abs(angle - self.last_raw_angle) <= 100
+                       and 0.03 <= abs(movement - self.last_raw_position) <= 0.15)
         self.missing_frames = 0
         self.last_raw_position = movement
+        self.last_raw_angle = angle
+        self.last_sample_ms = timestamp_ms
         if head is not None:
             self.last_head_position = head
         # Push-ups can reverse direction in only a few camera frames. Follow
         # their measured motion faster while retaining two-frame confirmation.
-        smoothing = 0.45 if pullup else 0.65
+        smoothing = 0.45 if pullup else 0.80 if fast_sample else 0.65
         required_frames = STABLE_FRAMES if pullup else 2
         self.smoothed_angle = angle if self.smoothed_angle is None else smoothing * angle + (1 - smoothing) * self.smoothed_angle
         if movement is not None:
@@ -343,6 +403,10 @@ class ExerciseCounter:
             self.last_reason = "cooldown"
             return False
         if self.phase == "UP":
+            if fast_sample:
+                self.fast_arm_candidate = True
+            elif self.smoothed_angle >= up and self.down_frames == 0:
+                self.fast_arm_candidate = False
             down = min(self.ARM_DOWN["pullup"], self.arm_start_angle - 35.0) if pullup else self.ARM_DOWN["pushup"]
             angle_down = self.smoothed_angle <= down
             # Shallow elbow flexion needs stronger whole-body travel than a
@@ -405,7 +469,8 @@ class ExerciseCounter:
             self.phase = "UP"
             # A fresh DOWN state still has to be earned before another rep.
             # Ten ignored frames cost about a third of a second at 30 fps.
-            self.cooldown_frames = self.COOLDOWN_FRAMES if pullup else 2
+            self.cooldown_frames = self.COOLDOWN_FRAMES if pullup else 0 if self.fast_arm_candidate else 2
+            self.fast_arm_candidate = False
             self.movement_baseline = position
             self.head_baseline = head
             self.lateral_baseline = lateral

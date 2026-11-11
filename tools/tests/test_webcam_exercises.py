@@ -99,6 +99,94 @@ def replay_three_cycles(exercise, pose_factory):
 
 
 class ExerciseCounterTests(unittest.TestCase):
+    @staticmethod
+    def timed_cycles(exercise, down, up, cycles=5, gap_ms=32):
+        counter = ExerciseCounter(exercise)
+        stamp = 0
+        signals = []
+        for _ in range(8):
+            signals.append(counter.update(170, .40, timestamp_ms=stamp))
+            stamp += gap_ms
+        for _ in range(cycles):
+            for angle, position in down + up:
+                signals.append(counter.update(angle, position, timestamp_ms=stamp))
+                stamp += gap_ms
+        return counter, signals
+
+    def test_fast_pushups_with_full_travel_count_once_each(self):
+        counter, signals = self.timed_cycles(
+            'pushup', [(70, .52)] * 2, [(170, .40)] * 3)
+        self.assertEqual((counter.reps, sum(signals)), (5, 5))
+
+    def test_fast_squats_need_deep_knee_bend_and_hip_return(self):
+        down = [(130, .44), (80, .50), (70, .52)]
+        up = [(105, .50), (145, .44), (170, .40), (170, .40)]
+        counter, signals = self.timed_cycles('squat', down, up)
+        self.assertEqual((counter.reps, sum(signals)), (5, 5))
+        shallow, signals = self.timed_cycles('squat', [(130, .44)] * 3, up)
+        self.assertEqual((shallow.reps, sum(signals)), (0, 0))
+        no_return, signals = self.timed_cycles('squat', down, [(170, .50)] * 4)
+        self.assertEqual((no_return.reps, sum(signals)), (0, 0))
+
+    def test_fast_pushup_partial_return_and_top_pause_do_not_duplicate(self):
+        down = [(70, .52)] * 2
+        partial, signals = self.timed_cycles('pushup', down, [(170, .50)] * 5)
+        self.assertEqual((partial.reps, sum(signals)), (0, 0))
+        full, signals = self.timed_cycles('pushup', down, [(170, .40)] * 3, cycles=1)
+        for frame in range(60):
+            signals.append(full.update(170, .40, timestamp_ms=500 + frame * 32))
+        self.assertEqual((full.reps, sum(signals)), (1, 1))
+
+    def test_normal_and_slow_timed_cycles_still_count(self):
+        for exercise in ('pushup', 'squat'):
+            for frames in (8, 16):
+                with self.subTest(exercise=exercise, frames=frames):
+                    counter, signals = self.timed_cycles(
+                        exercise, [(70, .52)] * frames, [(170, .40)] * frames)
+                    self.assertEqual((counter.reps, sum(signals)), (5, 5))
+
+    def test_squat_angle_noise_and_brief_landmark_loss(self):
+        counter = ExerciseCounter('squat')
+        stamp = 0
+        detections = 0
+        for _ in range(8):
+            detections += counter.update(170, .40, timestamp_ms=stamp)
+            stamp += 32
+        for _ in range(6):
+            detections += counter.update(80, .52, timestamp_ms=stamp)
+            stamp += 32
+        for _ in range(2):
+            detections += counter.update(None, None, timestamp_ms=stamp)
+            stamp += 32
+        for _ in range(8):
+            detections += counter.update(170, .40, timestamp_ms=stamp)
+            stamp += 32
+        self.assertEqual((counter.reps, detections), (1, 1))
+        for _ in range(12):
+            detections += counter.update(170, .40, timestamp_ms=stamp)
+            stamp += 32
+            detections += counter.update(80, .52, timestamp_ms=stamp)
+            stamp += 32
+        self.assertEqual((counter.reps, detections), (1, 1))
+
+    def test_fast_path_does_not_bridge_sparse_frames_or_long_dropout(self):
+        down = [(130, .44), (80, .50), (70, .52)]
+        up = [(105, .50), (145, .44), (170, .40), (170, .40)]
+        sparse, signals = self.timed_cycles('squat', down, up, cycles=1, gap_ms=120)
+        self.assertEqual((sparse.reps, sum(signals)), (0, 0))
+        interrupted = ExerciseCounter('pushup')
+        stamp = 0
+        for angle, pos in [(170, .40)] * 8 + [(70, .52)] * 3:
+            interrupted.update(angle, pos, timestamp_ms=stamp)
+            stamp += 32
+        for _ in range(ExerciseCounter.MAX_MISSING_FRAMES):
+            interrupted.update(None, None, timestamp_ms=stamp)
+            stamp += 32
+        for _ in range(10):
+            self.assertFalse(interrupted.update(170, .40, timestamp_ms=stamp))
+            stamp += 32
+        self.assertEqual(interrupted.reps, 0)
+
     def test_requires_full_cycle_and_stable_transitions(self):
         counter = ExerciseCounter("squat")
         self.assertFalse(counter.update(170))  # standing calibration

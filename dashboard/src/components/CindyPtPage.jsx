@@ -1,18 +1,19 @@
 import { useState } from 'react'
 import { StoredRecommendationPanel } from './ApiPanels.jsx'
 import { usePolling } from '../hooks/usePolling.js'
-import { generateCindyPtRecommendation, getCindyPtGoal, getCindyPtProgress, getCindyPtRecommendations, saveCindyPtGoal } from '../services/api.js'
+import { generateCindyPtRecommendation, getCindyPtGoal, getCindyPtProgress, getCindyPtRecommendations, getCurrentCindyPtRecommendation, saveCindyPtGoal } from '../services/api.js'
 import { formatCindyDuration, isTestGoal, recommendationMatchesProgress } from '../services/cindyptDisplay.js'
 import { WeeklyPlanPanel } from './WeeklyPlanPanel.jsx'
 
-export function CindyPtPage() {
+export function CindyPtPage({ summaryRevision = 0 }) {
   const [refresh, setRefresh] = useState(0)
   const [roundsInput, setRoundsInput] = useState(null)
   const [minutesInput, setMinutesInput] = useState(null)
   const [action, setAction] = useState({ status: 'idle', message: '' })
   const goalResult = usePolling(getCindyPtGoal, { refreshKey: refresh })
-  const progressResult = usePolling(getCindyPtProgress, { refreshKey: refresh })
-  const recommendationResult = usePolling(getCindyPtRecommendations, { refreshKey: refresh })
+  const progressResult = usePolling(getCindyPtProgress, { refreshKey: `${refresh}-${summaryRevision}` })
+  const recommendationResult = usePolling(getCindyPtRecommendations, { refreshKey: `${refresh}-${summaryRevision}` })
+  const currentAdviceResult = usePolling(getCurrentCindyPtRecommendation, { refreshKey: `${refresh}-${summaryRevision}` })
 
   const goal = goalResult.data?.goal
   const visibleRoundsInput = roundsInput ?? String(goal?.targetRounds ?? 7)
@@ -89,6 +90,10 @@ export function CindyPtPage() {
       </section>
       <section className="recommendations panel" aria-label="Cindy PT recommendations">
         <div className="panel-header"><div><p className="eyebrow">COACH'S NOTES</p><h2>Training and recovery recommendations</h2></div><span className="stored-tag">RULE-BASED</span></div>
+        {currentAdviceResult.status === 'success' && currentAdviceResult.data?.available &&
+          !alreadySaved && <><p className="pt-advice-label">CURRENT WORKOUT · PREVIEW</p>
+            <p className="stored-advice">{currentAdviceResult.data.recommendations.recommendation}</p>
+            <p className="stored-advice">{currentAdviceResult.data.recommendations.recoveryRecommendation}</p></>}
         <button className="control-btn primary pt-generate" type="button" onClick={generateRecommendation} disabled={!canGenerate}>Generate Recommendation</button>
         {alreadySaved && <p className="pt-message">A recommendation is already saved for this workout and goal.</p>}
         {progressResult.status === 'success' && !progress?.available && <p className="pt-message">A saved goal and completed workout are required before generating advice.</p>}

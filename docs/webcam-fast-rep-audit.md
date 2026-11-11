@@ -1,0 +1,27 @@
+# Webcam fast-repetition audit (2026-11-11)
+
+## Evidence and scope
+
+The latest available trace, `../data/recordings/webcam_workout_20261111T095408Z.csv`, contains 26,253 frames from one seven-round Cindy session, with 35 pull-up, 70 push-up, and 105 squat event IDs. It is **not labeled ground truth** for the reported separate physical sets (10 push-ups with 8 detected; 5 squats with 4 detected). No matching console `.log` file was available. Thus the exact cause of those three missed physical repetitions cannot be assigned from the available recording.
+
+In the available trace, the push-up and squat frame-gap median was 32 ms, the 95th percentile was 48 ms, and neither exercise had a gap above 80 ms. Pose-angle measurements were unavailable on 890/7,862 push-up frames and 561/10,966 squat frames; this can interrupt state transitions, but these totals alone do not prove which individual repetition was missed. The original detector required two consecutive down and two return frames for push-ups and three of each for squats, after angle smoothing. It then ignored two push-up frames or ten squat frames after a confirmed count. At the observed frame cadence, the squat cooldown alone cost roughly 320 ms. The state machine also reset after eight missing frames. The lowest acceptable landmark visibility was 0.50; push-ups additionally required body alignment at least 145 degrees. MediaPipe detection, presence, and tracking confidence were all configured at 0.5. These visibility and posture gates were not lowered.
+
+## Rules changed
+
+In [webcam_exercises.py](../tools/webcam_exercises.py), existing joint-angle thresholds remain squat 115/155 degrees, push-up 95/155 degrees, and pull-up 100/150 degrees. Normal smoothing remains 0.4 for squats, 0.65 for push-ups, and 0.45 for pull-ups; normal confirmation remains three/three frames for squats and two/two for push-ups. The optional `timestamp_ms` supplied by [webcam_squat.py](../tools/webcam_squat.py) enables a narrowly scoped fast path:
+
+- A fast sample needs a gap of at most 80 ms and simultaneous plausible joint-angle and body-position motion. Squat rapid motion uses a 25–80 degree angle step and a 0.02–0.08 normalized hip-position step, opening a 250 ms window with smoothing 0.65. Two consecutive frames at knee angle at most 115 degrees, raw knee angle at most 90 degrees, and hip descent at least 0.05 can arm a fast DOWN state. A completed fast squat needs near-full hip return (within 0.03 of baseline) and two extended frames; a merely extended knee with no hip return does not count. Its post-count cooldown is zero, because another complete DOWN/UP cycle is still required. Normal squats now use a four-frame cooldown, down from ten.
+- Push-ups use smoothing 0.80 for a rapid, plausible angle/shoulder-position change (40–100 degrees and 0.03–0.15 normalized position), otherwise 0.65. The 95/155-degree and shoulder-travel gates remain. A fast candidate has zero post-count ignored frames; a normal candidate retains two. The full down-and-return posture requirement is unchanged.
+- Pull-up angle, posture, smoothing, three-frame confirmation, and ten-frame cooldown rules are unchanged. Missing-frame tolerance remains eight frames for all exercises; short dropouts preserve a candidate, long ones force recalibration or rejection.
+
+The camera loop passes its existing monotonic frame timestamp into the counter. The oneM2M event schema and publishing branch are unchanged: each `True` return still creates exactly one local repetition event. No TinyIoT resource or dashboard/audio/CindyPT code changed.
+
+## Replay and tests
+
+The original `HEAD` detector was loaded in memory for baseline comparison, with no file overwrite. Five identical synthetic fast cycles (32 ms/frame) produced **0/5 push-ups** at two deep frames plus three extended frames, and **0/5 squats** for a three-frame deep descent plus four-frame return. The revised detector produced **5/5** for both. New tests additionally check slow and normal timed cycles, partial returns, shallow squats, top pauses, noise, sparse frames, and short/long landmark dropouts. The existing pull-up tests remain unchanged.
+
+Replaying the full available CSV with the original counter yielded 34 pull-ups, 70 push-ups, and 105 squats; the revised counter yielded the **same** 34/70/105. The CSV itself contains 35 pull-up event IDs, and the one-event discrepancy is already present in the old replay (likely because the recorded stream does not capture every input/state reset in a replay-equivalent way). The replay's matching totals do **not** prove frame-by-frame equivalence or physical accuracy. A broad initial smoothing/cooldown reduction overcounted this recording (72 push-ups, 116 squats) and was discarded in favor of the gated fast path. No physical post-change test has been performed.
+
+## Remaining validation
+
+Run short, video-annotated sets at slow, ordinary, and fast cadence for each exercise, logging the CSV and console output with the physical rep number marked. Check the frame sequence around every physical miss and every extra detection, especially lost landmarks, alignment failures, and the new fast-window gate. The existing 10/8 and 5/4 observations remain the physical baseline, **not** a verified post-change result. If fast valid repetitions still have fewer than two observable deep frames, the current algorithm will still undercount; reducing that guard further would require evidence that it does not count tracking noise or incomplete movements.
