@@ -79,6 +79,7 @@ function App() {
     const stream = new EventSource(integrationEventUrl)
     stream.addEventListener('repetition', () => setRepetitionRevision((value) => value + 1))
     stream.addEventListener('summary', () => setSummaryRevision((value) => value + 1))
+    stream.addEventListener('recommendation', () => setSummaryRevision((value) => value + 1))
     stream.addEventListener('reconcile', () => {
       setRepetitionRevision((value) => value + 1)
       setSummaryRevision((value) => value + 1)

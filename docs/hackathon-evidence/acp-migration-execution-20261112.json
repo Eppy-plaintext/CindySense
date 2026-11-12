@@ -1,0 +1,311 @@
+{
+  "at": "2026-11-12T10:17:06.667497+00:00",
+  "operations": [
+    {
+      "operation": "GET  as CAdmin",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "operation": "GET CindySense_AE/CindySense_WebcamPublisher_ACP as CAdmin",
+      "http": 404,
+      "rsc": "4004"
+    },
+    {
+      "operation": "GET CindySense_ACP as CAdmin",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "operation": "GET CindyPT_ACP as CAdmin",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "operation": "GET Dashboard_ACP as CAdmin",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "operation": "GET CindySense_AE as CAdmin",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "operation": "GET CindySense_AE/RepetitionCount as CAdmin",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "operation": "GET CindySense_AE/WorkoutSummary as CAdmin",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "operation": "GET CindySense_AE/RepetitionCount/RepCount_Sub as CAdmin",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "operation": "GET CindySense_AE/WorkoutSummary/Summary_Sub as CAdmin",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "operation": "GET CindySense_AE/RepetitionCount as CCindyPT",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "operation": "GET CindySense_AE/RepetitionCount as CDashboard",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "operation": "GET CindySense_AE/RepetitionCount as CWebcam",
+      "http": 403,
+      "rsc": "4103"
+    },
+    {
+      "operation": "GET CindySense_AE/WorkoutSummary as CCindyPT",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "operation": "GET CindySense_AE/WorkoutSummary as CDashboard",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "operation": "GET CindySense_AE/WorkoutSummary as CWebcam",
+      "http": 403,
+      "rsc": "4103"
+    },
+    {
+      "operation": "GET CindySense_AE/RepetitionCount/RepCount_Sub as CCindyPT",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "operation": "GET CindySense_AE/RepetitionCount/RepCount_Sub as CDashboard",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "operation": "GET CindySense_AE/RepetitionCount/RepCount_Sub as CWebcam",
+      "http": 403,
+      "rsc": "4103"
+    },
+    {
+      "operation": "GET CindySense_AE/WorkoutSummary/Summary_Sub as CCindyPT",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "operation": "GET CindySense_AE/WorkoutSummary/Summary_Sub as CDashboard",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "operation": "GET CindySense_AE/WorkoutSummary/Summary_Sub as CWebcam",
+      "http": 403,
+      "rsc": "4103"
+    },
+    {
+      "operation": "preflight verified",
+      "result": "PASS"
+    },
+    {
+      "operation": "POST new publisher ACP",
+      "http": 201,
+      "rsc": "2001"
+    },
+    {
+      "operation": "GET CindySense_AE/CindySense_WebcamPublisher_ACP as CAdmin",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "operation": "PUT guard on CindySense_AE/RepetitionCount/RepCount_Sub",
+      "http": 200,
+      "rsc": "2004"
+    },
+    {
+      "operation": "GET CindySense_AE/RepetitionCount/RepCount_Sub as CAdmin",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "operation": "GET CindySense_AE/RepetitionCount/RepCount_Sub as CCindyPT",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "operation": "GET CindySense_AE/RepetitionCount/RepCount_Sub as CDashboard",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "operation": "GET CindySense_AE/RepetitionCount/RepCount_Sub as CWebcam",
+      "http": 403,
+      "rsc": "4103"
+    },
+    {
+      "operation": "PUT guard on CindySense_AE/WorkoutSummary/Summary_Sub",
+      "http": 200,
+      "rsc": "2004"
+    },
+    {
+      "operation": "GET CindySense_AE/WorkoutSummary/Summary_Sub as CAdmin",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "operation": "GET CindySense_AE/WorkoutSummary/Summary_Sub as CCindyPT",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "operation": "GET CindySense_AE/WorkoutSummary/Summary_Sub as CDashboard",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "operation": "GET CindySense_AE/WorkoutSummary/Summary_Sub as CWebcam",
+      "http": 403,
+      "rsc": "4103"
+    },
+    {
+      "operation": "PUT publisher on CindySense_AE/RepetitionCount",
+      "http": 200,
+      "rsc": "2004"
+    },
+    {
+      "operation": "GET CindySense_AE/RepetitionCount as CAdmin",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "operation": "GET CindySense_AE/RepetitionCount as CWebcam",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "operation": "GET CindySense_AE/RepetitionCount as CCindyPT",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "operation": "GET CindySense_AE/RepetitionCount as CDashboard",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "operation": "GET CindySense_AE/RepetitionCount/RepCount_Sub as CAdmin",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "operation": "GET CindySense_AE/RepetitionCount/RepCount_Sub as CCindyPT",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "operation": "GET CindySense_AE/RepetitionCount/RepCount_Sub as CDashboard",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "operation": "GET CindySense_AE/RepetitionCount/RepCount_Sub as CWebcam",
+      "http": 403,
+      "rsc": "4103"
+    },
+    {
+      "operation": "GET CindySense_AE/WorkoutSummary/Summary_Sub as CAdmin",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "operation": "GET CindySense_AE/WorkoutSummary/Summary_Sub as CCindyPT",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "operation": "GET CindySense_AE/WorkoutSummary/Summary_Sub as CDashboard",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "operation": "GET CindySense_AE/WorkoutSummary/Summary_Sub as CWebcam",
+      "http": 403,
+      "rsc": "4103"
+    },
+    {
+      "operation": "PUT publisher on CindySense_AE/WorkoutSummary",
+      "http": 200,
+      "rsc": "2004"
+    },
+    {
+      "operation": "GET CindySense_AE/WorkoutSummary as CAdmin",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "operation": "GET CindySense_AE/WorkoutSummary as CWebcam",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "operation": "GET CindySense_AE/WorkoutSummary as CCindyPT",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "operation": "GET CindySense_AE/WorkoutSummary as CDashboard",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "operation": "GET CindySense_AE/RepetitionCount/RepCount_Sub as CAdmin",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "operation": "GET CindySense_AE/RepetitionCount/RepCount_Sub as CCindyPT",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "operation": "GET CindySense_AE/RepetitionCount/RepCount_Sub as CDashboard",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "operation": "GET CindySense_AE/RepetitionCount/RepCount_Sub as CWebcam",
+      "http": 403,
+      "rsc": "4103"
+    },
+    {
+      "operation": "GET CindySense_AE/WorkoutSummary/Summary_Sub as CAdmin",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "operation": "GET CindySense_AE/WorkoutSummary/Summary_Sub as CCindyPT",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "operation": "GET CindySense_AE/WorkoutSummary/Summary_Sub as CDashboard",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "operation": "GET CindySense_AE/WorkoutSummary/Summary_Sub as CWebcam",
+      "http": 403,
+      "rsc": "4103"
+    }
+  ],
+  "publisher_acp_ri": "1-20261112T101707,2420075",
+  "outcome": "applied_and_verified"
+}

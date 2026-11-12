@@ -147,6 +147,8 @@ class NotificationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_completed_summary_notifies_once(self):
         await self.hub.ensure(self.client, self.settings)
+        queued = []
+        self.hub.on_summary = lambda resource, identity: queued.append((resource, identity))
         listener = __import__('asyncio').Queue()
         self.hub.listeners.add(listener)
         signal = {'m2m:sgn': {'sur': SUMMARIES + '/cindysense-fastapi-summaries',
@@ -156,6 +158,7 @@ class NotificationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(listener.get_nowait(), ('summary', {}))
         await self.hub.receive(signal, headers, TOKEN, self.client, self.settings)
         self.assertTrue(listener.empty())
+        self.assertEqual(queued, [(SUMMARIES + '/summary', 'summary-ri')] * 2)
         self.cse.summary['status'] = 'running'
         self.hub.seen.clear()
         with self.assertRaises(ValueError):

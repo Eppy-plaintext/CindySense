@@ -4,16 +4,18 @@ import secrets
 import asyncio
 import json
 import logging
+import os
 import httpx
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request, Query
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import settings
 from .cindypt import Goal, analyze, read_goal, read_summaries, recommend
+from .coaching_jobs import CoachingJobs
 from .events import RepetitionEvent, classify_repetition_content
 from .notifications import NotificationHub
 from .simulation import SimulationPublisher
@@ -25,6 +27,7 @@ from .weekly_plan import PlanPreferences, SavePlanRequest, generate_weekly_plan
 @asynccontextmanager
 async def lifespan(app):
     subscription_task = None
+    coaching_task = asyncio.create_task(coaching_jobs.run(tinyiot, settings, notification_hub.publish))
     if settings.notification_url:
         async def maintain_subscriptions():
             while True:
@@ -38,6 +41,11 @@ async def lifespan(app):
     try:
         yield
     finally:
+        coaching_task.cancel()
+        try:
+            await coaching_task
+        except asyncio.CancelledError:
+            pass
         if subscription_task:
             subscription_task.cancel()
             try:
@@ -60,6 +68,8 @@ tinyiot = TinyIoTClient(settings.base_url, httpx.AsyncClient(timeout=5.0))
 simulation_publisher = SimulationPublisher()
 workout_snapshot = WorkoutSnapshot()
 notification_hub = NotificationHub()
+coaching_jobs = CoachingJobs(os.getenv('CINDYSENSE_COACHING_DB', 'data/cindypt_jobs.sqlite3'))
+notification_hub.on_summary = coaching_jobs.enqueue
 recommendation_lock = asyncio.Lock()
 
 
@@ -107,7 +117,7 @@ async def integration_events():
 
 @app.get('/api/integration/metrics')
 async def integration_metrics():
-    return notification_hub.metrics()
+    return {**notification_hub.metrics(), 'coachingJobs': coaching_jobs.metrics()}
 
 
 
@@ -126,15 +136,16 @@ async def health():
 
 
 @app.get('/api/onem2m/discovery')
-async def onem2m_discovery():
+async def onem2m_discovery(label: str | None = Query(default=None, min_length=1, max_length=100)):
     """Discover authorized CindySense containers through the CSE."""
     try:
         origin = settings.discovery_origin
         if not origin:
             raise TinyIoTError('origin_not_configured', 'A discovery originator is not configured.', 503)
-        resources = await tinyiot.discover('CindySense_AE', origin, resource_type=3)
-        return {'source': 'TinyIoT', 'resource_path': 'CindySense_AE', 'resource_type': 3,
-                'resources': resources}
+        resources = await tinyiot.discover('CindySense_AE', origin, resource_type=3, label=label)
+        return {'source': 'TinyIoT', 'discovery': 'CSE', 'resource_path': 'CindySense_AE',
+                'resource_type': 3, 'label': label, 'resources': resources,
+                'owners': {uri: 'CindySense_AE' for uri in resources}}
     except TinyIoTError as exc:
         raise api_error(exc) from exc
 
@@ -183,8 +194,20 @@ async def workout_monitoring_group():
             raise TinyIoTError('origin_not_configured', 'A group originator is not configured.', 503)
         members = await tinyiot.group_members(settings.group_resource, settings.group_origin)
         fanout = await tinyiot.fanout_retrieve(settings.group_resource, settings.group_origin)
+        aggregate = fanout.get('m2m:agr')
+        responses = aggregate.get('m2m:rsp') if isinstance(aggregate, dict) else None
+        if isinstance(responses, dict):
+            responses = [responses]
+        if not isinstance(responses, list) or len(responses) != len(members):
+            raise TinyIoTError('invalid_tinyiot_response', 'Fan-out response count does not match the group.', 502)
+        statuses = [item.get('rsc') for item in responses if isinstance(item, dict)]
+        if len(statuses) != len(members):
+            raise TinyIoTError('invalid_tinyiot_response', 'Fan-out status is malformed.', 502)
+        overall = 'success' if all(str(status) == '2000' for status in statuses) else 'partial_failure'
         return {'source': 'TinyIoT', 'resource_path': settings.group_resource,
-                'members': members, 'fanout': fanout}
+                'members': members, 'fanout': fanout, 'fanout_results': responses,
+                'member_statuses': statuses,
+                'overall_status': overall}
     except TinyIoTError as exc:
         raise api_error(exc) from exc
 

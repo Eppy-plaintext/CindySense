@@ -1,0 +1,11 @@
+# End-to-end demo instructions
+
+1. Start the existing TinyIoT installation using its upstream instructions. Confirm only the intended instance is serving; require HTTP 200, X-M2M-RSC 2000, and a CSE representation before any probe or workout writes.
+2. Configure ignored `backend/.env` with reachable `TINYIOT_BASE_URL`, separate read/CindyPT/group/discovery origins, and a secret notification token and WSL-reachable callback URL. Inspect the live ACP before using the webcam event publisher; the current default `CAdmin` is a known least-privilege gap.
+3. From the repository root, run `C:/Users/USER/AppData/Local/Programs/Python/Python314/python.exe -m uvicorn backend.main:app --host 0.0.0.0 --port 8000` (one worker). Check `/api/health` and `/api/integration/metrics`.
+4. In `dashboard/`, run `npm.cmd run dev`. Open `http://localhost:5173` and the Cindy PT page.
+5. From the repository root, run `./.venv-webcam/Scripts/python.exe tools/webcam_squat.py --exercise cindy --duration-minutes 1 --tinyiot --tinyiot-base http://127.0.0.1:3001/TinyIoT --tinyiot-event-origin <verified-publisher> --tinyiot-summary-origin <verified-publisher> --no-workout-timeseries` only after a narrow publisher origin is verified. Complete the short workout using webcam pull-ups, push-ups, and squats. The normal 20-minute mode is the same command without `--duration-minutes 1`.
+6. Read back repetition CINs and the completed WorkoutSummary CIN in TinyIoT. Confirm the subscription callback, `coachingJobs` metrics, the `coach-...` recommendation CIN with matching workout and goal version, and its dashboard rendering. A duplicate notification must not add a second recommendation.
+7. GET `/api/onem2m/group/workout-monitoring` and `/api/onem2m/discovery`; show member RSCs and CSE-owned discovery results. Run the isolated ACP probe only against temporary resources after read-only preflight, and retain its HTTP/RSC matrix and cleanup result.
+
+This sequence is reproducible instructions, **not an assertion that a physical camera or live CSE run occurred in this session**. Capture only successful results actually observed during rehearsal. If the CSE remains unavailable, show the mock test run and mark the live sequence NOT VERIFIED.

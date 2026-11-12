@@ -21,6 +21,22 @@ class FakeResponse:
 
 
 class AdvancedProbeTests(unittest.TestCase):
+    def test_group_create_failure_is_recorded_without_followup(self):
+        calls = []
+
+        def record(label, method, path, **kwargs):
+            calls.append((label, method, path, kwargs))
+            return {'case': label, 'http': 403, 'rsc': '4108'}, {}
+
+        result = probe.probe_group(record, 'CindySense_AE',
+                                   'CindySense_AE/AdvancedProbe_test', ['ri-1', 'ri-2'])
+        self.assertIsNone(result)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][2], 'CindySense_AE')
+        self.assertEqual(calls[0][3]['body']['m2m:grp']['mid'], [
+            'TinyIoT/CindySense_AE/AdvancedProbe_test/labeled',
+            'TinyIoT/CindySense_AE/AdvancedProbe_test/plain'])
+
     def test_uri_names_extract_only_discovery_list(self):
         self.assertEqual(probe.uri_names({"m2m:uril": ["/a/labeled", "/a/plain/"]}),
                          {"labeled", "plain"})

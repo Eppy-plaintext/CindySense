@@ -1,0 +1,30 @@
+{
+  "capturedAt": "2026-11-12T10:04:18.964396+00:00",
+  "purpose": "Read-only subscription assignment backup; callback URIs omitted",
+  "subscriptions": {
+    "CindySense_AE/RepetitionCount/RepCount_Sub": {
+      "rn": "RepCount_Sub",
+      "ri": "23-20261026T161859,4040032",
+      "acpi": null,
+      "enc": {
+        "net": [
+          3
+        ]
+      },
+      "nct": 1,
+      "notificationUriCount": 1
+    },
+    "CindySense_AE/WorkoutSummary/Summary_Sub": {
+      "rn": "Summary_Sub",
+      "ri": "23-20261026T162232,8210035",
+      "acpi": null,
+      "enc": {
+        "net": [
+          3
+        ]
+      },
+      "nct": 1,
+      "notificationUriCount": 1
+    }
+  }
+}

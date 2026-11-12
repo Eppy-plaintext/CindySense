@@ -1,6 +1,7 @@
 """CindySense webcam exercise counter (MediaPipe Pose + OpenCV)."""
 
 import argparse
+import os
 import csv
 import sys
 import time
@@ -52,7 +53,7 @@ def main():
     parser.add_argument("--tinyiot", action="store_true", help="Publish webcam poses and repetition events")
     parser.add_argument("--tinyiot-base", default=DEFAULT_BASE)
     parser.add_argument("--tinyiot-origin", default=DEFAULT_ORIGIN)
-    parser.add_argument("--tinyiot-event-origin", default="CAdmin",
+    parser.add_argument("--tinyiot-event-origin", default=os.environ.get("CINDYSENSE_EVENT_ORIGIN"),
                         help="Originator with create access to CindySense_AE/RepetitionCount")
     parser.add_argument("--event-container", default=EVENT_CONTAINER,
                         help="Existing oneM2M container path, e.g. CindySense_AE/RepetitionCount")
@@ -67,6 +68,9 @@ def main():
     parser.add_argument("--voice-events-port", type=int, default=8765,
                         help="Local browser voice event stream port; 0 disables it")
     args = parser.parse_args()
+    if args.tinyiot and (not args.tinyiot_event_origin or args.tinyiot_event_origin == 'CAdmin'
+                         or (args.tinyiot_summary_origin or args.tinyiot_event_origin) == 'CAdmin'):
+        parser.error("Set verified non-admin event and summary publisher origins before writing workouts.")
     if not args.model.is_file():
         sys.exit(f"Model missing: {args.model}\nDownload pose_landmarker_lite.task into models/ first.")
     camera = cv2.VideoCapture(args.camera, cv2.CAP_DSHOW) if sys.platform.startswith("win") else cv2.VideoCapture(args.camera)

@@ -59,9 +59,9 @@ Copy [config.example.h](firmware/config.example.h) to `firmware/config.h`, fill 
 
 ### Cindy PT
 
-[cindypt.py](backend/cindypt.py) provides rule-based coaching through FastAPI. Configure `TINYIOT_CINDYPT_ORIGIN` server-side for `CindySense_AE/WorkoutSummary`, `CindyPT_AE/FitnessGoals`, and `CindyPT_AE/AIRecommendations`. These containers already exist on the inspected TinyIoT server; the backend only appends content instances. The Cindy PT dashboard page lets users save a goal, view progress from explicitly completed workout summaries, and confirm an explicit recommendation write. The test integration goal remains visibly labeled until a user saves a new goal.
+[cindypt.py](backend/cindypt.py) provides rule-based coaching through FastAPI. Configure `TINYIOT_CINDYPT_ORIGIN` server-side for `CindySense_AE/WorkoutSummary`, `CindyPT_AE/FitnessGoals`, and `CindyPT_AE/AIRecommendations`. These containers existed on the previously inspected TinyIoT server. A verified completed-summary notification now queues automatic recommendation generation in a local SQLite job store; the worker reads the summary and current goal back from TinyIoT and saves idempotent rule-based advice. Manual generation remains available. Run a single FastAPI worker with a persistent writable `CINDYSENSE_COACHING_DB` location. The live automatic path has not yet been verified; see [hackathon evidence](docs/hackathon-evidence/capability-audit.md).
 
-The webcam runner now prepares one idempotently named completed summary when its Cindy timer ends or the operator explicitly stops the workout. It does not save interrupted sessions. Mocked tests cover delivery and Cindy PT ingestion; a live webcam summary write has not yet been approved or tested. See [webcam workflow](docs/webcam-three-exercise.md).
+The webcam runner prepares one idempotently named completed summary when its Cindy timer ends or the operator explicitly stops the workout. It does not save interrupted sessions. Connected workout publishing requires explicit, verified non-admin event and summary origins; the earlier server's ACP did not grant `CWebcam` the required production access. Mocked tests cover delivery and Cindy PT ingestion. See [webcam workflow](docs/webcam-three-exercise.md).
 
 Cindy PT also offers a rule-based seven-day schedule preview using the stored goal, completed workout history, chosen training days, experience level, and browser timezone. Preview reads TinyIoT only. A separately confirmed save writes named content instances to the existing `CindyPT_AE/TrainingPlans`, `WorkoutSchedule`, and `RecoveryRecommendations` containers. No live plan write has been attempted. See [API contract](docs/api.md).
 
@@ -70,8 +70,10 @@ Cindy PT also offers a rule-based seven-day schedule preview using the stored go
 Run the webcam runner in Cindy mode and open the dashboard on the **same computer** at `http://localhost:5173`. The runner exposes confirmed repetition and workout progression events on loopback port 8765; the browser speaks them with the Web Speech API. The dashboard's Voice Coach controls set ON/OFF, volume, and speed, saved in browser storage. Speech is active only for a running webcam Cindy session. Browser audio may require one click on the page before it starts. The local stream works even if TinyIoT is disconnected; the existing TinyIoT publisher continues independently. Use `--voice-events-port 0` to disable the local stream, or set another port and update the dashboard EventSource URL if 8765 is occupied. A dashboard on another computer cannot receive this loopback stream.
 
 ```sh
-python tools/webcam_squat.py --exercise cindy --tinyiot
+python tools/webcam_squat.py --exercise cindy
 ```
+
+For connected TinyIoT publishing, use the verified non-admin origin flags in the [end-to-end demo instructions](docs/hackathon-evidence/demo-instructions.md).
 
 To check with a camera and speaker, start the runner and dashboard, click the page once, then complete five pull-ups, ten push-ups, and fifteen squats. Check that only confirmed reps speak, transitions and the new round speak once, Voice Coach OFF stops speech, and `R` clears it. Use a short `--duration-minutes` value to check completion; the 10/5/1 minute reminders are emitted only when that duration reaches each threshold. The runner's existing `S` and `Q` controls still stop or discard the session. The browser voice controls currently apply to the local webcam source; ESP32 live and dashboard demo modes remain visual only.
 

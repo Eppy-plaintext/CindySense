@@ -1,0 +1,166 @@
+{
+  "capturedAt": "2026-11-12T09:56:53.854678+00:00",
+  "purpose": "Read-only pre-migration ACP and assignment backup",
+  "resources": {
+    "CindySense_ACP": {
+      "m2m:acp": {
+        "rn": "CindySense_ACP",
+        "ri": "1-20261026T160317,2210029",
+        "pi": "tinyiot",
+        "ct": "20261026T160317,221",
+        "et": "20281025T160317,221",
+        "lt": "20261026T160317,221",
+        "ty": 1,
+        "pv": {
+          "acr": [
+            {
+              "acor": [
+                "CAdmin"
+              ],
+              "acop": 63
+            },
+            {
+              "acor": [
+                "CCindyPT",
+                "CDashboard"
+              ],
+              "acop": 2
+            }
+          ]
+        },
+        "pvs": {
+          "acr": [
+            {
+              "acor": [
+                "CAdmin"
+              ],
+              "acop": 63
+            }
+          ]
+        }
+      }
+    },
+    "CindyPT_ACP": {
+      "m2m:acp": {
+        "rn": "CindyPT_ACP",
+        "ri": "1-20261026T160425,6490030",
+        "pi": "tinyiot",
+        "ct": "20261026T160425,649",
+        "et": "20281025T160425,649",
+        "lt": "20261026T160425,649",
+        "ty": 1,
+        "pv": {
+          "acr": [
+            {
+              "acor": [
+                "CCindyPT"
+              ],
+              "acop": 63
+            },
+            {
+              "acor": [
+                "CAdmin",
+                "CDashboard"
+              ],
+              "acop": 2
+            }
+          ]
+        },
+        "pvs": {
+          "acr": [
+            {
+              "acor": [
+                "CCindyPT"
+              ],
+              "acop": 63
+            }
+          ]
+        }
+      }
+    },
+    "Dashboard_ACP": {
+      "m2m:acp": {
+        "rn": "Dashboard_ACP",
+        "ri": "1-20261026T160433,5250031",
+        "pi": "tinyiot",
+        "ct": "20261026T160433,525",
+        "et": "20281025T160433,525",
+        "lt": "20261026T160433,525",
+        "ty": 1,
+        "pv": {
+          "acr": [
+            {
+              "acor": [
+                "CDashboard"
+              ],
+              "acop": 63
+            },
+            {
+              "acor": [
+                "CAdmin"
+              ],
+              "acop": 2
+            }
+          ]
+        },
+        "pvs": {
+          "acr": [
+            {
+              "acor": [
+                "CDashboard"
+              ],
+              "acop": 63
+            }
+          ]
+        }
+      }
+    },
+    "CindySense_AE": {
+      "m2m:ae": {
+        "rn": "CindySense_AE",
+        "ri": "CAdmin",
+        "pi": "tinyiot",
+        "ct": "20261026T144718,540",
+        "et": "20281025T144718,540",
+        "lt": "20261026T161028,415",
+        "acpi": [
+          "1-20261026T160317,2210029"
+        ],
+        "ty": 2,
+        "api": "NCindySense",
+        "aei": "CAdmin",
+        "rr": true
+      }
+    },
+    "CindySense_AE/RepetitionCount": {
+      "m2m:cnt": {
+        "rn": "RepetitionCount",
+        "ri": "3-20261026T145138,5460005",
+        "pi": "CAdmin",
+        "ct": "20261026T145138,546",
+        "et": "20281025T145138,546",
+        "lt": "20261106T133551,107",
+        "ty": 3,
+        "mni": 1000,
+        "st": 617,
+        "cni": 292,
+        "cbs": 65513
+      }
+    },
+    "CindySense_AE/WorkoutSummary": {
+      "m2m:cnt": {
+        "rn": "WorkoutSummary",
+        "ri": "3-20261026T145138,5610007",
+        "pi": "CAdmin",
+        "ct": "20261026T145138,561",
+        "et": "20281025T145138,561",
+        "lt": "20261026T145138,561",
+        "ty": 3,
+        "mni": 100,
+        "st": 4,
+        "cni": 4,
+        "cbs": 529
+      }
+    }
+  }
+}

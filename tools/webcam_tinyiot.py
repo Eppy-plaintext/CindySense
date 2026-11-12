@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
 DEFAULT_BASE = os.environ.get("CINDYSENSE_TINYIOT_URL", "http://localhost:3000/TinyIoT")
-DEFAULT_ORIGIN = os.environ.get("CINDYSENSE_TINYIOT_ORIGIN", "CAdmin")
+DEFAULT_ORIGIN = os.environ.get("CINDYSENSE_TINYIOT_ORIGIN", "CWebcam")
 AE_NAME = "Webcam_AE"
 CNT_NAME = "PoseData"
 EVENT_CONTAINER = "CindySense_AE/RepetitionCount"

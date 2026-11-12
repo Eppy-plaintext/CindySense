@@ -29,6 +29,7 @@ class NotificationHub:
         self.rejected_callbacks = 0
         self.sse_queue_drops = 0
         self.instance_id = uuid4().hex
+        self.on_summary = None
 
     def publish(self, kind, data=None):
         for listener in tuple(self.listeners):
@@ -180,6 +181,9 @@ class NotificationHub:
             if not isinstance(summary.status, str) or summary.status.lower() not in ('complete', 'completed'):
                 raise ValueError('workout summary is not completed')
         key = (kind, instance.get('ri') or f'{resource}/{name}')
+        if kind == 'summary' and self.on_summary is not None:
+            # Queue even repeated callbacks: the durable store decides idempotency.
+            self.on_summary(f'{resource}/{name}', str(key[1]))
         self.validated_callbacks += 1
         if self.remember(key):
             data = {}

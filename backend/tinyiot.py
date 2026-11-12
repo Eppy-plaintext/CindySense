@@ -1,6 +1,7 @@
 """oneM2M client. Originators remain server-side; writes require API safeguards."""
 
 import json
+import hashlib
 import logging
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -25,11 +26,14 @@ class TinyIoTClient:
     async def retrieve(self, resource_path: str, origin: str) -> dict:
         return await self._request('GET', resource_path, origin)
 
-    async def discover(self, resource_path: str, origin: str, resource_type: int | None = None) -> list[str]:
+    async def discover(self, resource_path: str, origin: str, resource_type: int | None = None,
+                       label: str | None = None) -> list[str]:
         """Return authorized descendant URIs through TinyIoT discovery."""
         params = {'fu': 1, 'rcn': 11}
         if resource_type is not None:
             params['ty'] = resource_type
+        if label is not None:
+            params['lbl'] = label
         payload = await self._request('GET', resource_path, origin, params=params)
         references = payload.get('m2m:uril')
         if not isinstance(references, list) or any(not isinstance(item, str) for item in references):
@@ -65,6 +69,10 @@ class TinyIoTClient:
         payload = await self.retrieve(group_path, origin)
         group = payload.get('m2m:grp')
         members = group.get('mid') if isinstance(group, dict) else None
+        if isinstance(group, dict) and (group.get('mt', 3) != 3 or
+                                         group.get('mnm', len(members) if isinstance(members, list) else 0)
+                                         != (len(members) if isinstance(members, list) else 0)):
+            raise TinyIoTError('invalid_tinyiot_response', 'Group member type or count is invalid.', 502)
         if not isinstance(members, list) or any(not isinstance(item, str) for item in members):
             raise TinyIoTError('invalid_tinyiot_response', 'Group representation is missing mid.', 502)
         return members
@@ -138,6 +146,42 @@ class TinyIoTClient:
             return False
         if not await verify():
             raise TinyIoTError('plan_unconfirmed', 'Plan write succeeded but readback was unavailable.', 502)
+        return True
+
+    async def create_named_recommendation(self, resource_path: str, origin: str,
+                                          idempotency_key: str, content: dict) -> bool:
+        """Create a deterministic CIN and verify it after a lost reply or conflict."""
+        name = 'coach-' + hashlib.sha256(idempotency_key.encode()).hexdigest()
+        container = await self.retrieve(resource_path, origin)
+        if 'm2m:cnt' not in container:
+            raise TinyIoTError('invalid_resource', 'Recommendation resource is not a container.', 502)
+        child = f'{resource_path.strip("/")}/{name}'
+
+        async def verify():
+            try:
+                stored = await self.retrieve(child, origin)
+            except TinyIoTError as exc:
+                if exc.code == 'resource_not_found':
+                    return False
+                raise
+            parsed, instance = self.parse_content_instance(stored)
+            if instance.get('rn', name) != name or parsed != content:
+                raise TinyIoTError('recommendation_conflict', 'Recommendation ID has different content.', 409)
+            return True
+
+        if await verify():
+            return False
+        body = {'m2m:cin': {'rn': name, 'cnf': 'application/json:0',
+                           'con': json.dumps(content, separators=(',', ':'))}}
+        try:
+            await self._request('POST', resource_path, origin, body,
+                                content_type='application/json;ty=4')
+        except TinyIoTError as exc:
+            if exc.code not in ('resource_conflict', 'tinyiot_error', 'tinyiot_unreachable') or not await verify():
+                raise
+            return False
+        if not await verify():
+            raise TinyIoTError('recommendation_unconfirmed', 'Recommendation write could not be read back.', 502)
         return True
 
     async def _request(self, method: str, resource_path: str, origin: str, body: dict | None = None,

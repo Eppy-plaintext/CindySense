@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { StoredRecommendationPanel } from './ApiPanels.jsx'
 import { usePolling } from '../hooks/usePolling.js'
-import { generateCindyPtRecommendation, getCindyPtGoal, getCindyPtProgress, getCindyPtRecommendations, getCurrentCindyPtRecommendation, saveCindyPtGoal } from '../services/api.js'
+import { discoverWorkoutResources, generateCindyPtRecommendation, getCindyPtGoal, getCindyPtProgress, getCindyPtRecommendations, getCurrentCindyPtRecommendation, getWorkoutMonitoringGroup, saveCindyPtGoal } from '../services/api.js'
 import { formatCindyDuration, isTestGoal, recommendationMatchesProgress } from '../services/cindyptDisplay.js'
 import { WeeklyPlanPanel } from './WeeklyPlanPanel.jsx'
 
@@ -14,6 +14,8 @@ export function CindyPtPage({ summaryRevision = 0 }) {
   const progressResult = usePolling(getCindyPtProgress, { refreshKey: `${refresh}-${summaryRevision}` })
   const recommendationResult = usePolling(getCindyPtRecommendations, { refreshKey: `${refresh}-${summaryRevision}` })
   const currentAdviceResult = usePolling(getCurrentCindyPtRecommendation, { refreshKey: `${refresh}-${summaryRevision}` })
+  const groupResult = usePolling(getWorkoutMonitoringGroup, { refreshKey: `${refresh}-${summaryRevision}` })
+  const discoveryResult = usePolling(discoverWorkoutResources, { refreshKey: refresh })
 
   const goal = goalResult.data?.goal
   const visibleRoundsInput = roundsInput ?? String(goal?.targetRounds ?? 7)
@@ -101,6 +103,21 @@ export function CindyPtPage({ summaryRevision = 0 }) {
         <StoredRecommendationPanel result={recommendationResult} progress={progress} />
       </section>
     </div>
+    <section className="recommendations panel" aria-label="oneM2M monitoring" style={{ marginTop: 18 }}>
+      <p className="eyebrow">ONEM2M MONITORING</p><h2>Workout resources</h2>
+      {groupResult.status === 'success' ? <>
+        <p className="pt-message">Group: {groupResult.data.resource_path} · fan-out status: {groupResult.data.overall_status}</p>
+        <p className="pt-message">Members: {groupResult.data.members.join(', ')}</p>
+        <ul>{groupResult.data.fanout_results.map((result, index) =>
+          <li key={index}>Fan-out result {index + 1}: RSC {result.rsc} · {result.pc?.['m2m:cnt']
+            ? `CNT ${result.pc['m2m:cnt'].rn || 'member'}, content instances ${result.pc['m2m:cnt'].cni ?? 'unknown'}`
+            : 'member response unavailable'}</li>)}</ul>
+      </> : <p className="pt-message">Group fan-out: {groupResult.status === 'error' ? groupResult.error : 'checking…'}</p>}
+      {discoveryResult.status === 'success' ? <>
+        <p className="pt-message">TinyIoT CSE discovery · container type 3</p>
+        <ul>{discoveryResult.data.resources.map((resource) => <li key={resource}>{resource} · owner {discoveryResult.data.owners[resource]}</li>)}</ul>
+      </> : <p className="pt-message">CSE discovery: {discoveryResult.status === 'error' ? discoveryResult.error : 'checking…'}</p>}
+    </section>
     <WeeklyPlanPanel key={refresh} progressResult={progressResult} />
     {action.status !== 'idle' && <p className={action.status === 'error' ? 'pt-action pt-error' : 'pt-action'} role={action.status === 'error' ? 'alert' : 'status'}>{action.message}</p>}
   </div>

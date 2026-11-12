@@ -44,4 +44,6 @@ export const previewCindyPtPlan = (preferences) => getJson('/api/cindypt/plans/p
 export const saveCindyPtPlan = (request) => getJson('/api/cindypt/plans', { method: 'POST', body: request })
 export const getSavedCindyPtPlan = (options) => getJson('/api/cindypt/plans', options)
 export const getCindyPtRecovery = (options) => getJson('/api/cindypt/recovery', options)
+export const getWorkoutMonitoringGroup = (options) => getJson('/api/onem2m/group/workout-monitoring', options)
+export const discoverWorkoutResources = (options) => getJson('/api/onem2m/discovery', options)
 export const integrationEventUrl = `${API_BASE_URL}/api/integration/events`

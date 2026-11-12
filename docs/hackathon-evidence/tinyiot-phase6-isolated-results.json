@@ -1,0 +1,187 @@
+{
+  "status": "passed",
+  "base": "http://127.0.0.1:3101/TinyIoT",
+  "records": [
+    {
+      "case": "initial root GET",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "case": "sequential root GET 1",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "case": "sequential root GET 2",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "case": "sequential root GET 3",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "case": "sequential root GET 4",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "case": "sequential root GET 5",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "case": "sequential root GET 6",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "case": "sequential root GET 7",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "case": "sequential root GET 8",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "case": "sequential root GET 9",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "case": "sequential root GET 10",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "case": "24 GETs, maximum eight concurrent",
+      "count": 24,
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "case": "partial header receive timeout",
+      "http": 408,
+      "rsc": "4008"
+    },
+    {
+      "case": "root GET after client disconnect",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "case": "test AE POST",
+      "http": 201,
+      "rsc": "2001"
+    },
+    {
+      "case": "test AE GET",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "case": "ACP POST",
+      "http": 201,
+      "rsc": "2001"
+    },
+    {
+      "case": "ACP GET",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "case": "CNT A POST",
+      "http": 201,
+      "rsc": "2001"
+    },
+    {
+      "case": "CNT B POST",
+      "http": 201,
+      "rsc": "2001"
+    },
+    {
+      "case": "scoped ACP assignment PUT",
+      "http": 200,
+      "rsc": "2004"
+    },
+    {
+      "case": "scoped CNT GET",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "case": "ACP denied GET",
+      "http": 403,
+      "rsc": "4103"
+    },
+    {
+      "case": "ACP denied POST",
+      "http": 403,
+      "rsc": "4103"
+    },
+    {
+      "case": "CIN POST",
+      "http": 201,
+      "rsc": "2001"
+    },
+    {
+      "case": "CIN GET",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "case": "SUB POST",
+      "http": 201,
+      "rsc": "2001"
+    },
+    {
+      "case": "SUB GET",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "case": "GRP POST",
+      "http": 201,
+      "rsc": "2001"
+    },
+    {
+      "case": "GRP GET",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "case": "GRP fopt GET",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "case": "type discovery",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "case": "label discovery",
+      "http": 200,
+      "rsc": "2000"
+    },
+    {
+      "case": "test AE cleanup DELETE",
+      "http": 200,
+      "rsc": "2002"
+    },
+    {
+      "case": "test AE absent GET",
+      "http": 404,
+      "rsc": "4004"
+    },
+    {
+      "case": "final root GET",
+      "http": 200,
+      "rsc": "2000"
+    }
+  ]
+}

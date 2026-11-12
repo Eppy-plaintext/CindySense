@@ -57,11 +57,56 @@ def uri_names(data):
     return {str(ref).rstrip("/").rsplit("/", 1)[-1] for ref in refs}
 
 
+def probe_group(record, parent, root, member_ids):
+    """Probe a disposable sibling GRP; CNT cannot have a GRP child on TinyIoT."""
+    group_name = root.rsplit('/', 1)[-1] + '_GRP'
+    group_path = f'{parent}/{group_name}'
+    member_paths = [f'TinyIoT/{root}/labeled', f'TinyIoT/{root}/plain']
+    entry, _ = record('GRP POST', 'POST', parent,
+                      body={'m2m:grp': {'rn': group_name, 'mt': 3, 'mid': member_paths,
+                                        'mnm': 2, 'csy': 2}}, ty=9)
+    entry['passed'] = (entry['http'], entry['rsc']) == (201, '2001')
+    if not entry['passed']:
+        entry['reason'] = 'GRP create failed; readback and fan-out skipped'
+        return None
+    readback_entry, stored = record('GRP GET', 'GET', group_path)
+    grp = stored.get('m2m:grp') if isinstance(stored, dict) else None
+    grp = grp if isinstance(grp, dict) else {}
+    stored_members = grp.get('mid')
+    # The CSE normalizes local member URIs to resource IDs in stored mid.
+    readback_entry['member_ids'] = grp.get('mid')
+    readback_entry['passed'] = ((readback_entry['http'], readback_entry['rsc']) == (200, '2000') and
+                                grp.get('mt') == 3 and grp.get('csy') == 2 and
+                                grp.get('mnm') == 2 and isinstance(stored_members, list) and
+                                set(stored_members) == set(member_ids))
+    if not readback_entry['passed']:
+        readback_entry['reason'] = 'GRP representation or member IDs mismatch'
+        return group_path
+    fanout_entry, aggregate = record('GRP fopt GET', 'GET', group_path + '/fopt')
+    agr = aggregate.get('m2m:agr') if isinstance(aggregate, dict) else None
+    responses = agr.get('m2m:rsp', []) if isinstance(agr, dict) else []
+    if isinstance(responses, dict):
+        responses = [responses]
+    if not isinstance(responses, list):
+        responses = []
+    fanout_entry['member_rsc'] = [response.get('rsc') for response in responses if isinstance(response, dict)]
+    fanout_entry['member_types'] = [list(response.get('pc') or {}) for response in responses if isinstance(response, dict)]
+    fanout_entry['passed'] = ((fanout_entry['http'], fanout_entry['rsc']) == (200, '2000') and
+                              len(responses) == 2 and all(isinstance(response, dict) and
+                              str(response.get('rsc')) == '2000' and
+                              isinstance(response.get('pc'), dict) and
+                              'm2m:cnt' in response['pc'] for response in responses))
+    if not fanout_entry['passed']:
+        fanout_entry['reason'] = 'Fan-out member responses did not match two successful CNT retrievals'
+    return group_path
+
+
 def main():
     name = "AdvancedProbe_" + uuid.uuid4().hex[:12]
     root = f"{PARENT}/{name}"
     records = []
     created = False
+    group_path = None
     healthy = True
 
     def record(label, method, path, *, body=None, ty=None, query=None, expected=None):
@@ -106,6 +151,9 @@ def main():
                             expected={(200, "2000")})
         if marker not in labeled["m2m:cnt"].get("lbl", []):
             raise RuntimeError("Labeled CNT readback lost marker")
+        _, plain = record("plain CNT GET", "GET", root + "/plain",
+                          expected={(200, "2000")})
+        member_ids = [labeled['m2m:cnt']['ri'], plain['m2m:cnt']['ri']]
 
         filters = [
             ("label match", {"lbl": marker}, {"labeled"}),
@@ -126,6 +174,8 @@ def main():
             names = uri_names(data)
             entry["names"] = sorted(names)
             entry["passed"] = names == expected_names
+
+        group_path = probe_group(record, PARENT, root, member_ids)
         # Modification filters use an explicit PUT, so there is no clock-edge guess.
         record("labeled CNT PUT", "PUT", root + "/labeled",
                body={"m2m:cnt": {"lbl": [marker, "updated"]}},
@@ -205,9 +255,17 @@ def main():
         elif entry["http"] >= 500:
             raise RuntimeError("TS server error; stopping")
 
-        if not all(row.get("passed", True) for row in records):
+        if not all(row.get("passed", True) for row in records
+                   if not row['case'].startswith('GRP')):
             raise RuntimeError("Discovery result mismatch; stopping")
     finally:
+        if group_path and healthy:
+            try:
+                checked_health()
+                record("GRP DELETE", "DELETE", group_path, expected={(200, "2002")})
+                record("GRP absent GET", "GET", group_path, expected={(404, "4004")})
+            except Exception as exc:
+                records.append({"case": "GRP cleanup error", "error": str(exc)})
         if created and healthy:
             try:
                 checked_health()
