@@ -198,3 +198,69 @@ cd /home/eppy-04/tinyIoT/source/server
 The final `./server` command is foreground by design: use the existing approved process supervisor/session procedure, record the new PID, and verify there is only one `tinydb` CSE connection. Do not use this snippet unmodified or launch it in a second terminal while an old server remains. Rollback, after stopping and confirming exit of the patched PID, is `install -m 0755 /SECURE/BACKUP/server-original /home/eppy-04/tinyIoT/source/server/server`, confirm the original SHA above, then start the **one approved original listener** with its original port and configuration. A database restore is a separate exceptional decision, not part of routine binary rollback.
 
 No Phase 8 production process was stopped, started, replaced, or queried through a mutating API. No production database records, ACPs, subscriptions, workouts, or credentials were changed. No patch was deployed or pushed.
+
+## Phase 8B final safety checks (2026-11-14)
+
+### Port ownership and final endpoint configuration
+
+The historical port-3000 process could not be re-established during this read-only check. WSL had no listener or TinyIoT process on port **3000**, Windows had no port-3000 listener, and `netsh interface portproxy show all` contained only `0.0.0.0:3001 -> 172.31.28.214:3001`. The current WSL TinyIoT process is a single `./server -p 3001` instance (PID 551 at inspection). The prior port-3000 process was not stopped or modified, but there is no current listener, startup command, portproxy rule, or active client configuration requiring it. Its ownership is therefore historical/uncertain rather than an active deployment dependency.
+
+The intended CindySense endpoint configuration is:
+
+| Component | Intended endpoint |
+| --- | --- |
+| TinyIoT | WSL `127.0.0.1:3001/TinyIoT` |
+| Windows portproxy | `0.0.0.0:3001 -> 172.31.28.214:3001` |
+| FastAPI | Windows port `8000`, with `TINYIOT_BASE_URL=http://127.0.0.1:3001/TinyIoT` |
+| Dashboard | FastAPI `http://localhost:8000` |
+| Webcam bridge | Explicit `CINDYSENSE_TINYIOT_URL=http://127.0.0.1:3001/TinyIoT` or equivalent `--tinyiot-base`; do not use the port-3000 fallback |
+
+The repository webcam default has now been corrected to port 3001 while preserving the `CINDYSENSE_TINYIOT_URL` override. The CSE root representation still advertises `poa=http://127.0.0.1:3000`; this metadata drift must not be treated as proof that port 3000 is a valid deployment endpoint. Any existing firmware or collector configuration must be reviewed before use.
+
+### Full production backup and isolated restore
+
+Production PostgreSQL accepted connections on `127.0.0.1:5432`; `pg_dump`, `pg_restore`, and `psql` were PostgreSQL **14.24** tools, and approximately **953 GB** was available on the WSL filesystem. A fresh full custom-format archive was created without owner or ACL restoration at the restricted path `/var/lib/postgresql/phase8b-backups/tinydb-phase8b-preflight-20261114.dump` with mode **600** and size **147,768 bytes**. SHA-256:
+
+`07cb393da46b688280f9e7e03640ca4e4cc5d2cf14dc9fadc84692056b0c5768`
+
+The archive restored successfully with `pg_restore --single-transaction --exit-on-error` into temporary database `tinydb_phase8b_restore_20261114`. Restored top-level counts were `general=563`, `ae=4`, `cnt=24`, `cin=518`, `acp=5`, `sub=8`, and `grp=1`, matching the production snapshot. The restored database contained the expected AE/container resource IDs, ACP assignments, and `RepCount_Sub`/`Summary_Sub` records with `enc.net=[3]` and the configured redacted callback destination. The temporary restore database was deleted after verification. Production `tinydb` records were not modified.
+
+### Final Phase 8 candidate endurance test
+
+The complete Phase 8 candidate binary was run only with the isolated PostgreSQL cluster on port **55432** and isolated TinyIoT on port **3101**. The production 3001 process remained running and untouched; all endurance requests were hard-coded to 3101. The candidate hash was **95f5f4bf1ba7473af74a24abdfe0bd8533dc6a2986b8afb15a5305332991dff7**. The test used one isolated CIN POST per second and one isolated container GET every two seconds for **1,200 seconds**.
+
+| Measurement | Result |
+| --- | --- |
+| CIN POSTs | **1200/1200** HTTP 201 / RSC 2001 |
+| Container GETs | **600/600** HTTP 200 / RSC 2000 |
+| Latency | Median **18.24 ms**, p95 **39.71 ms**, maximum **173.62 ms** across 1,805 requests |
+| Threads | Baseline/final **2/2**, maximum sampled **2** |
+| Descriptors | Baseline/final **7/7**, maximum sampled **7** |
+| CLOSE_WAIT | **0** at every sample and final |
+| RSS | Baseline **12,624 KiB**, maximum **13,380 KiB**, final **13,252 KiB** |
+| PostgreSQL | Ready at every sample and final |
+| Cleanup | AE DELETE 200 / RSC 2002; absent GET 404 / RSC 4004; isolated DB had zero test AEs and CINs |
+
+The isolated server and PostgreSQL cluster were stopped after the run. No production TinyIoT restart, deployment, ACP change, subscription change, or production data write occurred.
+
+### Final build and readiness decision
+
+The candidate patch passed `patch --dry-run -p1` against the untouched original source. A clean rebuild in the established isolated candidate directory reproduced the recorded candidate SHA-256. The original production executable remained preserved at `/home/eppy-04/tinyIoT-phase6/production-server-original` and `/home/eppy-04/tinyIoT/source/server/server`, both SHA-256 `8bce4692af5a202ba5f6fddd2df182e12385481ef189614fd29ed06d58fbfbef`.
+
+The Phase 8 candidate is **isolated-test verified and ready for approval**, but it has not been deployed. No active port-3000 dependency remains in the verified runtime configuration. Separately authorized production deployment/rollback review is still required. Rollback remains: stop only the approved patched PID, verify it exited, restore the preserved byte-identical original executable, restart the one approved original service, and re-read the baseline resources, ACP assignments, subscriptions, and PostgreSQL health. No production deployment or restart was performed in Phase 8B.
+
+### Configuration alignment follow-up
+
+The active runtime defaults are now consistent: the webcam bridge and backend fallback use `http://127.0.0.1:3001/TinyIoT`; `backend/.env` uses the same URL; the dashboard uses FastAPI at `http://localhost:8000`; and the currently visible repetition and summary notification subscriptions target the configured Windows gateway callback on port 8000 with `enc.net=[3]`. The `CINDYSENSE_TINYIOT_URL` override was exercised with a non-production test value and remains honored.
+
+Port-3000 references remaining outside historical evidence are mocked test fixtures that intentionally exercise arbitrary URLs; they are not runtime dependencies. Historical reports retain their original port values for evidentiary accuracy. The live read-only check showed the active repetition callback subscription as `cindysense-fastapi-repetitions` and the summary subscription as `Summary_Sub`; no subscription was changed. The database backup contained a historical `RepCount_Sub` row, but it was not assumed to be live without a direct resource readback.
+
+Focused validation passed: **31/31** webcam/API/notification unit tests and **23/23** sensor-collector tests. No live workout data was published.
+
+### Phase 9B.1 fatigue-history retrieval follow-up
+
+The fatigue endpoint now has a separate read-only history path in `backend/fatigue_history.py`. It reuses the existing paginated CIN reader, validates each CIN independently, excludes malformed/legacy, synthetic, diagnostic, and non-webcam content, groups events by `sessionId`, and never combines sessions. The existing `WorkoutSnapshot.read` path and live counting behavior are unchanged.
+
+Against the retained production `CindySense_AE/RepetitionCount` container, the read-only scan reported **292 retained** and **292 retrieved** CIN references. It accepted **282 validated webcam events** and excluded **10** (`diagnostic_session=8`, `synthetic=2`). The default latest suitable session was `webcam-20261111T102705Z-f7a4b355` with 30 events and sufficient history. The seven-round session `webcam-20261111T095408Z-c7efabb8` was also selected explicitly with 210 events and sufficient history. Its heuristic results were pull-up `possible_fatigue` (25.6), push-up `possible_fatigue` (30.0), and squat `normal` (0.0); these are not medically validated fatigue detection.
+
+Focused Phase 9B.1 tests passed **14/14** and the existing backend regression suite passed **51/51**. The live FastAPI process has not been restarted and still reports the old cache-based response (`cachedEventCount=1`); restarting FastAPI is required before the new endpoint behavior is visible. No TinyIoT resource, subscription, ACP, PostgreSQL record, or workout event was modified.

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { generateCindyPtRecommendation, getCindyPtGoal, getCindyPtProgress, getCindyPtRecommendations, saveCindyPtGoal, previewCindyPtPlan, saveCindyPtPlan, getSavedCindyPtPlan, getCindyPtRecovery } from './api.js'
+import { generateCindyPtRecommendation, getCindyPtGoal, getCindyPtProgress, getCindyPtRecommendations, getWorkoutFatigue, saveCindyPtGoal, previewCindyPtPlan, saveCindyPtPlan, getSavedCindyPtPlan, getCindyPtRecovery } from './api.js'
 
 test('Cindy PT reads use GET and writes happen only on explicit calls', async () => {
   const originalFetch = globalThis.fetch
@@ -35,6 +35,24 @@ test('Cindy PT API exposes server and connection failures', async () => {
     await assert.rejects(getCindyPtGoal(), /TinyIoT could not be reached/)
     globalThis.fetch = async () => { throw new TypeError('disconnected') }
     await assert.rejects(getCindyPtProgress(), /Cannot reach the CindySense backend/)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('fatigue API is a read-only session-scoped GET', async () => {
+  const originalFetch = globalThis.fetch
+  const calls = []
+  globalThis.fetch = async (url, options) => {
+    calls.push({ url, options })
+    return { ok: true, json: async () => ({ selectedSessionId: 'webcam-current' }) }
+  }
+  try {
+    await getWorkoutFatigue('webcam/current')
+    assert.equal(new URL(calls[0].url).pathname, '/api/workout/fatigue')
+    assert.equal(new URL(calls[0].url).searchParams.get('sessionId'), 'webcam/current')
+    assert.equal(calls[0].options.method, 'GET')
+    assert.equal(calls[0].options.body, undefined)
   } finally {
     globalThis.fetch = originalFetch
   }

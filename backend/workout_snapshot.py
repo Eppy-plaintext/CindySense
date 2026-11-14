@@ -71,6 +71,10 @@ class WorkoutSnapshot:
         self._revision = 0
         self._retained_refs: list[str] = []
 
+    def validated_events(self) -> list[RepetitionEvent]:
+        """Return the currently cached validated structured events without writing."""
+        return [event for event in self._events.values() if event is not None]
+
     async def read(self, tinyiot: TinyIoTClient, resource: str, origin: str) -> dict:
         async with self._lock:
             started = time.perf_counter()

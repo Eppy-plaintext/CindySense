@@ -1,6 +1,6 @@
 
 {
-  "base_url": "http://localhost:3000/TinyIoT",
+  "base_url": "http://127.0.0.1:3001/TinyIoT",
   "origin": "CAdmin",
   "container": "CindySense_AE/SensorData",
   "output_dir": "../data/recordings",

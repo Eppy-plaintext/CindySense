@@ -1,6 +1,6 @@
 # TinyIoT external dependency
 
-TinyIoT is maintained at [seslabSJU/tinyIoT](https://github.com/seslabSJU/tinyIoT). The locally inspected WSL Ubuntu checkout was clean on `main` at commit `c140495`. Keep that checkout and its database, build files, and server configuration outside this repository. Follow its upstream README for installation and database choices; the inspected setup uses port 3000.
+TinyIoT is maintained at [seslabSJU/tinyIoT](https://github.com/seslabSJU/tinyIoT). The locally inspected WSL Ubuntu checkout was clean on `main` at commit `c140495`. Keep that checkout and its database, build files, and server configuration outside this repository. Follow its upstream README for installation and database choices; the CindySense runtime endpoint uses port 3001.
 
 The backend needs `TINYIOT_BASE_URL` reachable **from the backend process**, plus local read originators configured in ignored `backend/.env`. The dashboard never calls TinyIoT directly. Start and maintain TinyIoT separately; this repository does not provision its resources or change its access policies.
 

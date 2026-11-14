@@ -148,6 +148,43 @@ class TinyIoTClient:
             raise TinyIoTError('plan_unconfirmed', 'Plan write succeeded but readback was unavailable.', 502)
         return True
 
+    async def create_named_verified_content(self, resource_path: str, origin: str,
+                                            resource_name: str, content: dict) -> bool:
+        """Create a deterministic named CIN and verify exact content after retries."""
+        if not resource_name or '/' in resource_name or resource_name in ('.', '..'):
+            raise TinyIoTError('invalid_resource_name', 'Content instance name is invalid.', 503)
+        container = await self.retrieve(resource_path, origin)
+        if 'm2m:cnt' not in container:
+            raise TinyIoTError('invalid_resource', 'The configured resource is not a oneM2M container.', 502)
+        child = f'{resource_path.strip("/")}/{resource_name}'
+
+        async def verify() -> bool:
+            try:
+                stored = await self.retrieve(child, origin)
+            except TinyIoTError as exc:
+                if exc.code == 'resource_not_found':
+                    return False
+                raise
+            parsed, instance = self.parse_content_instance(stored)
+            if instance.get('rn', resource_name) != resource_name or parsed != content:
+                raise TinyIoTError('content_conflict', 'Named content has different content.', 409)
+            return True
+
+        if await verify():
+            return False
+        body = {'m2m:cin': {'rn': resource_name, 'cnf': 'application/json:0',
+                           'con': json.dumps(content, separators=(',', ':'))}}
+        try:
+            await self._request('POST', resource_path, origin, body,
+                                content_type='application/json;ty=4')
+        except TinyIoTError as exc:
+            if exc.code not in ('resource_conflict', 'tinyiot_error', 'tinyiot_unreachable') or not await verify():
+                raise
+            return False
+        if not await verify():
+            raise TinyIoTError('content_unconfirmed', 'Named content could not be read back.', 502)
+        return True
+
     async def create_named_recommendation(self, resource_path: str, origin: str,
                                           idempotency_key: str, content: dict) -> bool:
         """Create a deterministic CIN and verify it after a lost reply or conflict."""

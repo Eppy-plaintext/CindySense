@@ -4,7 +4,7 @@ The recorder in [collect_sensor_data.py](../tools/collect_sensor_data.py) reads 
 
 ## Configure and probe
 
-Copy [collector.example.json](../tools/collector.example.json) to `tools/collector.local.json`. Set `origin` to an originator authorized to retrieve the SensorData container and its CINs. Use a least-privilege read identity. Set `base_url` to the address reachable from the machine running Python. From Windows, `http://localhost:3000/TinyIoT` works only when WSL forwards that port; otherwise use the reachable WSL address. Set `device_id` if other devices share the container. Both `tools/collector.local.json` and `tools/collector.json`, plus `data/recordings/`, are Git ignored.
+Copy [collector.example.json](../tools/collector.example.json) to `tools/collector.local.json`. Set `origin` to an originator authorized to retrieve the SensorData container and its CINs. Use a least-privilege read identity. Set `base_url` to the address reachable from the machine running Python; the CindySense endpoint is `http://127.0.0.1:3001/TinyIoT` when Python runs in WSL or on the same host. Set `device_id` if other devices share the container. Both `tools/collector.local.json` and `tools/collector.json`, plus `data/recordings/`, are Git ignored.
 
 The script uses only the Python standard library. From the repository root:
 

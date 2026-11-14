@@ -17,6 +17,7 @@ from .config import settings
 from .cindypt import Goal, analyze, read_goal, read_summaries, recommend
 from .coaching_jobs import CoachingJobs
 from .events import RepetitionEvent, classify_repetition_content
+from .fatigue_history import FatigueHistoryCache
 from .notifications import NotificationHub
 from .simulation import SimulationPublisher
 from .tinyiot import TinyIoTClient, TinyIoTError
@@ -65,6 +66,7 @@ app.add_middleware(
 )
 
 tinyiot = TinyIoTClient(settings.base_url, httpx.AsyncClient(timeout=5.0))
+fatigue_history_cache = FatigueHistoryCache()
 simulation_publisher = SimulationPublisher()
 workout_snapshot = WorkoutSnapshot()
 notification_hub = NotificationHub()
@@ -240,6 +242,45 @@ async def live_workout_snapshot():
         return await workout_snapshot.read(tinyiot, settings.repetition_resource, settings.workout_origin)
     except TinyIoTError as exc:
         raise api_error(exc) from exc
+
+
+@app.get('/api/workout/fatigue')
+async def workout_fatigue(sessionId: str | None = Query(default=None, min_length=1, max_length=100)):
+    """Calculate non-medical fatigue signals from one validated retained session."""
+    try:
+        history = await fatigue_history_cache.read(
+            tinyiot, settings.repetition_resource, settings.workout_origin,
+            selected_session_id=sessionId)
+        return {
+            'available': history['selectedSessionId'] is not None,
+            'source': 'validated TinyIoT repetition history',
+            'dataSufficient': history['dataSufficient'],
+            'cachedEventCount': history['selectedEventCount'],
+            **history,
+            'medicalDisclaimer': 'Heuristic performance signal; not medically validated fatigue detection.',
+        }
+    except TinyIoTError as exc:
+        # A transient history read must not turn into an apparently valid
+        # fatigue result. Keep the dashboard explicit about unavailability.
+        return {
+            'available': False,
+            'source': 'validated TinyIoT repetition history',
+            'dataSufficient': False,
+            'cachedEventCount': 0,
+            'retainedInstanceCount': None,
+            'retrievedInstanceCount': 0,
+            'validEventCount': 0,
+            'excludedEventCount': 0,
+            'selectedSessionId': sessionId,
+            'availableSessions': [],
+            'exclusionReasons': {'history_unavailable': 1},
+            'selectionError': 'history_unavailable',
+            'selectedEventCount': 0,
+            'results': [],
+            'medicalDisclaimer': 'Heuristic performance signal; not medically validated fatigue detection.',
+            'message': 'Fatigue history is temporarily unavailable; no estimate was produced.',
+            'errorCode': exc.code,
+        }
 
 
 @app.get('/api/workout/webcam-status')

@@ -9,7 +9,7 @@ load_dotenv(Path(__file__).with_name('.env'))
 
 
 def tinyiot_base_url() -> str:
-    base = os.getenv('TINYIOT_BASE_URL', 'http://localhost:3000/TinyIoT').rstrip('/')
+    base = os.getenv('TINYIOT_BASE_URL', 'http://127.0.0.1:3001/TinyIoT').rstrip('/')
     return base[:-8] + '/TinyIoT' if base.lower().endswith('/tinyiot') else base
 
 

@@ -17,9 +17,9 @@ React/Vite demo dashboard plus a FastAPI bridge to TinyIoT. The dashboard reads 
 
 ## Architecture
 
-`React (:5173) → FastAPI (:8000) → TinyIoT (:3000/TinyIoT)`
+`React (:5173) → FastAPI (:8000) → TinyIoT (:3001/TinyIoT)`
 
-TinyIoT runs in WSL Ubuntu. FastAPI can run either in that WSL distribution or in Windows if `http://localhost:3000/TinyIoT` is reachable from Windows.
+TinyIoT runs in WSL Ubuntu on port 3001. FastAPI can run either in that WSL distribution or in Windows when `http://127.0.0.1:3001/TinyIoT` is reachable from the FastAPI process.
 
 ## Start TinyIoT and verify access
 
@@ -33,8 +33,8 @@ These are currently verified read identities, **not** evidence of least-privileg
 Example read-only verification:
 
 ```sh
-curl -i -H 'X-M2M-Origin: CAdmin' -H 'X-M2M-RI: verify-1' -H 'X-M2M-RVI: 4' -H 'Accept: application/json' http://localhost:3000/TinyIoT/CindySense_AE/RepetitionCount/la
-curl -i -H 'X-M2M-Origin: CCindyPT' -H 'X-M2M-RI: verify-2' -H 'X-M2M-RVI: 4' -H 'Accept: application/json' http://localhost:3000/TinyIoT/CindyPT_AE/AIRecommendations/la
+curl -i -H 'X-M2M-Origin: CAdmin' -H 'X-M2M-RI: verify-1' -H 'X-M2M-RVI: 4' -H 'Accept: application/json' http://127.0.0.1:3001/TinyIoT/CindySense_AE/RepetitionCount/la
+curl -i -H 'X-M2M-Origin: CCindyPT' -H 'X-M2M-RI: verify-2' -H 'X-M2M-RVI: 4' -H 'Accept: application/json' http://127.0.0.1:3001/TinyIoT/CindyPT_AE/AIRecommendations/la
 ```
 
 The backend verifies each container before reading `/la` (latest content instance). The example environment file supplies these origins and the verified paths; use a different server-side origin only after verifying its read access. No administrative origin or credential belongs in the React app.
@@ -77,7 +77,7 @@ Forbidden resources return 403, missing resources 404, unreachable TinyIoT 503, 
 
 ## Run all three services
 
-1. Start the existing TinyIoT server in WSL Ubuntu on port 3000. Confirm `http://localhost:3000/TinyIoT` is reachable from the FastAPI process.
+1. Start the existing TinyIoT server in WSL Ubuntu on port 3001. Confirm `http://127.0.0.1:3001/TinyIoT` is reachable from the FastAPI process.
 2. Start FastAPI on port 8000 using the WSL or Windows instructions above. Check `http://localhost:8000/api/health`; `backend.available` and `tinyiot.reachable` are separate indicators. The local [backend environment example](../backend/.env.example) contains the verified read origins and resource paths.
 3. Start React/Vite on port 5173 from the project root:
 

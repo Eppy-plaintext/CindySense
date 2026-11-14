@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from tools.webcam_tinyiot import PosePublisher, TinyIoTClient, TinyIoTError
+from tools.webcam_tinyiot import DEFAULT_BASE, PosePublisher, TinyIoTClient, TinyIoTError
 
 
 class EventUploadTests(unittest.TestCase):
@@ -20,6 +20,9 @@ class EventUploadTests(unittest.TestCase):
             "repetitions": 1, "round": 1, "timestamp": "2026-11-05T12:00:00+00:00",
             "source": "webcam",
         }
+
+    def test_default_endpoint_uses_cindysense_port(self):
+        self.assertEqual(DEFAULT_BASE, 'http://127.0.0.1:3001/TinyIoT')
 
     def test_posts_under_stable_idempotent_name(self):
         calls = []
