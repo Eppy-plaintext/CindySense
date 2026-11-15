@@ -1,6 +1,64 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { generateCindyPtRecommendation, getCindyPtGoal, getCindyPtProgress, getCindyPtRecommendations, getWorkoutFatigue, saveCindyPtGoal, previewCindyPtPlan, saveCindyPtPlan, getSavedCindyPtPlan, getCindyPtRecovery } from './api.js'
+import { API_BASE_URL, generateCindyPtRecommendation, getBackendHealth, getCindyPtGoal, getCindyPtProgress, getCindyPtRecommendations, getWorkoutFatigue, getWebcamWorker, startWebcamWorker, stopWebcamWorker, webcamPreviewUrl, saveCindyPtGoal, previewCindyPtPlan, saveCindyPtPlan, getSavedCindyPtPlan, getCindyPtRecovery } from './api.js'
+
+test('local API and webcam routes use FastAPI port 8000', async () => {
+  const originalFetch = globalThis.fetch
+  const calls = []
+  globalThis.fetch = async (url, options) => {
+    calls.push({ url, method: options.method })
+    return { ok: true, json: async () => ({ state: 'idle' }) }
+  }
+  try {
+    await getBackendHealth()
+    await getWebcamWorker()
+    await startWebcamWorker()
+    await stopWebcamWorker()
+    assert.equal(new URL(API_BASE_URL).port, '8000')
+    assert.equal(new URL(webcamPreviewUrl).port, '8000')
+    assert.deepEqual(calls.map(({ url, method }) => [new URL(url).pathname, method]), [
+      ['/api/health', 'GET'], ['/api/workout/webcam-worker', 'GET'],
+      ['/api/workout/webcam-worker/start', 'POST'], ['/api/workout/webcam-worker/stop', 'POST'],
+    ])
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('HTTP 200 health and idle worker responses remain independent', async () => {
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async (url) => ({
+    ok: true,
+    status: 200,
+    json: async () => url.endsWith('/api/health')
+      ? { backend: { available: true }, tinyiot: { reachable: true, resource_verified: true } }
+      : { state: 'idle' },
+  })
+  try {
+    assert.deepEqual(await getBackendHealth(), {
+      backend: { available: true }, tinyiot: { reachable: true, resource_verified: true },
+    })
+    assert.deepEqual(await getWebcamWorker(), { state: 'idle' })
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('a failed request does not poison a later successful poll', async () => {
+  const originalFetch = globalThis.fetch
+  let calls = 0
+  globalThis.fetch = async () => {
+    calls += 1
+    if (calls === 1) throw new TypeError('connection refused')
+    return { ok: true, status: 200, json: async () => ({ state: 'idle' }) }
+  }
+  try {
+    await assert.rejects(getWebcamWorker(), /Cannot reach the CindySense backend/)
+    assert.deepEqual(await getWebcamWorker(), { state: 'idle' })
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
 
 test('Cindy PT reads use GET and writes happen only on explicit calls', async () => {
   const originalFetch = globalThis.fetch

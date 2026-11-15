@@ -1,6 +1,6 @@
 import unittest
 import json
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 import os
 
 import httpx
@@ -130,11 +130,24 @@ class APITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()['recommendations']['roundsCompleted'], 1)
 
-    async def test_history_explicitly_unavailable(self):
-        response = await self.api.get('/api/workout/history')
+    async def test_history_uses_validated_retained_records(self):
+        observed = {'retainedInstanceCount': 1, 'exclusionReasons': {},
+                    'selectedSessionId': 'webcam-one', 'selectionError': None,
+                    'availableSessions': [{'sessionId': 'webcam-one',
+                                           'exerciseCounts': {'pullup': 5, 'pushup': 10, 'squat': 15},
+                                           'lastEventAt': '2026-11-16T00:00:00+00:00',
+                                           'performance': {'state': 'stable_performance'}}]}
+        with patch.object(main.fatigue_history_cache, 'read', AsyncMock(return_value=observed)), \
+             patch.object(main, 'read_summaries', AsyncMock(return_value=[])), \
+             patch.object(main, 'read_goal', AsyncMock(return_value=None)):
+            response = await self.api.get('/api/workout/history')
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()['sessions'], [])
-        self.assertFalse(response.json()['available'])
+        self.assertEqual(response.json()['sessions'][0]['status'], 'no_verified_summary')
+        self.assertFalse(response.json()['sessions'][0]['comparable'])
+        self.assertTrue(response.json()['available'])
+        with patch.object(main.fatigue_history_cache, 'read', AsyncMock(return_value=observed)):
+            performance = await self.api.get('/api/workout/performance?sessionId=webcam-one')
+        self.assertEqual(performance.json()['performance']['state'], 'stable_performance')
 
     async def test_health_separates_backend_from_resource_access(self):
         response = await self.api.get('/api/health')
@@ -156,10 +169,33 @@ class APITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request.url.params['ty'], '3')
         self.assertEqual(request.headers['X-M2M-Origin'], 'authorized-discovery-origin')
 
-    async def test_cors_allows_both_local_vite_origins(self):
-        for origin in ('http://localhost:5173', 'http://127.0.0.1:5173'):
-            response = await self.api.options('/api/workout/live', headers={'Origin': origin, 'Access-Control-Request-Method': 'GET'})
-            self.assertEqual(response.headers['access-control-allow-origin'], origin)
+    async def test_cors_allows_local_vite_origins_for_reads_and_webcam_preflight(self):
+        for port in (5173, 5174):
+            for host in ('localhost', '127.0.0.1'):
+                origin = f'http://{host}:{port}'
+                for path in ('/api/health', '/api/workout/live', '/api/workout/webcam-worker'):
+                    response = await self.api.get(path, headers={'Origin': origin})
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(response.headers['access-control-allow-origin'], origin)
+                for path in ('/api/workout/webcam-worker/start', '/api/workout/webcam-worker/stop'):
+                    response = await self.api.options(path, headers={
+                        'Origin': origin, 'Access-Control-Request-Method': 'POST',
+                        'Access-Control-Request-Headers': 'content-type',
+                    })
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(response.headers['access-control-allow-origin'], origin)
+                    self.assertIn('POST', response.headers['access-control-allow-methods'])
+
+    async def test_cors_does_not_allow_unrelated_origins(self):
+        origin = 'http://unrelated.example:5174'
+        response = await self.api.get('/api/health', headers={'Origin': origin})
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn('access-control-allow-origin', response.headers)
+        preflight = await self.api.options('/api/workout/webcam-worker/start', headers={
+            'Origin': origin, 'Access-Control-Request-Method': 'POST',
+        })
+        self.assertEqual(preflight.status_code, 400)
+        self.assertNotIn('access-control-allow-origin', preflight.headers)
 
 
 class ErrorTests(unittest.IsolatedAsyncioTestCase):

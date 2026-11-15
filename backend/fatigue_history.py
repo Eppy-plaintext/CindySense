@@ -8,6 +8,7 @@ from typing import Any
 
 from .events import RepetitionEvent, classify_repetition_content
 from .fatigue import EXERCISES, FatigueConfig, estimate_fatigue
+from .performance import analyze_performance
 from .tinyiot import TinyIoTClient, TinyIoTError
 
 DIAGNOSTIC_SESSION_PREFIXES = ('auto-', 'diag', 'live-', 'sse-audit', 'test-')
@@ -41,6 +42,7 @@ def _session_summary(session_id: str, events: list[RepetitionEvent], config: Fat
         'firstEventAt': first.isoformat(),
         'lastEventAt': last.isoformat(),
         'suitable': suitable,
+        'performance': analyze_performance(events),
     }
 
 
@@ -117,7 +119,10 @@ async def read_fatigue_history(client: TinyIoTClient, resource: str, origin: str
 
     selected_events = [] if selected is None else sorted(
         grouped[selected].values(), key=lambda event: (event.event_sequence or 0, event.timestamp, str(event.event_id)))
-    results = estimate_fatigue(selected_events, config=config)
+    # Repetition CINs currently contain no landmark-quality evidence. Observed
+    # pace is still reportable, but these events alone cannot substantiate a
+    # fatigue alert when the webcam may have missed movement phases.
+    results = estimate_fatigue(selected_events, config=config, require_quality=True)
     # A workout-level fatigue result is sufficient only when every supported
     # exercise has enough validated history.  One exercise alone must not make
     # the endpoint appear ready for a complete workout assessment.
@@ -169,8 +174,12 @@ class FatigueHistoryCache:
                    config: FatigueConfig | None = None) -> dict:
         async with self._lock:
             container = await client.retrieve(resource, origin)
-            latest = await client.retrieve(f'{resource}/la', origin)
-            marker = self._marker(container, latest)
+            metadata = container.get('m2m:cnt')
+            if isinstance(metadata, dict) and metadata.get('cni') == 0:
+                marker = (0, None, None)
+            else:
+                latest = await client.retrieve(f'{resource}/la', origin)
+                marker = self._marker(container, latest)
             key = (resource, selected_session_id, marker)
             cached = self._entries.get(key)
             if cached is not None:

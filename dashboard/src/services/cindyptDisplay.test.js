@@ -9,12 +9,14 @@ test('integration goal stays visibly marked as test data', () => {
 
 test('recommendation only matches the same completed workout and goal', () => {
   const goal = { label: null, targetRounds: 7, durationSeconds: 1200 }
-  const progress = { available: true, goal, workout: { workoutId: 'completed-1' } }
-  const advice = { goal, sourceWorkoutId: 'completed-1' }
+  const progress = { available: true, selectionStatus: 'sufficient', goal, workout: { workoutId: 'completed-1' } }
+  const advice = { goal, sourceWorkoutId: 'completed-1', dataSufficiency: 'sufficient' }
   assert.equal(recommendationMatchesProgress(advice, progress), true)
   assert.equal(recommendationMatchesProgress(advice, { ...progress, available: false }), false)
   assert.equal(recommendationMatchesProgress(advice, { ...progress, workout: { workoutId: 'running-2' } }), false)
   assert.equal(recommendationMatchesProgress({ ...advice, goal: { ...goal, label: 'TEST old' } }, progress), false)
+  assert.equal(recommendationMatchesProgress(advice, { ...progress, selectionStatus: 'not_comparable' }), false)
+  assert.equal(recommendationMatchesProgress({ ...advice, dataSufficiency: undefined }, progress), false)
 })
 
 test('duration preserves seconds without inventing a rounded workout time', () => {

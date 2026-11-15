@@ -71,6 +71,19 @@ class EventUploadTests(unittest.TestCase):
         self.assertEqual(publisher.event_overflow, 1)
         self.assertEqual(publisher.events.qsize(), 1)
 
+    def test_diagnostics_exposes_event_latency_without_live_threads(self):
+        publisher = PosePublisher.__new__(PosePublisher)
+        publisher.events = queue.Queue(maxsize=5)
+        publisher.inflight_event = None
+        publisher.event_confirmed = 1
+        publisher.event_retries = 0
+        publisher.event_overflow = 0
+        publisher.event_last_latency_ms = 42.5
+        publisher.event_max_latency_ms = 91.0
+        diagnostics = publisher.diagnostics()
+        self.assertEqual(diagnostics["eventLastLatencyMs"], 42.5)
+        self.assertEqual(diagnostics["eventMaxLatencyMs"], 91.0)
+
     def test_shutdown_spools_offline_events_and_replays_same_id(self):
         recordings = Path(__file__).resolve().parents[2] / "data" / "recordings"
         recordings.mkdir(parents=True, exist_ok=True)

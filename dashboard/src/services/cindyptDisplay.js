@@ -3,7 +3,9 @@ export function isTestGoal(goal) {
 }
 
 export function recommendationMatchesProgress(recommendation, progress) {
-  if (!recommendation || typeof recommendation !== 'object' || !progress?.available || !progress.workout || !progress.goal) return false
+  if (!recommendation || typeof recommendation !== 'object' || !progress?.available ||
+      progress.selectionStatus !== 'sufficient' || recommendation.dataSufficiency !== 'sufficient' ||
+      !progress.workout || !progress.goal) return false
   const goal = recommendation.goal
   return recommendation.sourceWorkoutId === progress.workout.workoutId &&
     goal?.targetRounds === progress.goal.targetRounds &&

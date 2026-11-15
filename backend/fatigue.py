@@ -152,7 +152,8 @@ def _estimate_exercise(session_id: str, exercise: str, events: list[RepetitionEv
 
 
 def estimate_fatigue(events: Sequence[RepetitionEvent], config: FatigueConfig | None = None,
-                     quality_by_event_id: Mapping[str, object] | None = None) -> list[dict]:
+                     quality_by_event_id: Mapping[str, object] | None = None,
+                     require_quality: bool = False) -> list[dict]:
     """Estimate fatigue per exercise without inferring from missing observations."""
     config = config or FatigueConfig()
     event_list = list(events)
@@ -162,6 +163,9 @@ def estimate_fatigue(events: Sequence[RepetitionEvent], config: FatigueConfig | 
         return [_unknown(None, exercise, 'no_validated_events') for exercise in EXERCISES]
     if len(sessions) != 1:
         return [_unknown(session_id, exercise, 'session_identity_changed') for exercise in EXERCISES]
+    if require_quality and (quality_by_event_id is None or any(
+            str(event.event_id) not in quality_by_event_id for event in event_list)):
+        return [_unknown(session_id, exercise, 'detector_quality_unverified') for exercise in EXERCISES]
     if any(event.source != 'webcam' for event in event_list):
         return [_unknown(session_id, exercise, 'unsupported_or_mixed_event_source') for exercise in EXERCISES]
     if any(not _valid_timestamp(event.timestamp) for event in event_list):

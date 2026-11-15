@@ -1,7 +1,7 @@
 import json
 import unittest
 from datetime import date
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 
@@ -15,6 +15,18 @@ PREFERENCES = {'timezone': 'Asia/Seoul', 'trainingDays': [0, 2, 4], 'experienceL
 
 
 class PlannerRulesTests(unittest.TestCase):
+    def test_webcam_provenance_requires_a_webcam_session_identity(self):
+        prefs = PlanPreferences.model_validate(PREFERENCES)
+        summary = {'workoutId': 'final-summary-097c0172', 'roundsCompleted': 1,
+                   'durationSeconds': 1200, 'source': 'webcam'}
+        plan = generate_weekly_plan(GOAL, [summary], prefs, date(2026, 11, 15))
+        self.assertEqual(plan['workoutProvenance'], 'unverified')
+        self.assertEqual(plan['sourceWorkoutId'], summary['workoutId'])
+        self.assertEqual([day['suggestedRounds'] for day in plan['days'] if day['type'] == 'workout'], [1, 1, 1])
+        webcam_named = {**summary, 'workoutId': 'webcam-20261111T102705Z-f7a4b355'}
+        self.assertEqual(generate_weekly_plan(GOAL, [webcam_named], prefs, date(2026, 11, 15))
+                         ['workoutProvenance'], 'webcam')
+
     def test_new_user_starter_plan_and_calendar(self):
         prefs = PlanPreferences.model_validate(PREFERENCES)
         plan = generate_weekly_plan(GOAL, [], prefs, today=date(2026, 11, 7))
@@ -118,8 +130,13 @@ class PlanApiTests(unittest.IsolatedAsyncioTestCase):
         self.settings_patch = patch.object(main, 'settings', main.settings.__class__(cindypt_origin='pt-origin'))
         self.client_patch.start()
         self.settings_patch.start()
+        self.history_patch = patch.object(main, 'fatigue_history_cache')
+        self.history_patch.start()
+        main.fatigue_history_cache.read = AsyncMock(return_value={
+            'availableSessions': [], 'retainedInstanceCount': 0, 'exclusionReasons': {}})
 
     async def asyncTearDown(self):
+        self.history_patch.stop()
         self.client_patch.stop()
         self.settings_patch.stop()
         await self.api.aclose()
@@ -141,6 +158,7 @@ class PlanApiTests(unittest.IsolatedAsyncioTestCase):
         self.summaries = [{'sessionId': 'webcam-new', 'status': 'completed', 'source': 'webcam',
                            'rounds': 3, 'durationSeconds': 1100, 'pullups': 15, 'pushups': 30, 'squats': 45}]
         plan = (await self.preview()).json()['plan']
+        self.assertIsNone(plan['sourceWorkoutId'])
         self.assertEqual(sum(len(records) for records in self.records.values()), 0)
         request = {'preferences': PREFERENCES, 'planId': plan['planId']}
         first = await self.api.post('/api/cindypt/plans', json=request)
@@ -177,7 +195,7 @@ class PlanApiTests(unittest.IsolatedAsyncioTestCase):
         summary = {'workoutId': 'same', 'status': 'completed', 'rounds': 3, 'durationSeconds': 1200}
         self.summaries = [summary, summary.copy()]
         plan = (await self.preview()).json()['plan']
-        self.assertEqual(plan['completedWorkoutCount'], 1)
+        self.assertEqual(plan['completedWorkoutCount'], 0)
         self.assertTrue(plan['limitedInformation'])
 
     async def test_failed_write_can_resume_without_duplicate_training_plan(self):

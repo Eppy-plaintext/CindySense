@@ -14,6 +14,8 @@ from backend.notifications import NotificationHub
 from backend.tinyiot import TinyIoTClient
 from backend.workout_snapshot import WorkoutSnapshot
 from tools.webcam_tinyiot import TinyIoTClient as WebcamClient
+from tools.webcam_exercises import CindyWorkout
+from tools.workout_summary import SummaryPublisher, completed_summary
 
 
 REPS = 'CindySense_AE/RepetitionCount'
@@ -113,7 +115,9 @@ class RoundIntegrationTests(unittest.IsolatedAsyncioTestCase):
             headers={'X-M2M-RI': str(uuid4()), 'X-M2M-Origin': 'TinyIoT', 'X-M2M-RVI': '4'})
 
     async def test_complete_round_storage_callbacks_sse_and_cindypt_preview(self):
-        session = 'webcam-20261111T000000Z-round'
+        session = 'webcam-20261111T000000Z-a1b2c3d4'
+        elapsed = [0.0]
+        workout = CindyWorkout(1200, clock=lambda: elapsed[0])
         sequence = 0
         for exercise, target in (('pullup', 5), ('pushup', 10), ('squat', 15)):
             for count in range(1, target + 1):
@@ -123,6 +127,7 @@ class RoundIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     'timestamp': f'2026-11-11T00:{sequence // 60:02d}:{sequence % 60:02d}Z',
                     'source': 'webcam'}
                 self.assertEqual(self.publisher.publish_event(event), '2001')
+                workout.record_rep(exercise)
                 response = await self.deliver(REPS, self.cse.records[REPS][-1])
                 self.assertEqual((response.status_code, response.headers['X-M2M-RSC']), (200, '2000'))
                 sse = await asyncio.wait_for(anext(self.stream), 1)
@@ -142,9 +147,15 @@ class RoundIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.hub.seen), 30)
         self.assertEqual(self.publisher.publish_event(event), 'verified')
         self.assertEqual(len(self.cse.records[REPS]), 30)
-        summary = {'sessionId': session, 'status': 'completed', 'rounds': 1,
-                   'durationSeconds': 1200, 'pullups': 5, 'pushups': 10, 'squats': 15}
-        self.assertEqual(self.publisher.publish_summary(summary), 'created')
+        elapsed[0] = 1200.0
+        self.assertTrue(workout.finished)
+        self.assertEqual(workout.rounds, 1)
+        summary = completed_summary(session, workout,
+                                    {'pullup': 5, 'pushup': 10, 'squat': 15}, 'timer')
+        summary_publisher = SummaryPublisher(self.publisher, attempts=2, retry_delay=0)
+        self.assertEqual(summary_publisher.publish(summary), 'created')
+        self.assertEqual(self.cse.records[SUMMARIES][-1]['rn'], 'webcam-summary-' + session)
+        self.assertEqual(json.loads(self.cse.records[SUMMARIES][-1]['con']), summary)
         response = await self.deliver(SUMMARIES, self.cse.records[SUMMARIES][-1])
         self.assertEqual((response.status_code, response.headers['X-M2M-RSC']), (200, '2000'))
         self.assertIn('event: summary', await asyncio.wait_for(anext(self.stream), 1))
@@ -154,7 +165,8 @@ class RoundIntegrationTests(unittest.IsolatedAsyncioTestCase):
         advice = (await self.api.get('/api/cindypt/recommendations/current')).json()
         self.assertEqual(advice['recommendations']['sourceWorkoutId'], session)
         self.assertEqual(self.cse.records.get('CindyPT_AE/AIRecommendations'), None)
-        self.assertEqual(self.publisher.publish_summary(summary), 'verified')
+        self.assertEqual(summary_publisher.publish(summary), 'already_persisted')
+        self.assertEqual(SummaryPublisher(self.publisher, attempts=1).publish(summary), 'verified')
         self.assertEqual(len(self.cse.records[SUMMARIES]), 1)
         self.assertEqual((await self.deliver(SUMMARIES, self.cse.records[SUMMARIES][-1])).status_code, 200)
         self.assertTrue(next(iter(self.hub.listeners)).empty())

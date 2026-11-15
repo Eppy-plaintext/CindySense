@@ -81,6 +81,12 @@ class FatigueTests(unittest.TestCase):
         self.assertEqual(result['fatigueLevel'], 'unknown')
         self.assertEqual(result['reasonUnknown'], 'tracking_quality_insufficient')
 
+    def test_unverified_detector_quality_cannot_produce_fatigue_alert(self):
+        items = events([2, 2, 2, 2, 2, 12, 3, 3, 3, 3])
+        result = result_for(estimate_fatigue(items, require_quality=True))
+        self.assertEqual(result['fatigueLevel'], 'unknown')
+        self.assertEqual(result['reasonUnknown'], 'detector_quality_unverified')
+
     def test_reset_repetition_count_is_unknown(self):
         items = events([2] * 5)
         items[-1] = items[-1].model_copy(update={'repetitions': 1})

@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from unittest.mock import AsyncMock, patch
 from pathlib import Path
 
 from backend.coaching_jobs import CoachingJobs
@@ -10,7 +11,8 @@ from backend.tinyiot import TinyIoTError
 class FakeClient:
     def __init__(self):
         self.summary = {'sessionId': 'session-1', 'status': 'completed', 'rounds': 2,
-                        'durationSeconds': 1200, 'pullups': 10, 'pushups': 20, 'squats': 30}
+                        'durationSeconds': 1200, 'pullups': 10, 'pushups': 20, 'squats': 30,
+                        'source': 'webcam', 'completionReason': 'timer'}
         self.goal = {'targetRounds': 3, 'durationSeconds': 1200}
         self.saved = {}
         self.fail = False
@@ -42,9 +44,40 @@ class CoachingJobTests(unittest.IsolatedAsyncioTestCase):
         self.jobs = CoachingJobs(self.path)
         self.client = FakeClient()
         self.settings = Settings(cindypt_origin='CCindyPT')
+        async def observed(*args, **kwargs):
+            summary = self.client.summary
+            counts = {'pullup': summary.get('pullups', 0), 'pushup': summary.get('pushups', 0),
+                      'squat': summary.get('squats', 0)}
+            return {'availableSessions': [{'sessionId': summary.get('sessionId'),
+                'exerciseCounts': counts, 'eventCount': sum(counts.values()),
+                'firstEventAt': '2026-11-16T00:00:00Z', 'lastEventAt': '2026-11-16T00:20:00Z',
+                'suitable': all(counts.values()), 'performance': None}],
+                'retainedInstanceCount': sum(counts.values()), 'exclusionReasons': {}}
+        self.history_patch = patch('backend.coaching_jobs.read_fatigue_history', new=AsyncMock(side_effect=observed))
+        self.history_patch.start()
 
     async def asyncTearDown(self):
+        self.history_patch.stop()
         self.temp.cleanup()
+
+    async def test_short_verified_stop_does_not_publish_advice(self):
+        self.client.summary.update({'durationSeconds': 40, 'completionReason': 'explicit_stop'})
+        self.jobs.enqueue('summary', 'summary-ri')
+        await self.jobs.process_one(self.client, self.settings)
+        self.assertEqual(self.jobs.metrics(), {'done': 1})
+        self.assertEqual(self.client.saved, {})
+
+    async def test_full_summary_without_matching_events_does_not_publish_advice(self):
+        self.client.summary['pushups'] = 19
+        self.jobs.enqueue('summary', 'summary-ri')
+        async def mismatched(*args, **kwargs):
+            return {'availableSessions': [{'sessionId': 'session-1', 'exerciseCounts':
+                {'pullup': 10, 'pushup': 20, 'squat': 30}, 'eventCount': 60, 'suitable': True,
+                'firstEventAt': '2026-11-16T00:00:00Z', 'lastEventAt': '2026-11-16T00:20:00Z',
+                'performance': None}], 'retainedInstanceCount': 60, 'exclusionReasons': {}}
+        with patch('backend.coaching_jobs.read_fatigue_history', new=AsyncMock(side_effect=mismatched)):
+            await self.jobs.process_one(self.client, self.settings)
+        self.assertEqual(self.client.saved, {})
 
     async def test_success_duplicate_and_restart(self):
         self.jobs.enqueue('CindySense_AE/WorkoutSummary/summary', 'summary-ri')
@@ -65,7 +98,9 @@ class CoachingJobTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_interrupted_and_malformed_are_discarded(self):
         for summary in ({'status': 'interrupted', 'rounds': 1, 'durationSeconds': 30},
-                        {'status': 'completed', 'rounds': -1, 'durationSeconds': 30}):
+                        {'status': 'completed', 'rounds': -1, 'durationSeconds': 30},
+                        {'status': 'completed', 'rounds': 1, 'durationSeconds': 30,
+                         'synthetic': True, 'source': 'webcam'}):
             self.client.summary = summary
             self.jobs.enqueue('summary', 'summary-ri')
             await self.jobs.process_one(self.client, self.settings)

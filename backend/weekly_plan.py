@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import re
 from datetime import datetime, timedelta
 from statistics import median_low
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -11,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 DAY_NAMES = ('Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday')
 HISTORICAL_TEST_ID = '4-20261026T162428,4070040'
+WEBCAM_SESSION_ID = re.compile(r'^webcam-\d{8}T\d{6}Z-[a-f0-9]{8}$')
 
 
 class PlanPreferences(BaseModel):
@@ -109,6 +111,9 @@ def generate_weekly_plan(goal: dict, summaries: list[dict], preferences: PlanPre
     ]
     test_goal = isinstance(goal.get('label'), str) and goal['label'].upper().startswith('TEST')
     provenance = ('historical-test' if latest and latest['workoutId'] == HISTORICAL_TEST_ID else
+                  'unverified' if latest and latest.get('source') == 'webcam' and
+                  (not isinstance(latest.get('workoutId'), str) or
+                   not WEBCAM_SESSION_ID.fullmatch(latest['workoutId'])) else
                   'unverified' if latest and not latest.get('source') else
                   latest.get('source') if latest else 'no-workout-history')
     plan = {'source': 'rule-based', 'weekStart': monday.isoformat(),

@@ -5,6 +5,8 @@
 tools/collector.local.json
 tools/collector.json
 data/recordings/
+data/webcam-worker-ipc/
+data/webcam-camera.lock
 firmware/config.h
 *.pem
 *.key

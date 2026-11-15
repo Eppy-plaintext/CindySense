@@ -5,7 +5,9 @@ import asyncio
 import json
 import logging
 import os
+import time
 import httpx
+from pydantic import ValidationError
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
@@ -15,6 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .config import settings
 from .cindypt import Goal, analyze, read_goal, read_summaries, recommend
+from .coaching_selection import select_workout
 from .coaching_jobs import CoachingJobs
 from .events import RepetitionEvent, classify_repetition_content
 from .fatigue_history import FatigueHistoryCache
@@ -22,7 +25,9 @@ from .notifications import NotificationHub
 from .simulation import SimulationPublisher
 from .tinyiot import TinyIoTClient, TinyIoTError
 from .workout_snapshot import WorkoutSnapshot
+from .workout_history import build_history
 from .weekly_plan import PlanPreferences, SavePlanRequest, generate_weekly_plan
+from .webcam_worker import WebcamWorker
 
 
 @asynccontextmanager
@@ -42,6 +47,7 @@ async def lifespan(app):
     try:
         yield
     finally:
+        await asyncio.to_thread(webcam_worker.shutdown)
         coaching_task.cancel()
         try:
             await coaching_task
@@ -59,9 +65,12 @@ async def lifespan(app):
 app = FastAPI(title='CindySense API', version='0.1.0', lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=['http://localhost:5173', 'http://127.0.0.1:5173'],
+    allow_origins=[
+        'http://localhost:5173', 'http://127.0.0.1:5173',
+        'http://localhost:5174', 'http://127.0.0.1:5174',
+    ],
     allow_credentials=False,
-    allow_methods=['GET', 'POST'],
+    allow_methods=['GET', 'POST', 'OPTIONS'],
     allow_headers=['*'],
 )
 
@@ -71,8 +80,70 @@ simulation_publisher = SimulationPublisher()
 workout_snapshot = WorkoutSnapshot()
 notification_hub = NotificationHub()
 coaching_jobs = CoachingJobs(os.getenv('CINDYSENSE_COACHING_DB', 'data/cindypt_jobs.sqlite3'))
+webcam_worker = WebcamWorker()
 notification_hub.on_summary = coaching_jobs.enqueue
 recommendation_lock = asyncio.Lock()
+
+
+def local_webcam_request(request):
+    if request.client is None or request.client.host not in ('127.0.0.1', '::1', 'localhost', 'testserver'):
+        raise HTTPException(status_code=403, detail='Webcam control and preview require a local client.')
+
+
+@app.get('/api/workout/webcam-worker')
+async def webcam_worker_status(request: Request):
+    local_webcam_request(request)
+    return webcam_worker.status()
+
+
+@app.post('/api/workout/webcam-worker/start')
+async def start_webcam_worker(request: Request):
+    local_webcam_request(request)
+    try:
+        return webcam_worker.start(event_origin=os.getenv('CINDYSENSE_EVENT_ORIGIN'),
+                                   summary_origin=os.getenv('CINDYSENSE_SUMMARY_ORIGIN'),
+                                   base_url=settings.base_url)
+    except ValueError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.post('/api/workout/webcam-worker/stop')
+async def stop_webcam_worker(request: Request):
+    local_webcam_request(request)
+    return webcam_worker.request_stop()
+
+
+@app.get('/api/workout/webcam-worker/preview')
+async def webcam_worker_preview(request: Request):
+    local_webcam_request(request)
+    if webcam_worker.status().get('state') not in ('running', 'starting', 'stopping'):
+        raise HTTPException(status_code=404, detail='No active webcam preview.')
+
+    async def frames():
+        previous = None
+        next_status_check = 0.0
+        while True:
+            if await request.is_disconnected():
+                break
+            path = webcam_worker.frame_path()
+            try:
+                frame = path.read_bytes() if path else None
+            except OSError:
+                frame = None
+            if frame and frame != previous:
+                previous = frame
+                yield b'--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ' + str(len(frame)).encode() + b'\r\n\r\n' + frame + b'\r\n'
+            now = time.monotonic()
+            if now >= next_status_check:
+                if webcam_worker.status().get('state') not in ('running', 'starting', 'stopping'):
+                    break
+                next_status_check = now + 0.5
+            # Poll the latest file frequently enough to keep browser frame age
+            # below the preview worker interval without retaining a backlog.
+            await asyncio.sleep(0.05)
+
+    return StreamingResponse(frames(), media_type='multipart/x-mixed-replace; boundary=frame',
+                             headers={'Cache-Control': 'no-store'})
 
 
 @app.post('/api/onem2m/notify/{token}')
@@ -332,7 +403,30 @@ async def simulate_repetition_event(
 
 @app.get('/api/workout/history')
 async def workout_history():
-    return {'available': False, 'source': None, 'sessions': [], 'message': 'Workout history is not connected to a verified oneM2M resource yet.'}
+    try:
+        observed = await fatigue_history_cache.read(tinyiot, settings.repetition_resource, settings.workout_origin)
+        summaries = await read_summaries(tinyiot, settings.workout_summary_resource, settings.cindypt_origin)
+        goal = await read_goal(tinyiot, settings.target_plan_resource, settings.cindypt_origin)
+        return build_history(observed, summaries, goal)
+    except TinyIoTError as exc:
+        raise api_error(exc) from exc
+
+
+@app.get('/api/workout/performance')
+async def workout_performance(sessionId: str | None = Query(default=None, min_length=1, max_length=100)):
+    try:
+        observed = await fatigue_history_cache.read(
+            tinyiot, settings.repetition_resource, settings.workout_origin,
+            selected_session_id=sessionId)
+        selected = next((item for item in observed['availableSessions']
+                         if item['sessionId'] == observed['selectedSessionId']), None)
+        return {'available': selected is not None,
+                'sessionId': observed['selectedSessionId'],
+                'performance': selected['performance'] if selected else None,
+                'selectionError': observed['selectionError'],
+                'source': 'validated retained TinyIoT repetition events'}
+    except TinyIoTError as exc:
+        raise api_error(exc) from exc
 
 
 @app.get('/api/cindypt/recommendations')
@@ -383,9 +477,12 @@ async def set_cindypt_goal(goal: Goal):
 async def _cindypt_progress():
     goal = await read_goal(tinyiot, settings.target_plan_resource, settings.cindypt_origin)
     if goal is None:
-        return {'available': False, 'goal': None, 'workout': None, 'message': 'No Cindy goal is stored.'}
+        return {'available': False, 'goal': None, 'workout': None, 'latestWorkout': None,
+                'coachingWorkout': None, 'selectionStatus': 'insufficient_data',
+                'message': 'No Cindy goal is stored.'}
     summaries = await read_summaries(tinyiot, settings.workout_summary_resource, settings.cindypt_origin)
-    return analyze(goal, summaries[0] if summaries else None)
+    observed = await fatigue_history_cache.read(tinyiot, settings.repetition_resource, settings.workout_origin)
+    return select_workout(build_history(observed, summaries, goal), summaries, goal)
 
 
 @app.get('/api/cindypt/progress')
@@ -402,7 +499,8 @@ async def current_cindypt_recommendation():
     try:
         progress = await _cindypt_progress()
         if not progress['available']:
-            return {'available': False, 'recommendations': None, 'message': progress['message']}
+            return {'available': False, 'recommendations': None,
+                    'message': progress.get('selectionReason') or progress.get('message')}
         return {'available': True, 'recommendations': recommend(progress), 'source': 'rule-based-preview'}
     except TinyIoTError as exc:
         raise api_error(exc) from exc
@@ -413,19 +511,27 @@ async def generate_cindypt_recommendation():
     try:
         async with recommendation_lock:
             progress = await _cindypt_progress()
-            if not progress['available']:
-                raise HTTPException(status_code=409, detail={'code': 'insufficient_data', 'message': progress['message']})
+            if not progress['available'] or progress.get('selectionStatus') != 'sufficient':
+                raise HTTPException(status_code=409, detail={'code': progress.get('selectionStatus', 'insufficient_data'),
+                                                             'message': progress.get('selectionReason') or progress.get('message')})
             advice = recommend(progress)
+            goal_content, goal_instance = await tinyiot.latest_content(settings.target_plan_resource,
+                                                                        settings.cindypt_origin)
             try:
-                existing, _ = await tinyiot.latest_content(settings.recommendations_resource, settings.cindypt_origin)
-            except TinyIoTError as exc:
-                if exc.code != 'resource_not_found':
-                    raise
-                existing = None
-            if existing != advice:
-                await tinyiot.create_content(settings.recommendations_resource, settings.cindypt_origin, advice)
+                current_goal = Goal.model_validate(goal_content).model_dump()
+            except ValidationError as exc:
+                raise TinyIoTError('invalid_content', 'Stored goal is malformed.', 502) from exc
+            if current_goal != progress['goal']:
+                raise HTTPException(status_code=409, detail={'code': 'stale_goal', 'message': 'The goal changed. Retry with the latest goal.'})
+            goal_version = str(goal_instance.get('ri') or goal_instance.get('ct') or '')
+            if not goal_version:
+                raise TinyIoTError('goal_version_missing', 'Goal has no stable version.', 502)
+            advice['goalVersion'] = goal_version
+            key = json.dumps([progress['workout']['workoutId'], goal_version], separators=(',', ':'))
+            created = await tinyiot.create_named_recommendation(settings.recommendations_resource,
+                                                                 settings.cindypt_origin, key, advice)
             return {'recommendations': advice, 'resource_path': settings.recommendations_resource,
-                    'alreadySaved': existing == advice}
+                    'alreadySaved': not created}
     except TinyIoTError as exc:
         raise api_error(exc) from exc
 
@@ -435,7 +541,11 @@ async def _weekly_preview(preferences: PlanPreferences):
     if goal is None:
         raise HTTPException(status_code=409, detail={'code': 'missing_goal', 'message': 'Save a Cindy goal before planning.'})
     summaries = await read_summaries(tinyiot, settings.workout_summary_resource, settings.cindypt_origin)
-    return generate_weekly_plan(goal, summaries, preferences)
+    observed = await fatigue_history_cache.read(tinyiot, settings.repetition_resource, settings.workout_origin)
+    history = build_history(observed, summaries, goal)
+    qualified = {row['sessionId'] for row in history['sessions'] if row['comparable'] and row['summaryVerified']
+                 and row['eventCount'] >= 30 and row['suitable']}
+    return generate_weekly_plan(goal, [item for item in summaries if item['workoutId'] in qualified], preferences)
 
 
 @app.post('/api/cindypt/plans/preview')

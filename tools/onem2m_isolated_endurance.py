@@ -6,6 +6,7 @@ The script refuses every port except the isolated Phase 6/7 port 3101.
 """
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import json
 import re
 import statistics
@@ -19,6 +20,8 @@ from urllib.request import Request, urlopen
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--seconds', type=int, default=1200)
+    parser.add_argument('--expected-server-exe',
+                        help='Absolute isolated server executable; required when production port is active')
     args = parser.parse_args()
     if not 1 <= args.seconds <= 1200:
         parser.error('duration must be 1..1200 seconds')
@@ -26,6 +29,7 @@ def main():
     ae = 'Phase7Endurance_' + uuid.uuid4().hex[:10]
     results = {'duration_requested_seconds': args.seconds, 'ae': ae,
                'write': {'ok': 0, 'failed': 0}, 'read': {'ok': 0, 'failed': 0},
+               'discovery_cin_pair': {'ok': 0, 'failed': 0},
                'samples': [], 'status': 'running'}
     latencies = []
 
@@ -50,9 +54,17 @@ def main():
     def metrics():
         ss = subprocess.run(['wsl.exe', '-e', 'ss', '-ltnp'], capture_output=True, text=True).stdout
         match = re.search(r':3101\s+.*pid=(\d+)', ss)
-        if not match or re.search(r':3001\s', ss):
-            raise RuntimeError('isolated server missing or production port active')
+        if not match:
+            raise RuntimeError('isolated server missing')
         pid = match.group(1)
+        if re.search(r':3001\s', ss):
+            if not args.expected_server_exe:
+                raise RuntimeError('production port active; isolated executable not verified')
+            actual_exe = subprocess.run(['wsl.exe', '-e', 'readlink', '-f',
+                                         f'/proc/{pid}/exe'], capture_output=True,
+                                        text=True, check=True).stdout.strip()
+            if actual_exe != args.expected_server_exe:
+                raise RuntimeError(f'unexpected isolated executable: {actual_exe}')
         def count(path):
             output = subprocess.run(['wsl.exe', '-e', 'ls', path],
                                     capture_output=True, text=True, check=True).stdout
@@ -91,7 +103,8 @@ def main():
         next_read = start
         next_sample = start + 60
         index = 0
-        while time.monotonic() - start < args.seconds:
+        with ThreadPoolExecutor(max_workers=2) as pair_pool:
+          while time.monotonic() - start < args.seconds:
             now = time.monotonic()
             if now >= next_write:
                 index += 1
@@ -109,6 +122,15 @@ def main():
                     results['read']['ok' if status == (200, '2000') else 'failed'] += 1
                 except Exception:
                     results['read']['failed'] += 1
+                if index:
+                    try:
+                        paths = [ae + '/PoseSamples?fu=1',
+                                 ae + f'/PoseSamples/sample_{index:05}']
+                        statuses = list(pair_pool.map(lambda path: request('GET', path), paths))
+                        key = 'ok' if all(status == (200, '2000') for status in statuses) else 'failed'
+                        results['discovery_cin_pair'][key] += 1
+                    except Exception:
+                        results['discovery_cin_pair']['failed'] += 1
                 next_read += 2.0
             if now >= next_sample:
                 sample = metrics()
@@ -122,7 +144,7 @@ def main():
                     break
                 next_sample += 60
             time.sleep(0.05)
-        else:
+          else:
             results['status'] = 'completed'
         results['elapsed_seconds'] = round(time.monotonic() - start, 1)
         results['final_metrics'] = metrics()
@@ -134,7 +156,8 @@ def main():
         results['cleanup_delete'] = request('DELETE', ae)
         results['cleanup_absent'] = request('GET', ae)
         print(json.dumps({'result': results}), flush=True)
-    if (results['status'] != 'completed' or results['write']['failed'] or results['read']['failed']):
+    if (results['status'] != 'completed' or results['write']['failed']
+            or results['read']['failed'] or results['discovery_cin_pair']['failed']):
         raise SystemExit(1)
 
 

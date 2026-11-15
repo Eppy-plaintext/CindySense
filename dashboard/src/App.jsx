@@ -1,18 +1,21 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
-import { ConnectionStatus, HistoryAvailability, StoredRepetitionPanel } from './components/ApiPanels.jsx'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { ConnectionStatus, StoredRepetitionPanel } from './components/ApiPanels.jsx'
 import { CindyPtPage } from './components/CindyPtPage.jsx'
 import { FatiguePanel } from './components/FatiguePanel.jsx'
+import { PerformanceMonitor } from './components/PerformanceMonitor.jsx'
+import { StoredHistoryPage } from './components/StoredHistoryPage.jsx'
 import { usePolling } from './hooks/usePolling.js'
-import { getBackendHealth, getLatestRepetition, getWebcamStatus, getWorkoutFatigue, getWorkoutHistory, getWorkoutSnapshot, integrationEventUrl } from './services/api.js'
+import { getBackendHealth, getLatestRepetition, getWebcamStatus, getWebcamWorker, getWorkoutFatigue, getWorkoutHistory, getWorkoutSnapshot, integrationEventUrl, startWebcamWorker, stopWebcamWorker, webcamPreviewUrl } from './services/api.js'
 import { acceptSnapshot, liveDisplay } from './services/workoutDisplay.js'
+import { canStartWebcamWorker, webcamWorkoutDisplay } from './services/webcamDisplay.js'
 import { VoiceCoach, handleLocalVoiceEvent } from './services/voiceCoach.js'
 import './App.css'
 
 const WORKOUT_SECONDS = 20 * 60
 const EXERCISES = [
-  { key: 'pullUps', label: 'Pull-ups', target: 5, color: 'orange', icon: '↑' },
-  { key: 'pushUps', label: 'Push-ups', target: 10, color: 'blue', icon: '↓' },
-  { key: 'squats', label: 'Squats', target: 15, color: 'violet', icon: '◒' },
+  { key: 'pullUps', label: 'Pull-ups', target: 5, color: 'orange', icon: 'â†‘' },
+  { key: 'pushUps', label: 'Push-ups', target: 10, color: 'blue', icon: 'â†“' },
+  { key: 'squats', label: 'Squats', target: 15, color: 'violet', icon: 'â—’' },
 ]
 const INITIAL_REPS = { pullUps: 0, pushUps: 0, squats: 0 }
 
@@ -44,6 +47,10 @@ function App() {
   const [repetitionRevision, setRepetitionRevision] = useState(0)
   const [summaryRevision, setSummaryRevision] = useState(0)
   const [displayMode, setDisplayMode] = useState('webcam')
+  const [workerRevision, setWorkerRevision] = useState(0)
+  const [workerAction, setWorkerAction] = useState({ busy: false, error: '', stopRequestedAt: null })
+  const [lastKnownWorker, setLastKnownWorker] = useState(null)
+  const workerActionLock = useRef(false)
   const [now, setNow] = useState(() => Date.now())
   const [voicePreferences, setVoicePreferences] = useState(() => {
     try { return { enabled: true, volume: 0.8, rate: 1, ...JSON.parse(localStorage.getItem('cindysense.voice') || '{}') } }
@@ -73,6 +80,28 @@ function App() {
   const liveResult = usePolling(getLatestRepetition, { enabled: activePage === 'dashboard' })
   const snapshotResult = usePolling(getLiveSnapshot, { enabled: activePage === 'dashboard', intervalMs: 2000, refreshKey: repetitionRevision })
   const webcamStatus = usePolling(getWebcamStatus, { enabled: activePage === 'dashboard' && displayMode === 'webcam', intervalMs: 1500 })
+  const pollWebcamWorker = useCallback(async (options) => {
+    const result = await getWebcamWorker(options)
+    setLastKnownWorker(result)
+    return result
+  }, [])
+  const webcamWorker = usePolling(pollWebcamWorker, { enabled: activePage === 'dashboard' && displayMode === 'webcam', intervalMs: 500, refreshKey: workerRevision })
+  async function controlWebcam(action) {
+    if (workerActionLock.current) return
+    workerActionLock.current = true
+    setWorkerAction({ busy: true, error: '', stopRequestedAt: action === 'stop' ? Date.now() : null })
+    try {
+      if (action === 'start') voiceCoach.unlock()
+      const result = await (action === 'start' ? startWebcamWorker() : stopWebcamWorker())
+      setLastKnownWorker(result)
+      setWorkerRevision((value) => value + 1)
+      setWorkerAction({ busy: false, error: '', stopRequestedAt: action === 'stop' ? Date.now() : null })
+    } catch (error) {
+      setWorkerAction({ busy: false, error: error.message, stopRequestedAt: null })
+    } finally {
+      workerActionLock.current = false
+    }
+  }
   const fatigueSessionId = displayMode === 'webcam' ? liveDisplay(lastSnapshot, displayMode, now)?.sessionId : null
   const getFatigue = useCallback(({ signal }) => getWorkoutFatigue(fatigueSessionId, { signal }), [fatigueSessionId])
   const fatigueResult = usePolling(getFatigue, { enabled: activePage === 'dashboard' && Boolean(fatigueSessionId), intervalMs: 5000, refreshKey: repetitionRevision })
@@ -152,22 +181,42 @@ function App() {
         {[['dashboard', 'Dashboard', 'dashboard'], ['history', 'Workout history', 'history'], ['pt', 'Cindy PT', 'spark']].map(([page, label, icon]) => <button key={page} className={`nav-item ${activePage === page ? 'active' : ''}`} onClick={() => setActivePage(page)}><Icon name={icon} /><span>{label}</span>{page === 'dashboard' && <i>{displayMode === 'demo' ? 'DEMO' : 'LIVE'}</i>}</button>)}
         <p className="nav-label nav-label-spaced">System</p><button className="nav-item"><Icon name="settings" /><span>Settings</span></button>
       </nav>
-      <div className="hardware-card"><div className="hardware-top"><span className="hardware-icon">⌁</span><span className="connected">{displayMode === 'demo' ? 'Demo hardware' : 'Live workout source'}</span></div><strong>{displayMode === 'webcam' ? 'Webcam pose detector' : 'ESP32 sensor kit'}</strong><span>{displayMode === 'webcam' ? 'MediaPipe pose' : 'MPU6050 motion sensor'}</span><div className="signal"><span></span><span></span><span></span><span></span><small>{displayMode === 'demo' ? 'Simulated signal' : 'TinyIoT events'}</small></div></div>
-      <div className="user-card"><div className="avatar">JD</div><div><strong>Jordan Davis</strong><span>CrossFit athlete</span></div><button aria-label="Open profile">•••</button></div>
+      <div className="hardware-card"><div className="hardware-top"><span className="hardware-icon">âŒ</span><span className="connected">{displayMode === 'demo' ? 'Demo hardware' : 'Live workout source'}</span></div><strong>{displayMode === 'webcam' ? 'Webcam pose detector' : 'ESP32 sensor kit'}</strong><span>{displayMode === 'webcam' ? 'MediaPipe pose' : 'MPU6050 motion sensor'}</span><div className="signal"><span></span><span></span><span></span><span></span><small>{displayMode === 'demo' ? 'Simulated signal' : 'TinyIoT events'}</small></div></div>
+      <div className="user-card"><div className="avatar">JD</div><div><strong>Jordan Davis</strong><span>CrossFit athlete</span></div><button aria-label="Open profile">â€¢â€¢â€¢</button></div>
     </aside>
     <main className="main-content">
       <header className="topbar"><div className="mobile-brand"><div className="brand-mark"><span></span><span></span><span></span></div><strong>Cindy<span>Sense</span></strong></div><div className="breadcrumb"><span>Workspace</span><span>/</span><strong>{activePage === 'dashboard' ? 'Workout dashboard' : activePage === 'history' ? 'Workout history' : 'Cindy PT'}</strong></div><ConnectionStatus result={healthResult} /></header>
       <nav className="mobile-nav" aria-label="Mobile navigation">{[['dashboard', 'Dashboard'], ['history', 'History'], ['pt', 'Cindy PT']].map(([page, label]) => <button key={page} className={activePage === page ? 'active' : ''} onClick={() => setActivePage(page)}>{label}</button>)}</nav>
-      {activePage === 'dashboard' && <Dashboard secondsLeft={secondsLeft} formatTime={formatTime} timerProgress={timerProgress} workoutState={workoutState} setWorkoutState={setWorkoutState} resetWorkout={resetWorkout} reps={reps} rounds={rounds} activeExercise={activeExercise} setActiveExercise={setActiveExercise} incrementRep={incrementRep} currentExercise={currentExercise} autoSimulate={autoSimulate} setAutoSimulate={setAutoSimulate} liveResult={liveResult} snapshotResult={snapshotResult} webcamStatus={webcamStatus} lastSnapshot={lastSnapshot} displayMode={displayMode} setDisplayMode={setDisplayMode} now={now} voicePreferences={voicePreferences} setVoicePreferences={setVoicePreferences} voiceCoach={voiceCoach} fatigueResult={fatigueResult} fatigueSessionId={fatigueSessionId} />}
-      {activePage === 'history' && <><div className="view-data-slot"><HistoryAvailability result={historyResult} /><p className="demo-section-label">SIMULATED HISTORY EXAMPLES BELOW</p></div><HistoryPage /></>}
+      {activePage === 'dashboard' && <Dashboard secondsLeft={secondsLeft} formatTime={formatTime} timerProgress={timerProgress} workoutState={workoutState} setWorkoutState={setWorkoutState} resetWorkout={resetWorkout} reps={reps} rounds={rounds} activeExercise={activeExercise} setActiveExercise={setActiveExercise} incrementRep={incrementRep} currentExercise={currentExercise} autoSimulate={autoSimulate} setAutoSimulate={setAutoSimulate} liveResult={liveResult} snapshotResult={snapshotResult} webcamStatus={webcamStatus} webcamWorker={webcamWorker} lastKnownWorker={lastKnownWorker} workerAction={workerAction} controlWebcam={controlWebcam} lastSnapshot={lastSnapshot} displayMode={displayMode} setDisplayMode={setDisplayMode} now={now} voicePreferences={voicePreferences} setVoicePreferences={setVoicePreferences} voiceCoach={voiceCoach} fatigueResult={fatigueResult} fatigueSessionId={fatigueSessionId} />}
+      {activePage === 'history' && <StoredHistoryPage result={historyResult} />}
       {activePage === 'pt' && <CindyPtPage summaryRevision={summaryRevision} />}
     </main>
   </div>
 }
 
-function Dashboard({ secondsLeft, formatTime, timerProgress, workoutState, setWorkoutState, resetWorkout, reps, rounds, activeExercise, setActiveExercise, incrementRep, currentExercise, autoSimulate, setAutoSimulate, liveResult, snapshotResult, webcamStatus, lastSnapshot, displayMode, setDisplayMode, now, voicePreferences, setVoicePreferences, voiceCoach, fatigueResult, fatigueSessionId }) {
+function WebcamPreview() {
+  const [preview, setPreview] = useState('loading')
+  useEffect(() => {
+    const timeout = window.setTimeout(() => setPreview((current) => current === 'loading' ? 'timeout' : current), 10000)
+    return () => window.clearTimeout(timeout)
+  }, [])
+  return <div className="webcam-preview-panel" aria-label="Live webcam preview">
+    {preview !== 'ready' && <p className="webcam-preview-message" role={preview === 'loading' ? 'status' : 'alert'}>
+      {preview === 'loading' ? 'Opening camera and waiting for the first frameâ€¦' :
+        preview === 'timeout' ? 'No camera frames arrived. Check camera permission and worker status.' :
+          'Camera preview disconnected. Check the FastAPI connection and worker status.'}
+    </p>}
+    <img className="webcam-preview" src={webcamPreviewUrl} alt="Live annotated CindySense webcam feed"
+      onLoad={() => setPreview('ready')} onError={() => setPreview('error')} />
+  </div>
+}
+
+function Dashboard({ secondsLeft, formatTime, timerProgress, workoutState, setWorkoutState, resetWorkout, reps, rounds, activeExercise, setActiveExercise, incrementRep, currentExercise, autoSimulate, setAutoSimulate, liveResult, snapshotResult, webcamStatus, webcamWorker, lastKnownWorker, workerAction, controlWebcam, lastSnapshot, displayMode, setDisplayMode, now, voicePreferences, setVoicePreferences, voiceCoach, fatigueResult, fatigueSessionId }) {
   const demo = displayMode === 'demo'
-  const live = liveDisplay(lastSnapshot, displayMode, now)
+  const worker = webcamWorker.status === 'success' ? webcamWorker.data : null
+  const workerLive = displayMode === 'webcam' ? webcamWorkoutDisplay(worker) : null
+  const live = workerLive || (displayMode === 'webcam' && worker?.state && worker.state !== 'idle'
+    ? null : liveDisplay(lastSnapshot, displayMode, now))
   const poseStatus = webcamStatus.data
   const poseAge = Date.parse(poseStatus?.detectedAt)
   const poseCurrent = displayMode === 'webcam' && webcamStatus.status === 'success' &&
@@ -182,38 +231,51 @@ function Dashboard({ secondsLeft, formatTime, timerProgress, workoutState, setWo
   const shownProgress = demo ? timerProgress : ((WORKOUT_SECONDS - shownSeconds) / WORKOUT_SECONDS) * 100
   const statusLabel = demo
     ? workoutState === 'running' ? 'Demo in progress' : workoutState === 'paused' ? 'Demo paused' : workoutState === 'complete' ? 'Demo time complete' : 'Demo ready'
-    : snapshotResult.status === 'error' ? 'Source disconnected'
+    : workerLive ? worker.state === 'stopped' ? 'Workout complete' : worker.state === 'stopping' ? 'Finishing workout' : 'Webcam live'
+    : displayMode === 'webcam' && worker?.state === 'starting' ? 'Opening camera'
+    : displayMode === 'webcam' && worker?.state === 'error' ? 'Camera error'
+    : snapshotResult.status === 'error' ? 'Workout data unavailable'
       : !live ? 'Waiting for session' : live.complete ? 'Time complete'
         : live.stale ? 'No recent repetitions' : 'Live session'
   const totalReps = Object.values(shownReps).reduce((a, b) => a + b, 0)
-  return <div className="page-wrap"><section className="page-heading"><div><p className="eyebrow">TUESDAY · OCTOBER 27, 2026</p><h1>Good morning, Jordan <span>✦</span></h1><p className="subheading">Ready to build some momentum? Your next round starts here.</p></div>{demo && <button className="outline-btn" onClick={() => setWorkoutState('running')}><Icon name="play" size={15} /> Quick start</button>}</section>
+  return <div className="page-wrap"><section className="page-heading"><div><p className="eyebrow">TUESDAY Â· OCTOBER 27, 2026</p><h1>Good morning, Jordan <span>âœ¦</span></h1><p className="subheading">Ready to build some momentum? Your next round starts here.</p></div>{demo && <button className="outline-btn" onClick={() => setWorkoutState('running')}><Icon name="play" size={15} /> Quick start</button>}</section>
     {displayMode === 'webcam' && <div className="source-picker"><span>
-      {sessionMismatch ? 'Webcam session changed; waiting for its confirmed events.' :
+      {worker?.state === 'idle' ? 'Webcam idle. Start Workout to open the camera.' :
+        sessionMismatch ? 'Webcam session changed; waiting for its confirmed events.' :
         poseCurrent ? `Detected ${poseStatus.exercise} ${poseStatus.detectedRepetitions ?? '?'} | pending confirmation ${pendingRepetitions ?? '?'} | publisher queue ${poseStatus.eventQueueDepth ?? '?'} | retries ${poseStatus.eventRetries ?? '?'} | overflow ${poseStatus.eventOverflow ?? '?'}` :
           'Webcam pose status stale or disconnected; pending event count unavailable.'}
     </span></div>}
     {!demo && <div className="source-picker"><span>
-      {snapshotResult.status === 'error' ? 'Connection lost; showing the last verified snapshot.' :
-        live ? `Last confirmed event ${new Date(lastSnapshot.sources[displayMode].lastEventAt).toLocaleTimeString()} | backend ${lastSnapshot.retrievalMs ?? '?'} ms${live.stale ? ' | source stale' : ''}${lastSnapshot.retentionAtCapacity ? ' | TinyIoT retention full; older events may be unavailable' : ''}` :
+      {snapshotResult.status === 'error' ? 'Workout snapshot unavailable; showing the last verified snapshot.' :
+        live && lastSnapshot?.sources?.[displayMode] ? `Last confirmed event ${new Date(lastSnapshot.sources[displayMode].lastEventAt).toLocaleTimeString()} | backend ${lastSnapshot.retrievalMs ?? '?'} ms${live.stale ? ' | source stale' : ''}${lastSnapshot.retentionAtCapacity ? ' | TinyIoT retention full; older events may be unavailable' : ''}` :
           'Waiting for a confirmed repetition event.'}
     </span></div>}
     <div className="source-picker" role="group" aria-label="Workout data source">
       {[['webcam', 'Webcam live'], ['mpu6050', 'ESP32 live'], ['demo', 'Demo Mode']].map(([mode, label]) => <button key={mode} className={displayMode === mode ? 'active' : ''} onClick={() => setDisplayMode(mode)} aria-pressed={displayMode === mode}>{label}</button>)}
-      {!demo && <span>{snapshotResult.status === 'error' ? `Connection lost: ${snapshotResult.error}. Showing last verified session.` : live ? `Session ${live.sessionId}${live.startInferred ? ' · timer starts at first stored event' : ''}${!live.coverageComplete ? ' · partial exercise coverage' : ''}` : 'Waiting for a stored session'}</span>}
+      {!demo && <span>{snapshotResult.status === 'error' ? `Workout snapshot request failed: ${snapshotResult.error}. Showing last verified session.` : live ? `Session ${live.sessionId}${live.startInferred ? ' Â· timer starts at first stored event' : ''}${!live.coverageComplete ? ' Â· partial exercise coverage' : ''}` : 'Waiting for a stored session'}</span>}
     </div>
-    <section className="voice-controls panel" aria-label="Voice Coach controls"><div><p className="eyebrow">AUDIO FEEDBACK</p><h2>Voice Coach</h2><small>{displayMode === 'webcam' ? 'Local webcam events · open this dashboard on the webcam computer' : 'Voice feedback currently uses the local webcam event stream'}</small></div><label><input type="checkbox" checked={voicePreferences.enabled} onChange={(event) => { if (!event.target.checked) voiceCoach.clear(); setVoicePreferences((old) => ({ ...old, enabled: event.target.checked })) }} /> ON</label><label>Volume <input aria-label="Voice volume" type="range" min="0" max="1" step="0.1" value={voicePreferences.volume} onChange={(event) => setVoicePreferences((old) => ({ ...old, volume: Number(event.target.value) }))} /></label><label>Speed <input aria-label="Voice speed" type="range" min="0.7" max="1.3" step="0.1" value={voicePreferences.rate} onChange={(event) => setVoicePreferences((old) => ({ ...old, rate: Number(event.target.value) }))} /></label></section>
+    {displayMode === 'webcam' && <section className="webcam-panel panel" aria-label="Webcam workout controls">
+      <div className="panel-header"><div><p className="eyebrow">LOCAL CAMERA</p><h2>Webcam workout</h2></div><span className="stored-tag">{worker?.state === 'idle' ? 'Webcam Idle' : worker?.state || (webcamWorker.status === 'error' ? 'unavailable' : 'checking')}</span></div>
+      <div className="webcam-actions">
+        <button className="control-btn primary" onClick={() => controlWebcam('start')} disabled={workerAction.busy || !canStartWebcamWorker(worker)}>Start Workout</button>
+        <button className="control-btn secondary" onClick={() => controlWebcam('stop')} disabled={workerAction.busy || (worker && ['idle', 'stopped', 'completed'].includes(worker.state))}>Stop Workout</button>
+        <span role="status">{workerAction.error || (workerAction.stopRequestedAt && worker?.state === 'stopped' ? `Stopped. Summary: ${worker.summaryPublication || 'unconfirmed'}` : null) ||
+          (workerAction.stopRequestedAt && now - workerAction.stopRequestedAt > 15000 && worker?.state !== 'stopped' ? `Failed to stop promptly. Worker PID ${worker?.pid || lastKnownWorker?.pid || 'unknown'}; retry Stop Workout or inspect the worker log.` : null) ||
+          (workerAction.stopRequestedAt ? 'Stopping webcam and saving the completed workoutâ€¦' : null) || worker?.message ||
+          (webcamWorker.status === 'error' ? `${webcamWorker.error} Last known PID ${lastKnownWorker?.pid || 'unknown'}.` : `Camera ${worker?.state || 'checking'}`)}</span>
+      </div>
+      {['starting', 'running', 'stopping'].includes(worker?.state) && <WebcamPreview key={worker.sessionId || worker.pid || 'starting'} />}
+      {worker?.state && ['starting', 'running', 'stopping'].includes(worker.state) && <p className="camera-guidance">Camera positioning: {worker.positioning || 'Checking required jointsâ€¦'}</p>}
+      {worker?.sessionId && <p className="pt-message">Session {worker.sessionId} Â· confirmed repetitions appear in the TinyIoT snapshot below.</p>}
+    </section>}
+    <section className="voice-controls panel" aria-label="Voice Coach controls"><div><p className="eyebrow">AUDIO FEEDBACK</p><h2>Voice Coach</h2><small>{displayMode === 'webcam' ? 'Local webcam events Â· open this dashboard on the webcam computer' : 'Voice feedback currently uses the local webcam event stream'}</small></div><label><input type="checkbox" checked={voicePreferences.enabled} onChange={(event) => { if (!event.target.checked) voiceCoach.clear(); setVoicePreferences((old) => ({ ...old, enabled: event.target.checked })) }} /> ON</label><label>Volume <input aria-label="Voice volume" type="range" min="0" max="1" step="0.1" value={voicePreferences.volume} onChange={(event) => setVoicePreferences((old) => ({ ...old, volume: Number(event.target.value) }))} /></label><label>Speed <input aria-label="Voice speed" type="range" min="0.7" max="1.3" step="0.1" value={voicePreferences.rate} onChange={(event) => setVoicePreferences((old) => ({ ...old, rate: Number(event.target.value) }))} /></label></section>
     <div className="hero-grid"><section className="timer-card panel"><div className="panel-header"><div><p className="eyebrow">CINDY AMRAP</p><h2>20-minute engine</h2></div><span className={`session-badge ${demo ? workoutState : live?.complete ? 'complete' : live ? 'running' : 'idle'}`}><span className="status-dot"></span>{statusLabel}</span></div><div className="timer-display"><div className="timer-ring" style={{ '--progress': `${shownProgress * 3.6}deg` }}><div><span>{formatTime(shownSeconds)}</span><small>{shownSeconds === 0 ? 'DONE' : 'REMAINING'}</small></div></div></div><div className="timer-controls">{demo ? <>{workoutState === 'running' ? <button className="control-btn primary" onClick={() => setWorkoutState('paused')}><Icon name="pause" size={16} /> Pause</button> : <button className="control-btn primary" onClick={() => setWorkoutState('running')}><Icon name="play" size={16} /> {workoutState === 'paused' ? 'Resume' : 'Start workout'}</button>}<button className="control-btn secondary" onClick={resetWorkout}><Icon name="rotate" size={16} /> Reset</button></> : <span className="live-timer-note">Timer follows the selected source session</span>}</div><div className="timer-meta"><span><b>20:00</b> target</span><span><b>{Math.round(shownProgress)}%</b> elapsed</span><span><b>AMRAP</b> format</span></div></section>
       <section className="round-card panel"><div className="panel-header"><div><p className="eyebrow">SESSION SCORE</p><h2>Round tracker</h2></div><div className="round-number"><span>ROUND</span><strong>{String(shownRounds + 1).padStart(2, '0')}</strong></div></div><div className="round-progress"><div className="round-progress-top"><span>Current round</span><strong>{Math.round((totalReps / 30) * 100)}%</strong></div><div className="progress-track"><span style={{ width: `${(totalReps / 30) * 100}%` }}></span></div></div><div className="exercise-list">{EXERCISES.map((exercise) => <button className={`exercise-row ${activeExercise === exercise.key ? 'selected' : ''}`} key={exercise.key} onClick={() => setActiveExercise(exercise.key)}><span className={`exercise-icon ${exercise.color}`}>{exercise.icon}</span><span className="exercise-name"><strong>{exercise.label}</strong><small>{shownReps[exercise.key] >= exercise.target ? 'Complete' : `${exercise.target - shownReps[exercise.key]} reps to go`}</small></span><span className="exercise-count"><b>{String(shownReps[exercise.key]).padStart(2, '0')}</b><i>/{exercise.target}</i></span>{shownReps[exercise.key] >= exercise.target && <Icon name="check" size={16} />}</button>)}</div><div className="round-total"><span>Completed rounds</span><strong>{shownRounds}</strong></div></section></div>
     {demo && <section className="rep-console panel"><div className="panel-header"><div><p className="eyebrow">DEMO CONTROLS</p><h2>Simulate movement</h2></div><label className="toggle-label"><span>Auto simulate</span><button className={`toggle ${autoSimulate ? 'on' : ''}`} onClick={() => setAutoSimulate(!autoSimulate)} aria-label="Toggle auto simulate"><span></span></button></label></div><div className="rep-console-body"><div className="focus-exercise"><span className={`exercise-icon ${currentExercise.color}`}>{currentExercise.icon}</span><div><small>ACTIVE MOVEMENT</small><strong>{currentExercise.label}</strong></div></div><button className="rep-btn" onClick={() => incrementRep()} disabled={reps[currentExercise.key] >= currentExercise.target}><span>+1</span> Add {currentExercise.label} rep</button><div className="exercise-shortcuts">{EXERCISES.map((exercise) => <button key={exercise.key} className={activeExercise === exercise.key ? 'active' : ''} onClick={() => { setActiveExercise(exercise.key); incrementRep(exercise.key) }}><span className={`mini-dot ${exercise.color}`}></span>{exercise.label}</button>)}</div></div><p className="demo-note"><Icon name="zap" size={14} /> Timer, exercise counters, and round score are simulated. Stored TinyIoT content below is read-only and does not update this session.</p></section>}
-    {!demo && <FatiguePanel result={fatigueResult} sessionId={fatigueSessionId} live={Boolean(live && !live.stale)} />}
+    {!demo && <><PerformanceMonitor result={fatigueResult} sessionId={fatigueSessionId} /><FatiguePanel result={fatigueResult} sessionId={fatigueSessionId} live={Boolean(live && !live.stale)} /></>}
     <StoredRepetitionPanel result={liveResult} snapshot={lastSnapshot} />
-    <section className="bottom-grid"><div className="insight-card panel"><div className="insight-icon">↗</div><div><p className="eyebrow">TODAY'S INSIGHT</p><h3>Consistency beats intensity.</h3><p>Keep your transitions smooth and save your sprint for the final 3 minutes.</p></div><span className="insight-tag">SIMULATED</span></div><div className="mini-stats panel"><div><span>Last workout</span><strong>4 rounds</strong><small>+1 from average</small></div><div><span>Weekly volume</span><strong>12.4k</strong><small>reps logged</small></div><div><span>Streak</span><strong>06 days</strong><small>Personal best</small></div></div></section>
+    <section className="bottom-grid"><div className="insight-card panel"><div className="insight-icon">â†—</div><div><p className="eyebrow">TODAY'S INSIGHT</p><h3>Consistency beats intensity.</h3><p>Keep your transitions smooth and save your sprint for the final 3 minutes.</p></div><span className="insight-tag">SIMULATED</span></div><div className="mini-stats panel"><div><span>Last workout</span><strong>4 rounds</strong><small>+1 from average</small></div><div><span>Weekly volume</span><strong>12.4k</strong><small>reps logged</small></div><div><span>Streak</span><strong>06 days</strong><small>Personal best</small></div></div></section>
   </div>
-}
-
-function HistoryPage() {
-  const sessions = [['Oct 25, 2026', 'Sunday', '5 rounds + 12 reps', '19:42', 'Completed'], ['Oct 23, 2026', 'Friday', '4 rounds + 21 reps', '20:00', 'Completed'], ['Oct 21, 2026', 'Wednesday', '3 rounds + 28 reps', '20:00', 'Completed'], ['Oct 19, 2026', 'Monday', '4 rounds + 5 reps', '17:36', 'Stopped early']]
-  return <div className="page-wrap"><section className="page-heading"><div><p className="eyebrow">PERFORMANCE LOG</p><h1>Workout history</h1><p className="subheading">A clear view of your work, one session at a time.</p></div><button className="outline-btn"><span>↗</span> Export data</button></section><section className="history-summary">{[['orange', '◒', 'SESSIONS THIS MONTH', '14', '+3 vs. last month'], ['blue', '↗', 'AVERAGE ROUNDS', '4.2', '+0.6 round improvement'], ['violet', '✦', 'BEST SESSION', '5.4', 'Oct 25, 2026']].map((item) => <div className="summary-card panel" key={item[2]}><span className={`summary-symbol ${item[0]}`}>{item[1]}</span><div><small>{item[2]}</small><strong>{item[3]}</strong><span>{item[4]}</span></div></div>)}</section><section className="panel history-panel"><div className="panel-header"><div><p className="eyebrow">RECENT SESSIONS</p><h2>Your training rhythm</h2></div><span className="history-filter">Last 30 days <Icon name="chevron" size={14} /></span></div><div className="history-table"><div className="history-row history-head"><span>DATE</span><span>RESULT</span><span>DURATION</span><span>STATUS</span><span></span></div>{sessions.map((session) => <div className="history-row" key={session[0]}><span><strong>{session[0]}</strong><small>{session[1]}</small></span><span className="result">{session[2]}</span><span className="duration">{session[3]}</span><span><em className={`status-chip ${session[4] === 'Completed' ? 'complete' : 'stopped'}`}>{session[4]}</em></span><button aria-label={`View ${session[0]} workout details`}><Icon name="chevron" size={16} /></button></div>)}</div></section></div>
 }
 
 export default App

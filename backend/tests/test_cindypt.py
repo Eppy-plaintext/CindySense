@@ -1,207 +1,154 @@
 import unittest
-from unittest.mock import patch
-
+from unittest.mock import AsyncMock, patch
 import httpx
-
 from backend import main
 from backend.tinyiot import TinyIoTClient
 
 
 class CindyPTTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.calls = []
-        self.goal = None
-        self.recommendations = []
+        self.goal = {'targetRounds': 5, 'durationSeconds': 1200}
         self.summaries = []
-        self.failure = None
-        self.failure_method = None
+        self.sessions = []
+        self.saved = []
+        self.named = {}
 
         def handle(request):
-            self.calls.append(request)
             path = request.url.path
-            if self.failure and path.endswith(self.failure) and (self.failure_method is None or request.method == self.failure_method):
-                return httpx.Response(500, json={'m2m:dbg': 'failed'})
-            if request.method == 'POST':
-                content = request.read()
+            if request.method == 'POST' and path.endswith('/AIRecommendations'):
                 import json
-                cin = json.loads(content)['m2m:cin']
-                self.assertEqual(request.headers['Content-Type'], 'application/json;ty=4')
-                self.assertEqual(cin['cnf'], 'application/json:0')
+                cin = json.loads(request.content)['m2m:cin']
                 stored = json.loads(cin['con'])
-                if path.endswith('/FitnessGoals'):
-                    self.goal = stored
-                elif path.endswith('/AIRecommendations'):
-                    self.recommendations.append(stored)
-                return httpx.Response(201, json={'m2m:cin': {'ri': 'new'}})
+                self.saved.append(stored)
+                self.named[cin['rn']] = stored
+                return httpx.Response(201, json={'m2m:cin': {'ri': 'saved'}})
             if request.url.params.get('rcn') == '6':
                 return httpx.Response(200, json={'m2m:rrl': {'rrf': [
-                    {'typ': 4, 'val': f'TinyIoT/CindySense_AE/WorkoutSummary/{index}'}
-                    for index in range(len(self.summaries) - 1, -1, -1)]}})
+                    {'typ': 4, 'val': f'TinyIoT/CindySense_AE/WorkoutSummary/{i}'}
+                    for i in range(len(self.summaries))]}})
             if path.endswith(('/FitnessGoals', '/WorkoutSummary', '/AIRecommendations')):
                 return httpx.Response(200, json={'m2m:cnt': {'cni': len(self.summaries)}})
             if path.endswith('/FitnessGoals/la'):
-                return httpx.Response(200, json={'m2m:cin': {'con': self.goal}}) if self.goal else httpx.Response(404)
+                return httpx.Response(200, json={'m2m:cin': {'con': self.goal, 'ri': 'goal-1'}})
             if '/WorkoutSummary/' in path:
-                index = int(path.rsplit('/', 1)[-1])
-                return httpx.Response(200, json={'m2m:cin': {'con': self.summaries[index], 'ct': f'20261107T12000{index}', 'ri': str(index)}})
+                i = int(path.rsplit('/', 1)[-1])
+                return httpx.Response(200, json={'m2m:cin': {'con': self.summaries[i], 'ri': str(i),
+                                                             'ct': f'20261116T12000{i}'}})
             if path.endswith('/AIRecommendations/la'):
-                return httpx.Response(200, json={'m2m:cin': {'con': self.recommendations[-1]}}) if self.recommendations else httpx.Response(404)
+                return httpx.Response(200, json={'m2m:cin': {'con': self.saved[-1]}}) if self.saved else httpx.Response(404)
+            if '/AIRecommendations/' in path:
+                name = path.rsplit('/', 1)[-1]
+                return httpx.Response(200, json={'m2m:cin': {'rn': name, 'con': self.named[name]}}) if name in self.named else httpx.Response(404)
             return httpx.Response(404)
 
         self.upstream = httpx.AsyncClient(transport=httpx.MockTransport(handle))
         self.api = httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url='http://testserver')
-        self.client_patch = patch.object(main, 'tinyiot', TinyIoTClient('http://localhost:3000/TinyIoT', self.upstream))
-        self.settings_patch = patch.object(main, 'settings', main.settings.__class__(
-            cindypt_origin='pt-origin', workout_summary_resource='CindySense_AE/WorkoutSummary',
-            target_plan_resource='CindyPT_AE/FitnessGoals', recommendations_resource='CindyPT_AE/AIRecommendations'))
-        self.client_patch.start()
-        self.settings_patch.start()
+        self.patches = [patch.object(main, 'tinyiot', TinyIoTClient('http://mock/TinyIoT', self.upstream)),
+                        patch.object(main, 'fatigue_history_cache'),
+                        patch.object(main, 'settings', main.settings.__class__(
+                            cindypt_origin='pt-origin', workout_summary_resource='CindySense_AE/WorkoutSummary',
+                            target_plan_resource='CindyPT_AE/FitnessGoals',
+                            recommendations_resource='CindyPT_AE/AIRecommendations'))]
+        for item in self.patches:
+            item.start()
+        async def observed(*args, **kwargs):
+            return {'availableSessions': self.sessions, 'retainedInstanceCount': sum(x['eventCount'] for x in self.sessions),
+                    'exclusionReasons': {}}
+        main.fatigue_history_cache.read = AsyncMock(side_effect=observed)
 
     async def asyncTearDown(self):
-        self.client_patch.stop()
-        self.settings_patch.stop()
+        for item in reversed(self.patches):
+            item.stop()
         await self.api.aclose()
         await self.upstream.aclose()
 
-    async def test_goal_progress_deduplication_and_stored_rule_based_advice(self):
-        response = await self.api.post('/api/cindypt/goal', json={'targetRounds': 7, 'durationSeconds': 1200})
-        self.assertEqual(response.status_code, 201)
-        self.summaries = [
-            {'workoutId': 'w1', 'rounds': 5, 'durationSeconds': 1200, 'reps': {'pullup': 25}, 'status': 'completed'},
-            {'workoutId': 'w1', 'rounds': 5, 'durationSeconds': 1200, 'reps': {'pullup': 25}, 'status': 'completed'},
-            {'workoutId': 'w2', 'rounds': 6, 'durationSeconds': 1180, 'reps': {'pullup': 30, 'pushup': 60, 'squat': 90}, 'status': 'completed'},
-        ]
-        progress = (await self.api.get('/api/cindypt/progress')).json()
-        self.assertEqual(progress['workout']['workoutId'], 'w2')
-        self.assertEqual(progress['workout']['reps']['pushup'], 60)
-        self.assertEqual(progress['roundsRemaining'], 1)
-        self.assertFalse(progress['goalAchieved'])
-        generated = await self.api.post('/api/cindypt/recommendations/generate')
-        self.assertEqual(generated.status_code, 201)
-        self.assertEqual(self.recommendations[0]['source'], 'rule-based')
-        self.assertEqual(self.recommendations[0]['sourceWorkoutId'], 'w2')
-        self.assertEqual((await self.api.get('/api/cindypt/recommendations')).json()['recommendations'], self.recommendations[0])
-        repeated = await self.api.post('/api/cindypt/recommendations/generate')
-        self.assertTrue(repeated.json()['alreadySaved'])
-        self.assertEqual(len(self.recommendations), 1)
-        self.assertTrue(all(call.headers['X-M2M-Origin'] == 'pt-origin' for call in self.calls))
-        self.assertFalse(any(call.url.path.endswith(('/CindyPT_AE', '/CindySense_AE')) and call.method == 'POST' for call in self.calls))
+    def session(self, identity, counts=None, at='2026-11-16T12:00:00+00:00'):
+        counts = counts or {'pullup': 15, 'pushup': 30, 'squat': 45}
+        return {'sessionId': identity, 'exerciseCounts': counts, 'eventCount': sum(counts.values()),
+                'firstEventAt': at, 'lastEventAt': at, 'suitable': all(counts.values()),
+                'performance': {'state': 'stable_performance', 'detectorQuality': 'unverified',
+                                'exercises': {}, 'estimatedRestGaps': []}}
 
-    async def test_new_completed_workout_replaces_historical_progress_and_can_generate_new_advice(self):
-        self.goal = {'targetRounds': 7, 'durationSeconds': 1200}
-        self.summaries = [
-            {'workoutId': 'historical', 'rounds': 1, 'durationSeconds': 180, 'status': 'completed'},
-            {'workoutId': 'in-progress', 'rounds': 7, 'durationSeconds': 900, 'status': 'running'},
-        ]
-        self.recommendations = [{'source': 'rule-based', 'sourceWorkoutId': 'historical', 'goal': self.goal}]
-        before = (await self.api.get('/api/cindypt/progress')).json()
-        self.assertEqual(before['workout']['workoutId'], 'historical')
+    def summary(self, identity, rounds=3, duration=1200, reason='timer', source='webcam', counts=None):
+        counts = counts or {'pullup': 15, 'pushup': 30, 'squat': 45}
+        return {'sessionId': identity, 'rounds': rounds, 'durationSeconds': duration,
+                'reps': counts, 'status': 'completed', 'source': source, 'completionReason': reason}
 
-        self.summaries.append({
-            'sessionId': 'new-session', 'rounds': 6, 'durationSeconds': 1200,
-            'pullups': 30, 'pushups': 60, 'squats': 90, 'status': 'completed',
-            'completionReason': 'timer',
-        })
-        progress = (await self.api.get('/api/cindypt/progress')).json()
-        self.assertEqual(progress['workout']['workoutId'], 'new-session')
-        self.assertEqual(progress['workout']['roundsCompleted'], 6)
-        self.assertEqual(progress['roundsRemaining'], 1)
-        self.assertEqual((await self.api.get('/api/cindypt/recommendations')).json()['recommendations']['sourceWorkoutId'], 'historical')
+    async def test_full_workout_selected_over_newer_short_test_and_deduplicated(self):
+        short_counts = {'pullup': 1, 'pushup': 0, 'squat': 0}
+        self.sessions = [self.session('short', short_counts, '2026-11-16T13:00:00+00:00'), self.session('full')]
+        self.summaries = [self.summary('full'), self.summary('short', 0, 40, 'explicit_stop', counts=short_counts)]
+        result = (await self.api.get('/api/cindypt/progress')).json()
+        self.assertEqual(result['latestWorkout']['sessionId'], 'short')
+        self.assertEqual(result['coachingWorkout']['sessionId'], 'full')
+        self.assertEqual(result['selectionStatus'], 'sufficient')
+        advice = (await self.api.get('/api/cindypt/recommendations/current')).json()['recommendations']
+        self.assertEqual(advice['sourceWorkoutId'], 'full')
+        self.assertIsNone(advice['proposedTargetRounds'])
+        self.assertEqual(advice['detectorReliability'], 'detector_quality_unknown')
+        self.assertEqual((await self.api.post('/api/cindypt/recommendations/generate')).status_code, 201)
+        self.assertTrue((await self.api.post('/api/cindypt/recommendations/generate')).json()['alreadySaved'])
+        self.assertEqual(len(self.saved), 1)
 
-        generated = await self.api.post('/api/cindypt/recommendations/generate')
-        self.assertEqual(generated.status_code, 201)
-        self.assertEqual(self.recommendations[-1]['sourceWorkoutId'], 'new-session')
-        self.assertEqual(self.recommendations[-1]['roundsCompleted'], 6)
-        self.assertEqual((await self.api.get('/api/cindypt/recommendations')).json()['recommendations'], self.recommendations[-1])
-
-    async def test_current_advice_is_a_read_only_preview_for_latest_summary(self):
-        self.goal = {'targetRounds': 7, 'durationSeconds': 1200}
-        self.summaries = [{'sessionId': 'webcam-session', 'rounds': 2,
-                           'durationSeconds': 1200, 'status': 'completed'}]
-        response = await self.api.get('/api/cindypt/recommendations/current')
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()['recommendations']['sourceWorkoutId'], 'webcam-session')
-        self.assertEqual(self.recommendations, [])
-
-    async def test_missing_goal_or_summary_does_not_generate_data(self):
-        self.assertFalse((await self.api.get('/api/cindypt/goal')).json()['available'])
-        self.assertFalse((await self.api.get('/api/cindypt/recommendations')).json()['available'])
-        self.assertEqual((await self.api.post('/api/cindypt/recommendations/generate')).status_code, 409)
-        await self.api.post('/api/cindypt/goal', json={'targetRounds': 7, 'durationSeconds': 1200})
+    async def test_forty_second_session_cannot_drive_coaching(self):
+        counts = {'pullup': 1, 'pushup': 0, 'squat': 0}
+        self.sessions = [self.session('short', counts)]
+        self.summaries = [self.summary('short', 0, 40, 'explicit_stop', counts=counts)]
         progress = (await self.api.get('/api/cindypt/progress')).json()
         self.assertFalse(progress['available'])
+        self.assertEqual(progress['latestWorkout']['durationSeconds'], 40)
+        self.assertEqual(progress['selectionStatus'], 'insufficient_data')
         self.assertEqual((await self.api.post('/api/cindypt/recommendations/generate')).status_code, 409)
-        self.assertEqual(self.recommendations, [])
+        self.assertEqual(self.saved, [])
 
-    async def test_incomplete_summary_and_missing_reps(self):
-        self.goal = {'targetRounds': 7, 'durationSeconds': 1200}
-        self.summaries = [
-            {'workoutId': 'done', 'rounds': 4, 'durationSeconds': 1300, 'status': 'completed'},
-            {'workoutId': 'running', 'status': 'running'},
-        ]
-        progress = (await self.api.get('/api/cindypt/progress')).json()
-        self.assertEqual(progress['workout']['workoutId'], 'done')
-        self.assertIsNone(progress['workout']['reps'])
-        self.assertEqual(progress['durationDifferenceSeconds'], 100)
-
-    async def test_live_workout_summary_shape_preserves_observed_reps(self):
-        self.goal = {'targetRounds': 7, 'durationSeconds': 1200}
-        self.summaries = [{'rounds': 1, 'pullups': 5, 'pushups': 10, 'squats': 15,
-                           'durationSeconds': 180, 'status': 'completed'}]
-        progress = (await self.api.get('/api/cindypt/progress')).json()
-        self.assertEqual(progress['workout']['reps'], {'pullup': 5, 'pushup': 10, 'squat': 15})
-        self.assertEqual(progress['workout']['workoutId'], '0')
-        self.assertEqual(progress['roundsRemaining'], 6)
-
-    async def test_goal_can_carry_visible_test_label(self):
-        payload = {'label': 'TEST CindyPT integration', 'targetRounds': 7, 'durationSeconds': 1200}
-        response = await self.api.post('/api/cindypt/goal', json=payload)
-        self.assertEqual(response.status_code, 201)
-        self.assertEqual((await self.api.get('/api/cindypt/goal')).json()['goal']['label'], payload['label'])
-
-    async def test_missing_status_is_not_completed(self):
-        self.goal = {'targetRounds': 7, 'durationSeconds': 1200}
-        self.summaries = [{'workoutId': 'unverified', 'rounds': 7, 'durationSeconds': 1200}]
+    async def test_unverified_summary_crash_and_mismatch_are_excluded(self):
+        self.sessions = [self.session('crash'), self.session('unverified')]
+        self.summaries = [self.summary('unverified', source='simulator')]
         progress = (await self.api.get('/api/cindypt/progress')).json()
         self.assertFalse(progress['available'])
-        self.assertIsNone(progress['workout'])
-        self.assertEqual((await self.api.post('/api/cindypt/recommendations/generate')).status_code, 409)
+        self.assertEqual(progress['latestWorkout']['status'], 'no_verified_summary')
+        self.assertIsNone(progress['coachingWorkout'])
+        self.summaries = [self.summary('unverified', counts={'pullup': 1, 'pushup': 0, 'squat': 0})]
+        progress = (await self.api.get('/api/cindypt/progress')).json()
+        self.assertFalse(progress['available'])
 
-    async def test_upstream_failure_and_invalid_summary_do_not_write(self):
-        self.goal = {'targetRounds': 7, 'durationSeconds': 1200}
-        self.summaries = [{'workoutId': 'bad', 'rounds': -1, 'durationSeconds': 1200, 'status': 'completed'}]
-        response = await self.api.post('/api/cindypt/recommendations/generate')
-        self.assertEqual(response.status_code, 502)
-        self.assertEqual(response.json()['detail']['code'], 'invalid_content')
-        self.failure = '/WorkoutSummary'
+    async def test_explicit_stop_has_limited_advice_without_target_change(self):
+        self.sessions = [self.session('practice')]
+        self.summaries = [self.summary('practice', duration=300, reason='explicit_stop')]
+        progress = (await self.api.get('/api/cindypt/progress')).json()
+        self.assertEqual(progress['selectionStatus'], 'not_comparable')
+        advice = (await self.api.get('/api/cindypt/recommendations/current')).json()['recommendations']
+        self.assertFalse(advice['planChangeAppropriate'])
+        self.assertIsNone(advice['proposedTargetRounds'])
+        self.assertEqual((await self.api.post('/api/cindypt/recommendations/generate')).status_code, 409)
+        self.assertEqual(self.saved, [])
+
+    async def test_verified_detector_can_support_a_target_proposal(self):
+        self.sessions = [self.session('full')]
+        self.sessions[0]['performance']['detectorQuality'] = 'verified'
+        self.sessions[0]['performance']['exercises'] = {
+            'pullup': {'state': 'pace_decreasing', 'paceChangePercent': 32.0}}
+        self.sessions[0]['performance']['estimatedRestGaps'] = [{'observedGapSeconds': 14}]
+        self.summaries = [self.summary('full')]
+        advice = (await self.api.get('/api/cindypt/recommendations/current')).json()['recommendations']
+        self.assertTrue(advice['planChangeAppropriate'])
+        self.assertEqual(advice['proposedTargetRounds'], 4)
+        self.assertIn('pullup pace decreased by 32.0%', advice['explanation'])
+        self.assertIn('not confirmed rest or fatigue', advice['explanation'])
+        self.goal['label'] = 'TEST integration'
+        advice = (await self.api.get('/api/cindypt/recommendations/current')).json()['recommendations']
+        self.assertFalse(advice['planChangeAppropriate'])
+
+    async def test_missing_summary_and_worker_crash_stay_visible_without_advice(self):
+        self.sessions = [self.session('crashed')]
+        progress = (await self.api.get('/api/cindypt/progress')).json()
+        self.assertEqual(progress['latestWorkout']['sessionId'], 'crashed')
+        self.assertEqual(progress['latestWorkout']['status'], 'no_verified_summary')
+        self.assertFalse(progress['available'])
+        self.assertFalse((await self.api.get('/api/cindypt/recommendations/current')).json()['available'])
+
+    async def test_malformed_summary_fails_closed(self):
+        self.summaries = [{'sessionId': 'bad', 'rounds': -1, 'durationSeconds': 1200, 'status': 'completed'}]
         response = await self.api.get('/api/cindypt/progress')
         self.assertEqual(response.status_code, 502)
-        self.assertEqual(response.json()['detail']['code'], 'tinyiot_error')
-        self.assertEqual(self.recommendations, [])
-
-    async def test_invalid_goal_and_missing_container(self):
-        self.assertEqual((await self.api.post('/api/cindypt/goal', json={'targetRounds': 0, 'durationSeconds': 1200})).status_code, 422)
-        self.failure = '/FitnessGoals'
-        self.assertEqual((await self.api.post('/api/cindypt/goal', json={'targetRounds': 7, 'durationSeconds': 1200})).status_code, 502)
-        self.assertIsNone(self.goal)
-
-    async def test_conflicting_duplicate_summary_is_rejected(self):
-        self.goal = {'targetRounds': 7, 'durationSeconds': 1200}
-        self.summaries = [
-            {'workoutId': 'same', 'rounds': 4, 'durationSeconds': 1200, 'status': 'completed'},
-            {'workoutId': 'same', 'rounds': 5, 'durationSeconds': 1200, 'status': 'completed'},
-        ]
-        response = await self.api.post('/api/cindypt/recommendations/generate')
-        self.assertEqual(response.status_code, 502)
-        self.assertEqual(response.json()['detail']['code'], 'duplicate_workout_conflict')
-        self.assertEqual(self.recommendations, [])
-
-    async def test_failed_recommendation_write_is_reported(self):
-        self.goal = {'targetRounds': 7, 'durationSeconds': 1200}
-        self.summaries = [{'workoutId': 'w1', 'rounds': 7, 'durationSeconds': 1190, 'status': 'completed'}]
-        self.failure = '/AIRecommendations'
-        self.failure_method = 'POST'
-        response = await self.api.post('/api/cindypt/recommendations/generate')
-        self.assertEqual(response.status_code, 502)
-        self.assertEqual(response.json()['detail']['code'], 'tinyiot_error')
-        self.assertEqual(self.recommendations, [])
+        self.assertEqual(response.json()['detail']['code'], 'invalid_content')

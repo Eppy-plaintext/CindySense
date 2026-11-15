@@ -312,6 +312,9 @@ class PosePublisher:
         self.event_overflow = 0
         self.event_confirmed = 0
         self.event_retries = 0
+        self.event_queued_at = {}
+        self.event_last_latency_ms = None
+        self.event_max_latency_ms = 0
         self.stopping = threading.Event()
         self.shutdown_deadline = None
         self.inflight_event = None
@@ -368,6 +371,7 @@ class PosePublisher:
     def offer_event(self, event):
         try:
             self.events.put_nowait(event)
+            getattr(self, "event_queued_at", {})[event["eventId"]] = time.monotonic()
             print(f"[TinyIoT] Event queued at={datetime.now(timezone.utc).isoformat(timespec='milliseconds')} "
                   f"id={event.get('eventId')} seq={event.get('eventSequence')} "
                   f"{event.get('exercise')} rep={event.get('repetitions')} depth={self.events.qsize()}")
@@ -380,7 +384,9 @@ class PosePublisher:
     def diagnostics(self):
         return {"eventQueueDepth": self.events.qsize() + int(self.inflight_event is not None),
                 "eventConfirmed": self.event_confirmed, "eventRetries": self.event_retries,
-                "eventOverflow": self.event_overflow}
+                "eventOverflow": self.event_overflow,
+                "eventLastLatencyMs": getattr(self, "event_last_latency_ms", None),
+                "eventMaxLatencyMs": getattr(self, "event_max_latency_ms", 0)}
 
     def _run_events(self):
         delay = 1.0
@@ -401,6 +407,10 @@ class PosePublisher:
                     result = self.event_client.publish_event(event, self.event_container)
                     self.event_confirmed += 1
                     self.inflight_event = None
+                    queued_at = getattr(self, "event_queued_at", {}).pop(event.get("eventId"), None)
+                    if queued_at is not None:
+                        self.event_last_latency_ms = round((time.monotonic() - queued_at) * 1000, 1)
+                        self.event_max_latency_ms = max(getattr(self, "event_max_latency_ms", 0), self.event_last_latency_ms)
                     detected_at = datetime.fromisoformat(event["timestamp"].replace("Z", "+00:00"))
                     age_ms = round((datetime.now(timezone.utc) - detected_at).total_seconds() * 1000)
                     print(f"[TinyIoT] Event confirmed at={datetime.now(timezone.utc).isoformat(timespec='milliseconds')} "

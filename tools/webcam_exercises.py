@@ -116,6 +116,28 @@ def body_movement_measurement(exercise, landmarks, tracked_side=None):
     return position, confidence, label
 
 
+def positioning_feedback(exercise, landmarks):
+    """Give conservative framing guidance from visible landmark coverage.
+
+    This is a display aid only; it never gates repetition detection.
+    """
+    required = {
+        "pullup": (0, 11, 12, 13, 14, 15, 16),
+        "pushup": (11, 12, 13, 14, 15, 16, 23, 24, 27, 28),
+        "squat": (23, 24, 25, 26, 27, 28),
+    }[exercise]
+    scores = [visibility(landmarks[index]) for index in required]
+    if min(scores) < MIN_VISIBILITY:
+        return "Required joints not visible"
+    ys = [float(landmarks[index].y) for index in required]
+    span = max(ys) - min(ys)
+    if span < 0.22:
+        return "Move further back"
+    if span > 0.92:
+        return "Move closer"
+    return "Ready for detection"
+
+
 def pullup_auxiliary_measurement(landmarks):
     """Optional head height and shoulder horizontal position for pull-up evidence."""
     head_y = float(landmarks[0].y) if visibility(landmarks[0]) >= MIN_VISIBILITY else None

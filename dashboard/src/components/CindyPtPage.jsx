@@ -21,11 +21,14 @@ export function CindyPtPage({ summaryRevision = 0 }) {
   const visibleRoundsInput = roundsInput ?? String(goal?.targetRounds ?? 7)
   const visibleMinutesInput = minutesInput ?? String(goal?.durationSeconds != null ? goal.durationSeconds / 60 : 20)
   const progress = progressResult.data
-  const workout = progressResult.status === 'success' && progress?.available ? progress.workout : null
+  const selectionReady = progress && Object.hasOwn(progress, 'latestWorkout')
+  const workout = progressResult.status === 'success' && selectionReady && progress?.available ? progress.workout : null
+  const latest = progress?.latestWorkout
+  const selected = progress?.coachingWorkout
   const recommendation = recommendationResult.data?.recommendations
   const alreadySaved = recommendationMatchesProgress(recommendation, progress)
   const busy = action.status === 'pending'
-  const canGenerate = !busy && progressResult.status === 'success' && progress?.available &&
+  const canGenerate = !busy && progressResult.status === 'success' && progress?.selectionStatus === 'sufficient' &&
     recommendationResult.status === 'success' && !alreadySaved
 
   async function saveGoal(event) {
@@ -50,7 +53,7 @@ export function CindyPtPage({ summaryRevision = 0 }) {
 
   async function generateRecommendation() {
     if (!canGenerate) return
-    if (!window.confirm('Generate and save a rule-based recommendation for the latest completed workout and current goal?')) return
+    if (!window.confirm('Generate and save a rule-based recommendation for the selected verified workout and current goal?')) return
     setAction({ status: 'pending', message: 'Generating recommendation…' })
     try {
       await generateCindyPtRecommendation()
@@ -78,27 +81,39 @@ export function CindyPtPage({ summaryRevision = 0 }) {
           <button className="control-btn primary" type="submit" disabled={busy}>Save goal</button>
         </form>
       </section>
-      <section className="schedule-card panel" aria-label="Completed workout progress">
-        <p className="eyebrow">COMPLETED WORKOUT PERFORMANCE</p><h2>Progress toward your goal</h2>
-        {progressResult.status === 'loading' || progressResult.status === 'idle' ? <p className="pt-message" role="status">Loading completed workout summary…</p>
+      <section className="schedule-card panel" aria-label="Latest workout and coaching selection">
+        <p className="eyebrow">LATEST WORKOUT</p><h2>Recent session</h2>
+        {progressResult.status === 'loading' || progressResult.status === 'idle' ? <p className="pt-message" role="status">Loading workout history…</p>
           : progressResult.status === 'error' ? <p className="pt-error" role="alert">{progressResult.error}</p>
-            : !progress?.available ? <p className="pt-message">{progress?.message || 'No completed workout summary is available.'}</p>
-              : <><div className="pt-stats"><div><span>Completed rounds</span><strong>{workout.roundsCompleted}</strong></div><div><span>Target rounds</span><strong>{target}</strong></div><div><span>Remaining rounds</span><strong>{progress.roundsRemaining}</strong></div></div>
+            : !selectionReady ? <p className="pt-message">FastAPI is serving an older CindyPT response. Restart the backend to enable verified workout selection.</p>
+            : <>{latest ? <><p className="pt-message">Session: {latest.sessionId}</p>
+                <p className="pt-message">{latest.durationSeconds != null ? formatCindyDuration(latest.durationSeconds) : 'Duration unverified'} · {latest.completedRounds ?? 'Unknown'} completed rounds · {latest.status.replaceAll('_', ' ')}</p>
+                <p className="pt-message">Completion reason: {latest.completionReason || 'unverified'}</p>
+                <p className="pt-message">Observed reps: {Object.entries(latest.exerciseCounts || {}).map(([name, count]) => `${name} ${count}`).join(' · ') || 'Unavailable'}</p>
+                <p className="pt-message">Summary {latest.summaryVerified ? 'verified against retained events' : 'not verified'} · {latest.comparable ? 'comparable 20-minute workout' : 'not comparable to a full 20-minute workout'}</p></>
+                : <p className="pt-message">No legitimate retained workout session is available.</p>}
+              <p className="eyebrow">WORKOUT SELECTED FOR COACHING</p>
+              {selected ? <><p className="pt-message">{selected.sessionId} · {progress.selectionStatus.replaceAll('_', ' ')}</p>
+                <p className="pt-message">{progress.selectionReason}</p>
+                {progress.selectionStatus !== 'sufficient' && <p className="pt-message">No sufficiently verified workout is available for personalized target adjustments.</p>}</>
+                : <p className="pt-message">No sufficiently verified workout is available for personalized target adjustments. {progress?.selectionReason}</p>}
+              {workout && <><div className="pt-stats"><div><span>Completed rounds</span><strong>{workout.roundsCompleted}</strong></div><div><span>Target rounds</span><strong>{target}</strong></div><div><span>Remaining rounds</span><strong>{progress.roundsRemaining}</strong></div></div>
                 <div className="goal-progress"><div><span>Round progress</span><strong>{fraction}%</strong></div><div className="progress-track"><span style={{ width: `${fraction}%` }} /></div></div>
-                <p className="pt-message">Workout duration: {formatCindyDuration(workout.durationSeconds)} · Target: {formatCindyDuration(progress.goal.durationSeconds)}</p>
-                <p className="pt-message">{progress.goalAchieved ? 'Goal achieved in this completed workout.' : progress.durationDifferenceSeconds > 0 ? `Workout exceeded the target duration by ${formatCindyDuration(progress.durationDifferenceSeconds)}.` : 'Workout was within the target duration; keep building complete rounds.'}</p>
-                <p className="pt-message">{workout.reps ? `Observed reps: ${Object.entries(workout.reps).map(([name, count]) => `${name} ${count}`).join(' · ')}` : 'Repetition totals were not included in this summary.'}</p>
-                <p className="stored-caution">Only completed WorkoutSummary records are used here. Live repetitions and an ongoing workout are separate.</p></>}
+                <p className="pt-message">Detector reliability: {(progress.detectorReliability || 'detector_quality_unknown').replaceAll('_', ' ')}. Target changes are unavailable without reliable movement evidence.</p></>}</>}
       </section>
       <section className="recommendations panel" aria-label="Cindy PT recommendations">
         <div className="panel-header"><div><p className="eyebrow">COACH'S NOTES</p><h2>Training and recovery recommendations</h2></div><span className="stored-tag">RULE-BASED</span></div>
-        {currentAdviceResult.status === 'success' && currentAdviceResult.data?.available &&
+        {selectionReady && currentAdviceResult.status === 'success' && currentAdviceResult.data?.available &&
+          currentAdviceResult.data.recommendations?.sourceWorkoutId === workout?.workoutId &&
+          currentAdviceResult.data.recommendations?.dataSufficiency === progress.selectionStatus &&
           !alreadySaved && <><p className="pt-advice-label">CURRENT WORKOUT · PREVIEW</p>
             <p className="stored-advice">{currentAdviceResult.data.recommendations.recommendation}</p>
+            <p className="pt-message">Why: {currentAdviceResult.data.recommendations.explanation}</p>
+            <p className="pt-message">{currentAdviceResult.data.recommendations.proposedTargetRounds == null ? 'No target change is supported by the current evidence.' : `Proposed target: ${currentAdviceResult.data.recommendations.proposedTargetRounds} rounds.`} Preview and approve a plan below before saving; your current plan is unchanged.</p>
             <p className="stored-advice">{currentAdviceResult.data.recommendations.recoveryRecommendation}</p></>}
         <button className="control-btn primary pt-generate" type="button" onClick={generateRecommendation} disabled={!canGenerate}>Generate Recommendation</button>
         {alreadySaved && <p className="pt-message">A recommendation is already saved for this workout and goal.</p>}
-        {progressResult.status === 'success' && !progress?.available && <p className="pt-message">A saved goal and completed workout are required before generating advice.</p>}
+        {progressResult.status === 'success' && !progress?.available && <p className="pt-message">{latest?.durationSeconds != null ? `Your latest session lasted ${formatCindyDuration(latest.durationSeconds)}. ` : ''}Complete a longer verified workout before CindyPT recommends changing your 20-minute target.</p>}
         {recommendationResult.status === 'error' && <p className="pt-message">Recommendation generation is unavailable until the latest saved advice can be checked.</p>}
         <StoredRecommendationPanel result={recommendationResult} progress={progress} />
       </section>

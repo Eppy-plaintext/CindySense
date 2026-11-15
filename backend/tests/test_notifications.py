@@ -130,6 +130,44 @@ class NotificationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.hub.receive(signal, headers, TOKEN, self.client, self.settings))[0], 'repetition')
         self.assertEqual(listener.get_nowait()[0], 'repetition')
 
+    async def test_omitted_embedded_legacy_subscription_is_still_registered(self):
+        legacy = {'rn': 'RepCount_Sub', 'ri': 'legacy-rep-ri',
+                  'nu': [URL], 'enc': {'net': [3]}, 'nct': 1}
+        newer = {'rn': 'cindysense-fastapi-repetitions', 'ri': 'new-rep-ri',
+                 'nu': [URL], 'enc': {'net': [3]}, 'nct': 1}
+        summary = {'rn': 'Summary_Sub', 'ri': 'summary-ri',
+                   'nu': [URL], 'enc': {'net': [3]}, 'nct': 1}
+        self.cse.subscriptions[REPS + '/RepCount_Sub'] = legacy
+        self.cse.subscriptions[REPS + '/cindysense-fastapi-repetitions'] = newer
+        self.cse.subscriptions[SUMMARIES + '/Summary_Sub'] = summary
+
+        def embedded(resource, _origin):
+            return [newer] if resource == REPS else [summary]
+
+        with patch.object(self.client, 'embedded_subscriptions', side_effect=embedded):
+            configured = await self.hub.ensure(self.client, self.settings)
+        self.assertEqual(set(configured['repetition']),
+                         {REPS + '/RepCount_Sub', REPS + '/cindysense-fastapi-repetitions'})
+        self.assertEqual(set(self.hub.subscription_ids['repetition']),
+                         {'legacy-rep-ri', 'new-rep-ri'})
+        self.assertEqual(self.cse.posts, [])
+        self.assertEqual(self.cse.puts, [])
+
+        listener = __import__('asyncio').Queue()
+        self.hub.listeners.add(listener)
+        signal = {'m2m:sgn': {'sur': '/tinyiot/legacy-rep-ri',
+                             'nev': {'net': 3, 'rep': {'m2m:cin': {'rn': 'event',
+                                                                  'ri': 'event-ri'}}}}}
+        headers = {'x-m2m-ri': 'legacy-request', 'x-m2m-origin': 'TinyIoT',
+                   'x-m2m-rvi': '4'}
+        self.assertEqual((await self.hub.receive(signal, headers, TOKEN,
+                                                 self.client, self.settings))[0], 'repetition')
+        self.assertEqual(listener.get_nowait()[0], 'repetition')
+        signal['m2m:sgn']['sur'] = '/tinyiot/new-rep-ri'
+        await self.hub.receive(signal, headers, TOKEN, self.client, self.settings)
+        self.assertTrue(listener.empty())
+        self.assertEqual(self.hub.metrics()['duplicateCallbacks'], 1)
+
     async def test_tinyiot_rvi_three_is_accepted(self):
         await self.hub.ensure(self.client, self.settings)
         listener = __import__('asyncio').Queue()
@@ -158,12 +196,25 @@ class NotificationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(listener.get_nowait(), ('summary', {}))
         await self.hub.receive(signal, headers, TOKEN, self.client, self.settings)
         self.assertTrue(listener.empty())
-        self.assertEqual(queued, [(SUMMARIES + '/summary', 'summary-ri')] * 2)
+        self.assertEqual(queued, [(SUMMARIES + '/summary', 'summary-ri')])
         self.cse.summary['status'] = 'running'
         self.hub.seen.clear()
         with self.assertRaises(ValueError):
             await self.hub.receive(signal, headers, TOKEN, self.client, self.settings)
         self.assertTrue(listener.empty())
+
+    async def test_synthetic_summary_is_validated_but_not_queued_for_coaching(self):
+        await self.hub.ensure(self.client, self.settings)
+        queued = []
+        self.hub.on_summary = lambda resource, identity: queued.append((resource, identity))
+        self.cse.summary['synthetic'] = True
+        signal = {'m2m:sgn': {'sur': SUMMARIES + '/cindysense-fastapi-summaries',
+                             'nev': {'net': 3, 'rep': {'m2m:cin': {'rn': 'summary', 'ri': 'summary-ri'}}}}}
+        headers = {'x-m2m-ri': 'request-synthetic', 'x-m2m-origin': 'TinyIoT', 'x-m2m-rvi': '4'}
+        self.assertEqual(await self.hub.receive(signal, headers, TOKEN, self.client, self.settings),
+                         ('summary', 'request-synthetic'))
+        self.assertEqual(queued, [])
+        self.assertEqual(self.hub.metrics()['validatedCallbacks'], 1)
 
     async def test_sse_queue_overflow_is_reported_separately(self):
         listener = __import__('asyncio').Queue(maxsize=1)

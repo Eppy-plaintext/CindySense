@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 
@@ -14,6 +14,7 @@ from backend import main
 from backend.coaching_jobs import CoachingJobs
 from backend.notifications import NotificationHub
 from backend.tinyiot import TinyIoTClient
+from tools.workout_summary import completed_summary
 
 
 SUMMARY = 'CindySense_AE/WorkoutSummary'
@@ -24,9 +25,10 @@ TOKEN = 'i' * 40
 
 class MockCSE:
     def __init__(self):
-        self.summary = {'sessionId': 'webcam-session-1', 'status': 'completed',
-                        'rounds': 2, 'durationSeconds': 1200,
-                        'pullups': 10, 'pushups': 20, 'squats': 30}
+        self.summary = completed_summary(
+            'webcam-20261111T000000Z-a1b2c3d4', SimpleNamespace(rounds=2, elapsed=1200),
+            {'pullup': 10, 'pushup': 20, 'squat': 30}, 'timer')
+        self.summary_name = 'webcam-summary-' + self.summary['sessionId']
         self.goal = {'targetRounds': 3, 'durationSeconds': 1200}
         self.recommendations = {}
         self.posts = 0
@@ -35,9 +37,9 @@ class MockCSE:
     def handle(self, request):
         path = request.url.path.removeprefix('/TinyIoT/')
         self.reads.append((request.method, path))
-        if request.method == 'GET' and path == SUMMARY + '/summary-1':
+        if request.method == 'GET' and path == SUMMARY + '/' + self.summary_name:
             return httpx.Response(200, headers={'X-M2M-RSC': '2000'},
-                                  json={'m2m:cin': {'rn': 'summary-1', 'ri': 'summary-ri-1',
+                                  json={'m2m:cin': {'rn': self.summary_name, 'ri': 'summary-ri-1',
                                                     'con': json.dumps(self.summary)}})
         if request.method == 'GET' and path == GOALS:
             return httpx.Response(200, headers={'X-M2M-RSC': '2000'}, json={'m2m:cnt': {}})
@@ -59,6 +61,9 @@ class MockCSE:
                                                         'con': json.dumps(self.recommendations[name])}})
             return httpx.Response(404, headers={'X-M2M-RSC': '4004'}, json={'m2m:dbg': 'missing'})
         if request.method == 'POST' and path == RECOMMENDATIONS:
+            if request.headers.get('X-M2M-Origin') != 'CCindyPT':
+                return httpx.Response(403, headers={'X-M2M-RSC': '4103'},
+                                      json={'m2m:dbg': 'wrong origin'})
             cin = json.loads(request.content)['m2m:cin']
             self.posts += 1
             self.recommendations[cin['rn']] = json.loads(cin['con'])
@@ -80,17 +85,27 @@ class CoachingIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.hub.on_summary = self.jobs.enqueue
         self.settings = SimpleNamespace(notification_token=TOKEN, notification_origin='TinyIoT',
                                         workout_summary_resource=SUMMARY, cindypt_origin='CCindyPT',
+                                        repetition_resource='CindySense_AE/RepetitionCount',
+                                        workout_origin='CDashboard',
                                         target_plan_resource=GOALS,
                                         recommendations_resource=RECOMMENDATIONS)
+        counts = {'pullup': 10, 'pushup': 20, 'squat': 30}
+        observed = {'availableSessions': [{'sessionId': self.cse.summary['sessionId'],
+                    'exerciseCounts': counts, 'eventCount': 60, 'suitable': True,
+                    'firstEventAt': '2026-11-11T00:00:00Z', 'lastEventAt': '2026-11-11T00:20:00Z',
+                    'performance': None}], 'retainedInstanceCount': 60, 'exclusionReasons': {}}
+        self.history_patch = patch('backend.coaching_jobs.read_fatigue_history', new=AsyncMock(return_value=observed))
+        self.history_patch.start()
 
     async def asyncTearDown(self):
+        self.history_patch.stop()
         await self.http.aclose()
         self.temp.cleanup()
 
     async def test_verified_notification_to_dashboard_with_duplicate_delivery(self):
         signal = {'m2m:sgn': {'sur': '/tinyiot/subscription-ri-1',
                              'nev': {'net': 3, 'rep': {'m2m:cin': {
-                                 'rn': 'summary-1', 'ri': 'summary-ri-1'}}}}}
+                                 'rn': self.cse.summary_name, 'ri': 'summary-ri-1'}}}}}
         headers = {'X-M2M-RI': 'request-1', 'X-M2M-Origin': 'TinyIoT',
                    'X-M2M-RVI': '4', 'Content-Type': 'application/json'}
         listener = asyncio.Queue()
@@ -113,7 +128,7 @@ class CoachingIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual((await listener.get())[0], 'recommendation')
                 advice = next(iter(self.cse.recommendations.values()))
                 self.assertEqual(advice['source'], 'rule-based')
-                self.assertEqual(advice['sourceWorkoutId'], 'webcam-session-1')
+                self.assertEqual(advice['sourceWorkoutId'], self.cse.summary['sessionId'])
                 self.assertEqual(advice['goalVersion'], 'goal-ri-1')
                 self.assertIn(('GET', RECOMMENDATIONS + '/' + next(iter(self.cse.recommendations))), self.cse.reads)
                 displayed = await api.get('/api/cindypt/recommendations')

@@ -29,6 +29,12 @@ test('Cindy counts and transitions follow confirmed events once', () => {
   assert.equal(spoken.filter((item) => item.text === 'One').length, 3)
 })
 
+test('browser gesture unlock is silent and does not queue workout speech', () => {
+  const { coach, spoken } = fixture()
+  coach.unlock()
+  assert.equal(spoken.length, 0)
+})
+
 test('fast counts retain only the latest pending count', () => {
   const { coach, spoken, finish } = fixture()
   coach.start('session'); finish()

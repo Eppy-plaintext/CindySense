@@ -102,6 +102,40 @@ class SnapshotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['sources']['webcam']['counts'], {'pullup': 1, 'pushup': 0, 'squat': 0})
         self.assertTrue(result['sources']['mpu6050']['startInferred'])
 
+    async def test_live_audit_synthetic_content_is_excluded_from_real_counts(self):
+        zero_count = event('squat', 0)
+        zero_count['eventSequence'] = 1
+        self.add('real-zero', zero_count)
+        self.add('real-one', event('squat', 1))
+        self.add('live-audit-ec78fc72da624a4fbcd7bcc264b819b3', {
+            'eventId': 'ec78fc72-da62-4a4f-bcd7-bcc264b819b3',
+            'eventSequence': 999999,
+            'sessionId': 'live-audit-20261111T031124Z',
+            'exercise': 'squat', 'repetitions': 0, 'round': 0,
+            'timestamp': '2026-11-11T03:11:24.130393+00:00',
+            'source': 'live-audit', 'synthetic': True,
+        })
+        result = await self.read()
+        self.assertEqual(result['retainedInstanceCount'], 3)
+        self.assertEqual(result['cachedEventCount'], 2)
+        self.assertEqual(result['sources']['webcam']['counts']['squat'], 1)
+        self.assertEqual(result['sources']['webcam']['eventCount'], 2)
+        self.assertIsNone(result['sources']['mpu6050'])
+
+    async def test_malformed_non_audit_content_still_fails_closed(self):
+        for changes in ({'round': 0}, {'source': 'live-audit', 'synthetic': False},
+                        {'source': 'webcam', 'synthetic': True}):
+            with self.subTest(changes=changes):
+                self.snapshot = WorkoutSnapshot()
+                self.records.clear()
+                self.references.clear()
+                malformed = event('squat', 1)
+                malformed.update(changes)
+                self.add('malformed', malformed)
+                with self.assertRaises(TinyIoTError) as caught:
+                    await self.read()
+                self.assertEqual(caught.exception.code, 'invalid_content')
+
     async def test_cached_events_survive_tinyiot_retention_changes(self):
         self.add('first', event('squat', 1))
         await self.read()

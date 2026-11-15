@@ -81,6 +81,21 @@ class NotificationHub:
             if 'm2m:cnt' not in container:
                 raise TinyIoTError('invalid_resource', f'{resource} is not a container.', 502)
             subscriptions = await client.embedded_subscriptions(resource, origin)
+            # TinyIoT's embedded CNT representation may omit a named SUB that is
+            # still retrievable and delivering notifications. Include both known
+            # names so either existing subscription reference is recognized.
+            for candidate in (name, legacy_name):
+                if any(sub.get('rn') == candidate for sub in subscriptions):
+                    continue
+                try:
+                    payload = await client.retrieve(f'{resource}/{candidate}', origin)
+                except TinyIoTError as exc:
+                    if exc.code == 'resource_not_found':
+                        continue
+                    raise
+                subscription = payload.get('m2m:sub')
+                if isinstance(subscription, dict) and subscription.get('rn') == candidate:
+                    subscriptions.append(subscription)
             matched = [f"{resource}/{subscription['rn']}" for subscription in subscriptions
                        if isinstance(subscription.get('rn'), str) and
                        url in subscription.get('nu', []) and
@@ -181,8 +196,14 @@ class NotificationHub:
             if not isinstance(summary.status, str) or summary.status.lower() not in ('complete', 'completed'):
                 raise ValueError('workout summary is not completed')
         key = (kind, instance.get('ri') or f'{resource}/{name}')
-        if kind == 'summary' and self.on_summary is not None:
-            # Queue even repeated callbacks: the durable store decides idempotency.
+        # A CSE can retry the same notification.  Do not invoke the coaching
+        # enqueue callback twice for the same stored CIN; the durable SQLite
+        # queue is the second idempotency boundary, while this prevents
+        # duplicate callback side effects and needless work.
+        already_seen = key in self.seen
+        if kind == 'summary' and self.on_summary is not None and not already_seen and not (
+                isinstance(content, dict) and (content.get('synthetic') is True or
+                                               content.get('source') not in (None, 'webcam'))):
             self.on_summary(f'{resource}/{name}', str(key[1]))
         self.validated_callbacks += 1
         if self.remember(key):

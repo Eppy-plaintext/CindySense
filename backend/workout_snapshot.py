@@ -104,6 +104,9 @@ class WorkoutSnapshot:
                 async with semaphore:
                     payload = await tinyiot.retrieve(ref, origin)
                     content, _ = tinyiot.parse_content_instance(payload)
+                    if (isinstance(content, dict) and content.get('synthetic') is True
+                            and content.get('source') == 'live-audit'):
+                        return ref, None
                     try:
                         kind, event, _ = classify_repetition_content(content)
                     except ValueError as exc:

@@ -24,13 +24,25 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual(self.summary['durationSeconds'], 1200)
         self.assertEqual((self.summary['pullups'], self.summary['pushups'],
                           self.summary['squats'], self.summary['rounds']), (10, 20, 30, 2))
-        early = completed_summary('another-session', SimpleNamespace(rounds=1, elapsed=75.2),
+        early = completed_summary('webcam-20261107T120100Z-abcdef12', SimpleNamespace(rounds=1, elapsed=75.2),
                                   {'pullup': 6, 'pushup': 10, 'squat': 15}, 'explicit_stop')
         self.assertEqual((early['status'], early['completionReason'], early['durationSeconds']),
                          ('completed', 'explicit_stop', 76))
         with self.assertRaises(ValueError):
             completed_summary('interrupted', SimpleNamespace(rounds=1, elapsed=75),
                               {'pullup': 5, 'pushup': 10, 'squat': 15}, 'quit')
+
+    def test_rejects_unrelated_identity_and_inconsistent_rounds(self):
+        totals = {'pullup': 5, 'pushup': 10, 'squat': 15}
+        workout = SimpleNamespace(rounds=1, elapsed=81.5)
+        with self.assertRaisesRegex(ValueError, 'original webcam session ID'):
+            completed_summary('final-summary-097c0172', workout, totals, 'explicit_stop')
+        with self.assertRaisesRegex(ValueError, 'Completed rounds exceed'):
+            completed_summary(self.summary['sessionId'], workout,
+                              {**totals, 'squat': 14}, 'explicit_stop')
+        with self.assertRaisesRegex(ValueError, 'valid elapsed duration'):
+            completed_summary(self.summary['sessionId'],
+                              SimpleNamespace(rounds=1, elapsed=float('nan')), totals, 'timer')
 
     def test_create_verifies_named_instance_and_skips_duplicate(self):
         calls = []

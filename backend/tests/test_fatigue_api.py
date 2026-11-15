@@ -43,7 +43,8 @@ class FatigueAPITests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(body['dataSufficient'])
         self.assertEqual(body['cachedEventCount'], 5)
         self.assertEqual(body['results'][2]['exercise'], 'squat')
-        self.assertEqual(body['results'][2]['fatigueLevel'], 'normal')
+        self.assertEqual(body['results'][2]['fatigueLevel'], 'unknown')
+        self.assertEqual(body['results'][2]['reasonUnknown'], 'detector_quality_unverified')
         self.assertEqual(body['results'][0]['fatigueLevel'], 'unknown')
         self.assertIn('not medically validated', body['medicalDisclaimer'])
 

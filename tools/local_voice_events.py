@@ -27,8 +27,10 @@ class LocalVoiceEvents:
                     self.send_header("Content-Type", "text/event-stream")
                     self.send_header("Cache-Control", "no-cache")
                     origin = self.headers.get("Origin")
-                    if origin in ("http://localhost:5173", "http://127.0.0.1:5173"):
+                    if origin in ("http://localhost:5173", "http://127.0.0.1:5173",
+                                  "http://localhost:5174", "http://127.0.0.1:5174"):
                         self.send_header("Access-Control-Allow-Origin", origin)
+                        self.send_header("Vary", "Origin")
                     self.end_headers()
                     self.wfile.write(b": connected\n\n")
                     if owner.current_session:

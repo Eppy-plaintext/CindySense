@@ -9,11 +9,11 @@ export function ConnectionStatus({ result }) {
   const backendState = status === 'success' ? data?.backend?.available === true ? 'online' : 'offline' : status === 'error' ? 'offline' : 'pending'
   const tinyState = backendState === 'online' ? data?.tinyiot?.reachable === true ? 'online' : 'offline' : 'pending'
   const tinyDetail = tinyState === 'online'
-    ? data?.tinyiot?.resource_verified === true ? 'Reachable · resource verified' : 'Reachable · resource unverified'
+    ? data?.tinyiot?.resource_verified === true ? 'Connected · resource verified' : 'Connected · resource unverified'
     : tinyState === 'offline' ? data?.tinyiot?.message || 'Unavailable' : backendState === 'offline' ? 'Unknown · backend unavailable' : 'Checking…'
 
   return <div className="connection-status" role="status" aria-label="Connection status" title={error || undefined}>
-    <StatusItem label="Backend" state={backendState} detail={backendState === 'online' ? 'Available' : backendState === 'offline' ? 'Offline' : 'Checking…'} />
+    <StatusItem label="Backend" state={backendState} detail={backendState === 'online' ? 'Online' : backendState === 'offline' ? error || 'Offline' : 'Checking…'} />
     <StatusItem label="TinyIoT" state={tinyState} detail={tinyDetail} />
   </div>
 }
@@ -67,6 +67,8 @@ export function StoredRecommendationPanel({ result, progress }) {
       {isTestGoal(details?.goal) && <p className="pt-test-label">TEST DATA — saved for the integration test goal.</p>}
       <p className="pt-advice-label">TRAINING · {details?.source === 'rule-based' ? 'RULE-BASED' : 'STORED'}</p>
       <p className="stored-advice">{advice}</p>
+      {details?.explanation && <p className="pt-message">Why: {details.explanation}</p>}
+      {Number.isInteger(details?.proposedTargetRounds) && <p className="pt-message">Suggested target: {details.proposedTargetRounds} rounds. Saved plans remain unchanged until approved.</p>}
       <p className="pt-advice-label">RECOVERY</p>
       <p className="stored-advice">{details?.recoveryRecommendation || 'No stored recovery recommendation is available.'}</p>
       <div className="stored-metadata">
@@ -75,7 +77,7 @@ export function StoredRecommendationPanel({ result, progress }) {
         {details?.durationSeconds != null && <span>Stored duration <strong>{String(details.durationSeconds)}s</strong></span>}
       </div>
       <p className="stored-caption">Retrieved from {data.source || 'backend'}{data.recorded_at ? ` · Stored at ${data.recorded_at}` : ''}</p>
-      {progress?.available && !savedForCurrentGoal && <p className="stored-caution">This advice was saved for an earlier workout or goal. Generate new advice for the current completed workout when ready.</p>}
+      {!savedForCurrentGoal && <p className="stored-caution">This stored advice is not verified for the workout and goal currently selected for coaching. It may be historical or test data.</p>}
     </> : <ResultMessage result={result} loading="Loading stored recommendation…" empty="No saved recommendation is available yet." />}
   </StoredPanelShell>
 }

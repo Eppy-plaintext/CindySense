@@ -30,6 +30,16 @@ export class VoiceCoach {
     if (!enabled) this.clear()
   }
 
+  unlock() {
+    if (!this.enabled || !this.synth || !this.Utterance) return
+    try {
+      const utterance = new this.Utterance('')
+      utterance.volume = 0
+      this.synth.speak(utterance)
+      this.synth.cancel?.()
+    } catch { /* speech is optional */ }
+  }
+
   clear() {
     this.generation += 1
     this.pendingCount = null

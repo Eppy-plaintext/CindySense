@@ -11,6 +11,8 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from .cindypt import Goal, WorkoutSummary, analyze, recommend
+from .fatigue_history import read_fatigue_history
+from .workout_history import build_history
 from .tinyiot import TinyIoTError
 
 log = logging.getLogger(__name__)
@@ -79,6 +81,13 @@ class CoachingJobs:
             summary = WorkoutSummary.model_validate(content)
             if not summary.status or summary.status.lower() not in ('complete', 'completed'):
                 raise ValueError('summary is not completed')
+            if isinstance(content, dict) and (content.get('synthetic') is True or
+                                              content.get('source') != 'webcam'):
+                raise ValueError('summary is not a real webcam workout')
+            # A short explicit stop or a crash must never trigger a target-based recommendation.
+            if content.get('completionReason') != 'timer' or summary.durationSeconds < 1140:
+                self.finish(identity)
+                return True
             goal_content, goal_instance = await client.latest_content(
                 settings.target_plan_resource, settings.cindypt_origin)
             try:
@@ -89,9 +98,24 @@ class CoachingJobs:
             if not goal_version:
                 raise TinyIoTError('goal_version_missing', 'Goal has no stable version.', 502)
             workout_id = summary.workoutId or summary.sessionId or identity
+            observed = await read_fatigue_history(client, settings.repetition_resource,
+                                                  settings.workout_origin)
+            history = build_history(observed, [{'workoutId': workout_id,
+                'roundsCompleted': summary.rounds, 'durationSeconds': summary.durationSeconds,
+                'reps': summary.exercise_counts(), 'source': content['source'],
+                'completionReason': content['completionReason'], 'synthetic': False}], goal)
+            matching = next((row for row in history['sessions'] if row['sessionId'] == workout_id), None)
+            if not matching or not matching['comparable'] or not matching['summaryVerified'] or not matching['suitable']:
+                log.warning('Coaching skipped: workout summary lacks matching retained event evidence')
+                self.finish(identity)
+                return True
             workout = {'workoutId': workout_id, 'roundsCompleted': summary.rounds,
-                       'durationSeconds': summary.durationSeconds, 'reps': summary.exercise_counts()}
-            advice = recommend(analyze(goal, workout))
+                       'durationSeconds': summary.durationSeconds, 'reps': summary.exercise_counts(),
+                       'source': 'webcam', 'completionReason': 'timer'}
+            progress = analyze(goal, workout)
+            progress.update({'selectionStatus': 'sufficient', 'detectorReliability': 'detector_quality_unknown',
+                             'coachingWorkout': matching, 'trainingPlanChangeAppropriate': False})
+            advice = recommend(progress)
             advice['goalVersion'] = goal_version
             key = json.dumps([workout_id, goal_version], separators=(',', ':'))
             await client.create_named_recommendation(settings.recommendations_resource,

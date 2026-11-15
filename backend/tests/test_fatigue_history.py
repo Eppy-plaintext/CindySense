@@ -49,6 +49,12 @@ class FakeClient:
 
 
 class FatigueHistoryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_empty_container_cache_does_not_request_missing_latest_instance(self):
+        client = FakeClient({})
+        result = await FatigueHistoryCache().read(client, 'CindySense_AE/RepetitionCount', 'reader')
+        self.assertEqual(result['availableSessions'], [])
+        self.assertFalse(any(path.endswith('/la') for path in client.retrieve_calls))
+
     async def test_pagination_and_exclusions_are_reported(self):
         contents = {}
         refs = []
@@ -90,7 +96,9 @@ class FatigueHistoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['selectedSessionId'], 'webcam-latest')
         self.assertEqual(result['selectedEventCount'], 15)
         self.assertEqual(result['validEventCount'], 30)
-        self.assertTrue(result['dataSufficient'])
+        self.assertFalse(result['dataSufficient'])
+        self.assertTrue(all(item['reasonUnknown'] == 'detector_quality_unverified'
+                            for item in result['results']))
 
     async def test_explicit_session_selection_and_insufficient_data(self):
         contents = {}

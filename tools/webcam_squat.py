@@ -8,18 +8,21 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import cv2
 import mediapipe as mp
 
 from webcam_exercises import (CindyWorkout, ExerciseCounter, body_movement_measurement,
                               exercise_measurement, pullup_auxiliary_measurement,
-                              select_exercise_key, visibility)
+                              positioning_feedback, select_exercise_key, visibility)
 from webcam_tinyiot import (PosePublisher, TinyIoTClient, TinyIoTError, DEFAULT_BASE,
                             DEFAULT_ORIGIN, EVENT_CONTAINER, SUMMARY_CONTAINER)
 from workout_summary import SummaryPublisher, completed_summary
 from workout_timeseries import WorkoutTimeSeries
 from local_voice_events import LocalVoiceEvents
+from webcam_dashboard import CameraLock, DashboardIPC, DashboardPreview
+from webcam_camera import LatestFrameCamera
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_MODEL = PROJECT_ROOT / "models" / "pose_landmarker_lite.task"
@@ -46,6 +49,9 @@ def draw_pose(frame, landmarks):
 def main():
     parser = argparse.ArgumentParser(description="CindySense webcam workout counter")
     parser.add_argument("--camera", type=int, default=0)
+    parser.add_argument("--camera-width", type=int, default=640)
+    parser.add_argument("--camera-height", type=int, default=480)
+    parser.add_argument("--camera-fps", type=int, default=30)
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
     parser.add_argument("--exercise", choices=("cindy", "squat", "pushup", "pullup"), default="cindy",
                         help="Start in 20-minute Cindy AMRAP or a single exercise mode")
@@ -67,19 +73,39 @@ def main():
                         help="Keep WorkoutSummary publishing but skip optional TimeSeries mirroring")
     parser.add_argument("--voice-events-port", type=int, default=8765,
                         help="Local browser voice event stream port; 0 disables it")
+    parser.add_argument("--dashboard-ipc", type=Path,
+                        help="Local status, stop control, and JPEG preview directory")
     args = parser.parse_args()
+    if args.dashboard_ipc and args.exercise != 'cindy':
+        parser.error('Dashboard control supports Cindy workouts only.')
+    dashboard = DashboardIPC(args.dashboard_ipc) if args.dashboard_ipc else None
+    preview = None
+    if dashboard:
+        dashboard.status(state='starting')
     if args.tinyiot and (not args.tinyiot_event_origin or args.tinyiot_event_origin == 'CAdmin'
                          or (args.tinyiot_summary_origin or args.tinyiot_event_origin) == 'CAdmin'):
         parser.error("Set verified non-admin event and summary publisher origins before writing workouts.")
     if not args.model.is_file():
+        if dashboard:
+            dashboard.status(state='error', message='Pose model is missing.')
         sys.exit(f"Model missing: {args.model}\nDownload pose_landmarker_lite.task into models/ first.")
-    camera = cv2.VideoCapture(args.camera, cv2.CAP_DSHOW) if sys.platform.startswith("win") else cv2.VideoCapture(args.camera)
-    if not camera.isOpened():
-        camera.release()
-        if sys.platform.startswith("win"):
-            camera = cv2.VideoCapture(args.camera)
-    if not camera.isOpened():
-        sys.exit("Cannot open webcam. Check camera privacy settings or try --camera 1.")
+    (PROJECT_ROOT / 'data').mkdir(parents=True, exist_ok=True)
+    try:
+        camera_lock = CameraLock(PROJECT_ROOT / 'data' / 'webcam-camera.lock')
+    except RuntimeError as exc:
+        if dashboard:
+            dashboard.status(state='error', message=str(exc))
+        sys.exit(str(exc))
+    camera = LatestFrameCamera(args.camera, args.camera_width, args.camera_height, args.camera_fps)
+    try:
+        camera.start()
+    except RuntimeError as exc:
+        if dashboard:
+            dashboard.status(state='error', message=str(exc))
+        camera.close()
+        camera_lock.close()
+        sys.exit(str(exc))
+    preview = DashboardPreview(dashboard) if dashboard else None
 
     workout = CindyWorkout(max(1, int(args.duration_minutes * 60))) if args.exercise == "cindy" else None
     active = workout.current_exercise if workout else args.exercise
@@ -133,6 +159,16 @@ def main():
     session_baseline = dict(total_reps)
     end_reason = None
     timer_announced = set()
+    last_dashboard_update = 0.0
+    performance_enabled = os.environ.get("CINDYSENSE_PERF_LOGGING") == "1"
+    performance = {"frames": 0, "captureMs": 0.0, "poseMs": 0.0,
+                   "jpegMs": 0.0, "statusMs": 0.0, "frameGapMs": 0.0, "droppedFrames": 0,
+                   "lastFrameAgeMs": None, "lastConfirmLatencyMs": None}
+    summary_result = None
+    if dashboard:
+        dashboard.status(state='running', sessionId=session_id, durationSeconds=workout.duration_seconds,
+                         remainingSeconds=workout.remaining, counts=dict(total_reps), completedRounds=0,
+                         activeExercise=active)
     try:
         announce("start", round=1)
         with open(csv_path, "w", newline="", encoding="utf-8") as f, \
@@ -141,7 +177,8 @@ def main():
                       "visibility", "phase", "repCount", "angleDeg", "trackedSide",
                       "confidence", "bodyMovement", "exerciseReps", "rounds", "sessionId",
                       "headPosition", "lateralPosition", "detectorReason", "lastRejection",
-                      "eventId", "eventQueueDepth", "frameGapMs", "poseMs"]
+                      "eventId", "eventQueueDepth", "captureWaitMs", "frameAgeMs",
+                      "droppedFrames", "frameGapMs", "poseMs"]
             writer = csv.DictWriter(f, fieldnames=fields)
             writer.writeheader()
             while True:
@@ -150,29 +187,48 @@ def main():
                     end_reason = "timer"
                     announce("complete")
                     break
-                ok, frame = camera.read()
+                if dashboard and dashboard.stop_requested():
+                    end_reason = 'explicit_stop'
+                    announce('stop')
+                    break
+                capture_started = time.monotonic()
+                ok, frame, frame_info = camera.read()
+                capture_ms = (time.monotonic() - capture_started) * 1000
                 if not ok:
                     print("Camera frame read failed.")
+                    if dashboard:
+                        dashboard.status(state='error', sessionId=session_id,
+                                         message='Camera frame read failed; workout was interrupted.')
                     break
+                frame_age_ms = (time.monotonic() - frame_info["capturedAt"]) * 1000
                 frame_exercise = active
                 frame = cv2.flip(frame, 1)
                 h, w = frame.shape[:2]
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
                 ts_ms = max(int((time.monotonic() - start) * 1000), last_ts_ms + 1)
-                frame_gap_ms = ts_ms - last_ts_ms if last_ts_ms >= 0 else 0
+                frame_gap_ms = (frame_info["capturedAt"] - last_capture_at) * 1000 if 'last_capture_at' in locals() else 0
+                last_capture_at = frame_info["capturedAt"]
                 last_ts_ms = ts_ms
                 pose_started = time.monotonic()
                 result = landmarker.detect_for_video(image, ts_ms)
                 pose_ms = round((time.monotonic() - pose_started) * 1000, 1)
+                performance["frames"] += 1
+                performance["captureMs"] = round(performance["captureMs"] + capture_ms, 1)
+                performance["poseMs"] = round(performance["poseMs"] + pose_ms, 1)
+                performance["frameGapMs"] = round(frame_gap_ms, 1)
+                performance["lastFrameAgeMs"] = round(frame_age_ms, 1)
+                performance["droppedFrames"] = camera.diagnostics()["droppedFrames"]
                 angle, confidence, side = None, 0.0, "NONE"
                 body_movement, body_confidence = None, 0.0
                 head_position = lateral_position = None
                 measurement_reason = "no pose landmarks"
                 movement_reason = "no pose landmarks"
+                positioning = "Required joints not visible"
                 if result.pose_landmarks:
                     landmarks = result.pose_landmarks[0]
                     draw_pose(frame, landmarks)
+                    positioning = positioning_feedback(frame_exercise, landmarks)
                     angle, confidence, side, measurement_reason = exercise_measurement(
                         frame_exercise, landmarks, w, h, include_reason=True
                     )
@@ -256,11 +312,9 @@ def main():
                     f"{measurement_reason}; {display_counter.last_reason}" if angle is None
                     else display_counter.last_reason
                 )
-                lines = [f"{display_exercise.upper()}  reps {progress_text}  phase {display_counter.phase}",
-                         f"Confidence {tracking_confidence:.2f}  {angle_text}  {position_text}",
+                lines = [f"{display_exercise.upper()}  reps {progress_text}",
                          f"Cindy rounds {rounds_text}  {'remaining' if workout else 'elapsed'} {clock_text}",
-                         f"Reason: {reason[:72]}",
-                         "1 pull-up | 2 push-up | 3 squat | C Cindy | R reset | Q quit"]
+                         positioning]
                 if workout and workout.finished:
                     lines[2] = f"AMRAP complete | rounds {workout.rounds}"
                 for i, line in enumerate(lines):
@@ -302,9 +356,36 @@ def main():
                                  "detectorReason": reason, "lastRejection": display_counter.last_rejection or "",
                                  "eventId": event["eventId"] if event is not None else "",
                                  "eventQueueDepth": publisher.diagnostics()["eventQueueDepth"] if publisher else 0,
+                                 "captureWaitMs": round(capture_ms, 1),
+                                 "frameAgeMs": round(frame_age_ms, 1),
+                                 "droppedFrames": camera.diagnostics()["droppedFrames"],
                                  "frameGapMs": frame_gap_ms, "poseMs": pose_ms})
-                cv2.imshow("CindySense Webcam Workout", frame)
-                key = cv2.waitKey(1) & 0xFF
+                if dashboard and time.monotonic() - last_dashboard_update >= 0.15:
+                    values = dict(state='running', sessionId=session_id,
+                                     durationSeconds=workout.duration_seconds,
+                                     remainingSeconds=workout.remaining, counts={
+                                         name: total_reps[name] - session_baseline[name] for name in TARGETS},
+                                     completedRounds=workout.rounds, activeExercise=active,
+                                     positioning=positioning,
+                                     eventQueueDepth=publisher.diagnostics()['eventQueueDepth'] if publisher else 0)
+                    if performance_enabled:
+                        metrics = dict(performance)
+                        frames = max(1, performance["frames"])
+                        metrics["captureAvgMs"] = round(performance["captureMs"] / frames, 2)
+                        metrics["poseAvgMs"] = round(performance["poseMs"] / frames, 2)
+                        metrics["jpegAvgMs"] = round(performance["jpegMs"] / frames, 2)
+                        metrics["statusAvgMs"] = round(performance["statusMs"] / frames, 2)
+                        if preview:
+                            metrics.update(preview.diagnostics())
+                        values["performance"] = metrics
+                    if preview:
+                        preview.offer(frame, values, frame_info["capturedAt"])
+                    last_dashboard_update = time.monotonic()
+                if dashboard:
+                    key = -1
+                else:
+                    cv2.imshow("CindySense Webcam Workout", frame)
+                    key = cv2.waitKey(1) & 0xFF
                 if workout and workout.finished:
                     end_reason = "timer"
                     announce("complete")
@@ -348,16 +429,19 @@ def main():
                         announce("start", round=1)
                     print(f"Workout counts reset; new session {session_id}.")
     finally:
+        completion_elapsed = workout.elapsed if end_reason and workout else None
         if voice_events:
             voice_events.close()
         if publisher:
             publisher.close()
         if end_reason and workout:
             final_totals = {name: total_reps[name] - session_baseline[name] for name in TARGETS}
-            summary = completed_summary(session_id, workout, final_totals, end_reason)
+            summary = completed_summary(session_id, SimpleNamespace(rounds=workout.rounds,
+                                        elapsed=completion_elapsed), final_totals, end_reason)
             if summary_publisher:
                 try:
                     result = summary_publisher.publish(summary)
+                    summary_result = result
                     print(f"[TinyIoT] Workout summary PERSISTED session={session_id} result={result}")
                     if ts_publisher:
                         try:
@@ -369,6 +453,7 @@ def main():
                             # the optional TS through the explicit reconcile command.
                             print(f"[TinyIoT] Optional TimeSeries mirror failed for session={session_id}: {exc}")
                 except TinyIoTError as exc:
+                    summary_result = 'unconfirmed'
                     print(f"[TinyIoT] Workout summary PERSISTENCE UNCONFIRMED session={session_id}: {exc}")
             else:
                 print(f"[SESSION] Completed locally; TinyIoT summary not enabled for session={session_id}")
@@ -378,8 +463,24 @@ def main():
             summary_client.close()
         if ts_client:
             ts_client.close()
-        camera.release()
-        cv2.destroyAllWindows()
+        if preview:
+            preview.close()
+            if performance_enabled:
+                performance.update(preview.diagnostics())
+        camera.close()
+        if not dashboard:
+            cv2.destroyAllWindows()
+        camera_lock.close()
+        if dashboard and end_reason:
+            final_performance = dict(performance) if performance_enabled else None
+            if final_performance is not None:
+                final_performance["frames"] = performance["frames"]
+            dashboard.status(state='completed', sessionId=session_id, completionReason=end_reason,
+                             durationSeconds=summary['durationSeconds'],
+                             remainingSeconds=max(0, workout.duration_seconds - completion_elapsed),
+                             counts=final_totals, completedRounds=workout.rounds,
+                             summaryPublication=summary_result or 'disabled',
+                             **({'performance': final_performance} if final_performance is not None else {}))
     print(f"Completed. Local repetitions: {total_reps}; rounds={workout.rounds if workout else total_rounds}. CSV: {csv_path}")
 
 
