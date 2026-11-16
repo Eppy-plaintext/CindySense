@@ -13,6 +13,9 @@ import cv2
 
 
 class LatestFrameCamera:
+    # Tolerate short USB/driver hiccups; stop only after a bounded failure run.
+    MAX_CONSECUTIVE_READ_FAILURES = 30
+
     def __init__(self, index=0, width=640, height=480, fps=30):
         self.index = index
         self.width = width
@@ -28,6 +31,9 @@ class LatestFrameCamera:
         self._error = None
         self._frames = 0
         self._dropped = 0
+        self._read_failures = 0
+        self._consecutive_read_failures = 0
+        self._recoveries = 0
 
     def start(self, timeout=5.0):
         capture = cv2.VideoCapture(self.index, cv2.CAP_DSHOW) if sys.platform.startswith("win") else cv2.VideoCapture(self.index)
@@ -67,10 +73,19 @@ class LatestFrameCamera:
                 captured_at = time.monotonic()
                 if not ok:
                     with self._condition:
-                        self._error = "Camera frame read failed."
+                        self._read_failures += 1
+                        self._consecutive_read_failures += 1
+                        if self._consecutive_read_failures >= self.MAX_CONSECUTIVE_READ_FAILURES:
+                            self._error = "Camera frame read failed repeatedly."
                         self._condition.notify_all()
-                    return
+                    if self._error is not None:
+                        return
+                    time.sleep(0.05)
+                    continue
                 with self._condition:
+                    if self._consecutive_read_failures:
+                        self._recoveries += 1
+                        self._consecutive_read_failures = 0
                     if self._latest is not None:
                         self._dropped += 1
                     self._sequence += 1
@@ -99,7 +114,10 @@ class LatestFrameCamera:
     def diagnostics(self):
         with self._condition:
             return {"frames": self._frames, "droppedFrames": self._dropped,
-                    "sequence": self._sequence}
+                    "sequence": self._sequence,
+                    "readFailures": self._read_failures,
+                    "consecutiveReadFailures": self._consecutive_read_failures,
+                    "recoveries": self._recoveries}
 
     def close(self):
         self._stop.set()

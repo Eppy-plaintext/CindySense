@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import time
+from pathlib import Path
 import httpx
 from pydantic import ValidationError
 from contextlib import asynccontextmanager
@@ -21,7 +22,11 @@ from .coaching_selection import select_workout
 from .coaching_jobs import CoachingJobs
 from .events import RepetitionEvent, classify_repetition_content
 from .fatigue_history import FatigueHistoryCache
+from .federated_learning import read_result
 from .notifications import NotificationHub
+from .subscription_monitor import SubscriptionMonitor
+from .performance import PaceWarningConfig
+from .sdt import build_device_sdt
 from .simulation import SimulationPublisher
 from .tinyiot import TinyIoTClient, TinyIoTError
 from .workout_snapshot import WorkoutSnapshot
@@ -34,16 +39,8 @@ from .webcam_worker import WebcamWorker
 async def lifespan(app):
     subscription_task = None
     coaching_task = asyncio.create_task(coaching_jobs.run(tinyiot, settings, notification_hub.publish))
-    if settings.notification_url:
-        async def maintain_subscriptions():
-            while True:
-                try:
-                    await notification_hub.ensure(tinyiot, settings)
-                    return
-                except (TinyIoTError, ValueError) as exc:
-                    logging.getLogger(__name__).error('oneM2M subscription setup failed: %s', exc)
-                    await asyncio.sleep(30)
-        subscription_task = asyncio.create_task(maintain_subscriptions())
+    if subscription_monitor.enabled:
+        subscription_task = await subscription_monitor.start(tinyiot, settings)
     try:
         yield
     finally:
@@ -54,11 +51,7 @@ async def lifespan(app):
         except asyncio.CancelledError:
             pass
         if subscription_task:
-            subscription_task.cancel()
-            try:
-                await subscription_task
-            except asyncio.CancelledError:
-                pass
+            await subscription_monitor.stop()
         await tinyiot._client.aclose()
 
 
@@ -78,10 +71,38 @@ tinyiot = TinyIoTClient(settings.base_url, httpx.AsyncClient(timeout=5.0))
 fatigue_history_cache = FatigueHistoryCache()
 simulation_publisher = SimulationPublisher()
 workout_snapshot = WorkoutSnapshot()
-notification_hub = NotificationHub()
+notification_hub = NotificationHub(PaceWarningConfig(
+    slowdown_ratio=settings.pace_warning_slowdown_ratio,
+    minimum_pace_intervals=settings.pace_warning_minimum_intervals,
+    required_evidence=settings.pace_warning_required_evidence,
+    cooldown_seconds=settings.pace_warning_cooldown_seconds,
+))
 coaching_jobs = CoachingJobs(os.getenv('CINDYSENSE_COACHING_DB', 'data/cindypt_jobs.sqlite3'))
 webcam_worker = WebcamWorker()
 notification_hub.on_summary = coaching_jobs.enqueue
+
+
+def register_verified_subscriptions(required):
+    """Make only read-verified subscription references acceptable to callbacks."""
+    notification_hub.subscriptions = {
+        kind: list(info.get('subscriptions', []))
+        for kind, info in required.items()
+        if info.get('status') == 'healthy'
+    }
+    notification_hub.subscription_ids = {
+        kind: list(info.get('subscriptionIds', []))
+        for kind, info in required.items()
+        if info.get('status') == 'healthy'
+    }
+
+
+subscription_monitor = SubscriptionMonitor(
+    enabled=getattr(settings, 'subscription_monitor_enabled', True),
+    interval_seconds=getattr(settings, 'subscription_monitor_interval_seconds', 60),
+    recovery_enabled=getattr(settings, 'subscription_recovery_enabled', True),
+    max_backoff_seconds=getattr(settings, 'subscription_monitor_max_backoff_seconds', 300),
+    on_verified=register_verified_subscriptions,
+)
 recommendation_lock = asyncio.Lock()
 
 
@@ -148,20 +169,21 @@ async def webcam_worker_preview(request: Request):
 
 @app.post('/api/onem2m/notify/{token}')
 async def onem2m_notification(token: str, request: Request):
+    notification_hub.record_received()
     if request.headers.get('content-type', '').split(';', 1)[0] not in (
             'application/json', 'application/vnd.onem2m-ntfy+json'):
-        notification_hub.rejected_callbacks += 1
+        notification_hub.record_rejected()
         raise HTTPException(status_code=415, detail='Unsupported notification representation.')
     try:
         body = await request.json()
         kind, rqi = await notification_hub.receive(body, request.headers, token, tinyiot, settings)
     except (ValueError, TypeError) as exc:
-        notification_hub.rejected_callbacks += 1
+        notification_hub.record_rejected()
         logging.getLogger(__name__).warning('Rejected oneM2M notification: %s', exc)
         status = 403 if str(exc) in ('invalid notification token', 'unexpected oneM2M origin') else 400
         raise HTTPException(status_code=status, detail=str(exc)) from exc
     except TinyIoTError as exc:
-        notification_hub.rejected_callbacks += 1
+        notification_hub.record_rejected()
         raise api_error(exc) from exc
     return JSONResponse({'m2m:rsp': {'rsc': 2000, 'rqi': rqi}},
                         headers={'X-M2M-RSC': '2000', 'X-M2M-RI': rqi, 'X-M2M-RVI': '4'})
@@ -193,6 +215,31 @@ async def integration_metrics():
     return {**notification_hub.metrics(), 'coachingJobs': coaching_jobs.metrics()}
 
 
+@app.get('/api/fl/status')
+async def federated_learning_status():
+    """Read the last explicit offline FL run; never starts training."""
+    result = read_result(Path(__file__).resolve().parents[1])
+    if result is None:
+        return {'status': 'not_trained', 'available': False,
+                'simulation': 'single-machine-three-virtual-client',
+                'message': 'Run the explicit offline FL command to create results.'}
+    return {'status': result.get('status', 'unknown'), 'available': True,
+            'modelVersion': result.get('modelVersion'), 'provenance': result.get('provenance'),
+            'simulation': result.get('simulation', 'single-machine-three-virtual-client'),
+            'roundsCompleted': len(result.get('roundMetrics', [])),
+            'trainSampleCount': result.get('trainSampleCount', 0),
+            'validationSampleCount': result.get('validationSampleCount', 0)}
+
+
+@app.get('/api/fl/results')
+async def federated_learning_results():
+    """Read explicit offline FL results without touching workout services."""
+    result = read_result(Path(__file__).resolve().parents[1])
+    if result is None:
+        return {'available': False, 'status': 'not_trained', 'results': None}
+    return {'available': True, **result}
+
+
 
 
 def api_error(exc: TinyIoTError) -> HTTPException:
@@ -201,11 +248,26 @@ def api_error(exc: TinyIoTError) -> HTTPException:
 
 @app.get('/api/health')
 async def health():
+    diagnostics = notification_hub.metrics()
+    monitor = subscription_monitor.health()
     try:
         await tinyiot.retrieve(settings.repetition_resource, settings.workout_origin)
-        return {'backend': {'available': True}, 'tinyiot': {'reachable': True, 'resource_verified': True}}
+        return {'backend': {'available': True},
+                'tinyiot': {'reachable': True, 'resource_verified': True},
+                'notifications': diagnostics,
+                'subscriptionMonitor': monitor,
+                'subscriptions': {'configured': bool(notification_hub.subscriptions),
+                                  'repetition': notification_hub.subscriptions.get('repetition', []),
+                                  'summary': notification_hub.subscriptions.get('summary', [])}}
     except TinyIoTError as exc:
-        return {'backend': {'available': True}, 'tinyiot': {'reachable': exc.code != 'tinyiot_unreachable', 'resource_verified': False, 'code': exc.code, 'message': str(exc)}}
+        return {'backend': {'available': True},
+                'tinyiot': {'reachable': exc.code != 'tinyiot_unreachable',
+                            'resource_verified': False, 'code': exc.code, 'message': str(exc)},
+                'notifications': diagnostics,
+                'subscriptionMonitor': monitor,
+                'subscriptions': {'configured': bool(notification_hub.subscriptions),
+                                  'repetition': notification_hub.subscriptions.get('repetition', []),
+                                  'summary': notification_hub.subscriptions.get('summary', [])}}
 
 
 @app.get('/api/onem2m/discovery')
@@ -313,6 +375,47 @@ async def live_workout_snapshot():
         return await workout_snapshot.read(tinyiot, settings.repetition_resource, settings.workout_origin)
     except TinyIoTError as exc:
         raise api_error(exc) from exc
+
+
+@app.get('/api/sdt/device')
+async def sdt_device():
+    """Return a read-only custom CindySense SDT-style device representation."""
+    errors = []
+    try:
+        snapshot = await workout_snapshot.read(tinyiot, settings.repetition_resource, settings.workout_origin)
+        events = workout_snapshot.validated_events()
+    except TinyIoTError as exc:
+        snapshot, events = None, []
+        errors.append({'source': 'RepetitionCount', 'code': exc.code})
+
+    goal = recommendation = None
+    summaries = None
+    worker = await asyncio.to_thread(webcam_worker.status)
+    if settings.cindypt_origin:
+        try:
+            goal = await read_goal(tinyiot, settings.target_plan_resource, settings.cindypt_origin)
+        except TinyIoTError as exc:
+            errors.append({'source': 'FitnessGoals', 'code': exc.code})
+        try:
+            summaries = await read_summaries(tinyiot, settings.workout_summary_resource, settings.cindypt_origin)
+        except TinyIoTError as exc:
+            errors.append({'source': 'WorkoutSummary', 'code': exc.code})
+        try:
+            recommendation, _ = await tinyiot.latest_content(settings.recommendations_resource, settings.cindypt_origin)
+            if not isinstance(recommendation, dict):
+                recommendation = None
+        except TinyIoTError as exc:
+            errors.append({'source': 'AIRecommendations', 'code': exc.code})
+
+    try:
+        representation = build_device_sdt(snapshot, events, goal=goal, recommendation=recommendation,
+                                          worker=worker, summaries=summaries)
+    except (TypeError, ValueError) as exc:
+        errors.append({'source': 'mapping', 'code': 'invalid_source_data', 'message': str(exc)})
+        representation = build_device_sdt(None, [])
+    representation['available'] = snapshot is not None
+    representation['errors'] = errors
+    return representation
 
 
 @app.get('/api/workout/fatigue')

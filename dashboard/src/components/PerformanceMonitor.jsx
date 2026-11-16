@@ -1,9 +1,16 @@
-export function PerformanceMonitor({ result, sessionId }) {
+export function PerformanceMonitor({ result, sessionId, warning }) {
   const data = result?.data
   const selected = data?.availableSessions?.find((item) => item.sessionId === sessionId)
   const performance = selected?.performance
+  const currentWarning = warning && (!sessionId || warning.sessionId === sessionId) ? warning : null
+  const paceLabel = currentWarning ? 'Pace slowing' : performance?.state === 'stable_performance' ? 'Pace stable' : 'Insufficient data'
   return <section className="panel fatigue-panel" aria-label="Performance monitor">
     <div className="panel-header"><div><p className="eyebrow">OBSERVED PACE</p><h2>Performance monitor</h2></div><span className="fatigue-tag">RULE-BASED</span></div>
+    <div className={`pace-status ${currentWarning ? 'slowing' : paceLabel === 'Pace stable' ? 'stable' : 'unknown'}`} role="status">
+      <strong>{paceLabel}</strong>
+      {currentWarning ? <span>{currentWarning.message} · {new Date(currentWarning.timestamp).toLocaleTimeString()}</span> :
+        <span>{performance ? 'Relative to this session’s observed pace.' : 'Waiting for validated repetitions.'}</span>}
+    </div>
     {!performance ? <p className="pt-message">{result?.status === 'error' ? 'Performance history is unavailable.' : 'Waiting for validated events from this session.'}</p> : <>
       <p className="pt-message">Advisory: {performance.state.replaceAll('_', ' ')} · Detector quality {performance.detectorQuality}</p>
       <div className="fatigue-rows">{Object.entries(performance.exercises).map(([exercise, item]) => <div className="fatigue-row" key={exercise}><span>{exercise}</span><strong>{item.repsPerMinute == null ? 'Insufficient data' : `${item.repsPerMinute} reps/min`}</strong><span>{item.paceChangePercent == null ? '—' : `${item.paceChangePercent}% pace change`}</span><small>{item.estimatedRestGaps.length} possible rest gaps</small></div>)}</div>

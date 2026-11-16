@@ -156,6 +156,40 @@ class APITests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(response.json()['tinyiot']['reachable'])
         self.assertTrue(response.json()['tinyiot']['resource_verified'])
 
+    async def test_sdt_device_is_read_only_and_uses_existing_sources(self):
+        snapshot = {'sources': {'webcam': {'sessionId': 'webcam-test', 'counts': {'squat': 1},
+                                           'completedRounds': 0, 'startAt': '2026-11-16T00:00:00+00:00'}}}
+        with patch.object(main.workout_snapshot, 'read', AsyncMock(return_value=snapshot)), \
+             patch.object(main.workout_snapshot, 'validated_events', return_value=[]), \
+             patch.object(main, 'read_goal', AsyncMock(return_value={'targetRounds': 3})), \
+             patch.object(main.tinyiot, 'latest_content', AsyncMock(return_value=({'recommendation': 'Keep form.'}, {}))):
+            response = await self.api.get('/api/sdt/device')
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertTrue(body['available'])
+        self.assertFalse(body['nativeOneM2MResource'])
+        self.assertEqual(body['cindySenseWorkoutTracker']['coaching']['targetRounds'], 3)
+
+    async def test_fl_endpoints_are_read_only_and_consistent(self):
+        result = {'status': 'trained', 'modelVersion': 'fedavg-logistic-v1',
+                  'provenance': 'real_csv_recordings_single_user', 'roundMetrics': [{}, {}],
+                  'trainSampleCount': 20, 'validationSampleCount': 5,
+                  'simulation': 'Three sequential virtual clients on one machine; not three real users.'}
+        with patch.object(main, 'read_result', return_value=result):
+            status = await self.api.get('/api/fl/status')
+            results = await self.api.get('/api/fl/results')
+        self.assertEqual(status.status_code, 200)
+        self.assertEqual(status.json()['roundsCompleted'], 2)
+        self.assertEqual(results.status_code, 200)
+        self.assertEqual(results.json()['modelVersion'], 'fedavg-logistic-v1')
+        self.assertTrue(all(request.method == 'GET' for request in self.requests))
+
+    async def test_fl_status_is_explicit_when_no_offline_run_exists(self):
+        with patch.object(main, 'read_result', return_value=None):
+            response = await self.api.get('/api/fl/status')
+        self.assertEqual(response.json()['status'], 'not_trained')
+        self.assertFalse(response.json()['available'])
+
     async def test_discovery_uses_onem2m_filter_usage_and_returns_authorized_containers(self):
         response = await self.api.get('/api/onem2m/discovery')
         self.assertEqual(response.status_code, 200)

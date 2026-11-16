@@ -2,11 +2,13 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ConnectionStatus, StoredRepetitionPanel } from './components/ApiPanels.jsx'
 import { CindyPtPage } from './components/CindyPtPage.jsx'
 import { FatiguePanel } from './components/FatiguePanel.jsx'
+import { FederatedLearningPanel } from './components/FederatedLearningPanel.jsx'
 import { PerformanceMonitor } from './components/PerformanceMonitor.jsx'
 import { StoredHistoryPage } from './components/StoredHistoryPage.jsx'
 import { usePolling } from './hooks/usePolling.js'
-import { getBackendHealth, getLatestRepetition, getWebcamStatus, getWebcamWorker, getWorkoutFatigue, getWorkoutHistory, getWorkoutSnapshot, integrationEventUrl, startWebcamWorker, stopWebcamWorker, webcamPreviewUrl } from './services/api.js'
+import { getBackendHealth, getFederatedLearningResults, getFederatedLearningStatus, getLatestRepetition, getSdtDevice, getWebcamStatus, getWebcamWorker, getWorkoutFatigue, getWorkoutHistory, getWorkoutSnapshot, integrationEventUrl, startWebcamWorker, stopWebcamWorker, webcamPreviewUrl } from './services/api.js'
 import { acceptSnapshot, liveDisplay } from './services/workoutDisplay.js'
+import { applyLiveEvent, EMPTY_LIVE_WORKOUTS, mergeLiveEventsIntoSnapshot } from './services/liveWorkout.js'
 import { canStartWebcamWorker, webcamWorkoutDisplay } from './services/webcamDisplay.js'
 import { VoiceCoach, handleLocalVoiceEvent } from './services/voiceCoach.js'
 import './App.css'
@@ -44,6 +46,8 @@ function App() {
   const [activeExercise, setActiveExercise] = useState('pullUps')
   const [autoSimulate, setAutoSimulate] = useState(false)
   const [lastSnapshot, setLastSnapshot] = useState(null)
+  const [liveWorkouts, setLiveWorkouts] = useState(EMPTY_LIVE_WORKOUTS)
+  const [paceWarning, setPaceWarning] = useState(null)
   const [repetitionRevision, setRepetitionRevision] = useState(0)
   const [summaryRevision, setSummaryRevision] = useState(0)
   const [displayMode, setDisplayMode] = useState('webcam')
@@ -77,8 +81,11 @@ function App() {
     return data
   }, [])
   const healthResult = usePolling(getBackendHealth)
-  const liveResult = usePolling(getLatestRepetition, { enabled: activePage === 'dashboard' })
-  const snapshotResult = usePolling(getLiveSnapshot, { enabled: activePage === 'dashboard', intervalMs: 2000, refreshKey: repetitionRevision })
+  // The SSE stream is the normal update path. Keep a slower snapshot poll as
+  // recovery for a missed/rejected callback, rather than polling both the
+  // latest CIN and the full snapshot every few seconds.
+  const liveResult = usePolling(getLatestRepetition, { enabled: activePage === 'dashboard', intervalMs: null })
+  const snapshotResult = usePolling(getLiveSnapshot, { enabled: activePage === 'dashboard', intervalMs: 5000, refreshKey: repetitionRevision })
   const webcamStatus = usePolling(getWebcamStatus, { enabled: activePage === 'dashboard' && displayMode === 'webcam', intervalMs: 1500 })
   const pollWebcamWorker = useCallback(async (options) => {
     const result = await getWebcamWorker(options)
@@ -86,9 +93,11 @@ function App() {
     return result
   }, [])
   const webcamWorker = usePolling(pollWebcamWorker, { enabled: activePage === 'dashboard' && displayMode === 'webcam', intervalMs: 500, refreshKey: workerRevision })
+  const workerData = webcamWorker.status === 'success' ? webcamWorker.data : null
   async function controlWebcam(action) {
     if (workerActionLock.current) return
     workerActionLock.current = true
+    setPaceWarning(null)
     setWorkerAction({ busy: true, error: '', stopRequestedAt: action === 'stop' ? Date.now() : null })
     try {
       if (action === 'start') voiceCoach.unlock()
@@ -102,15 +111,38 @@ function App() {
       workerActionLock.current = false
     }
   }
-  const fatigueSessionId = displayMode === 'webcam' ? liveDisplay(lastSnapshot, displayMode, now)?.sessionId : null
+  const displayedSnapshot = useMemo(
+    () => mergeLiveEventsIntoSnapshot(lastSnapshot, liveWorkouts),
+    [lastSnapshot, liveWorkouts],
+  )
+  const fatigueSessionId = displayMode === 'webcam' ? liveDisplay(displayedSnapshot, displayMode, now)?.sessionId : null
+  const visiblePaceWarning = paceWarning &&
+    !['idle', 'stopped', 'completed', 'error'].includes(workerData?.state) &&
+    (!workerData?.sessionId || workerData.sessionId === paceWarning.sessionId)
+    ? paceWarning : null
   const getFatigue = useCallback(({ signal }) => getWorkoutFatigue(fatigueSessionId, { signal }), [fatigueSessionId])
-  const fatigueResult = usePolling(getFatigue, { enabled: activePage === 'dashboard' && Boolean(fatigueSessionId), intervalMs: 5000, refreshKey: repetitionRevision })
+  const fatigueResult = usePolling(getFatigue, { enabled: activePage === 'dashboard' && Boolean(fatigueSessionId), intervalMs: 5000 })
+  const sdtResult = usePolling(getSdtDevice, { enabled: activePage === 'dashboard', intervalMs: 10000 })
+  const flStatusResult = usePolling(getFederatedLearningStatus, { enabled: activePage === 'dashboard', intervalMs: 15000 })
+  const flResultsResult = usePolling(getFederatedLearningResults, { enabled: activePage === 'dashboard', intervalMs: 15000 })
   const historyResult = usePolling(getWorkoutHistory, { enabled: activePage === 'history', intervalMs: null })
 
   useEffect(() => {
     if (typeof EventSource === 'undefined') return undefined
     const stream = new EventSource(integrationEventUrl)
-    stream.addEventListener('repetition', () => setRepetitionRevision((value) => value + 1))
+    stream.addEventListener('repetition', ({ data }) => {
+      try {
+        setLiveWorkouts((current) => applyLiveEvent(current, JSON.parse(data)))
+      } catch { /* snapshot polling remains the recovery path */ }
+      setRepetitionRevision((value) => value + 1)
+    })
+    stream.addEventListener('pace_warning', ({ data }) => {
+      try {
+        const warning = JSON.parse(data)
+        setPaceWarning((previous) => previous?.warningId === warning.warningId ? previous : warning)
+        voiceCoach.warning(warning)
+      } catch { /* warning delivery is advisory; counts remain unaffected */ }
+    })
     stream.addEventListener('summary', () => setSummaryRevision((value) => value + 1))
     stream.addEventListener('recommendation', () => setSummaryRevision((value) => value + 1))
     stream.addEventListener('reconcile', () => {
@@ -118,7 +150,7 @@ function App() {
       setSummaryRevision((value) => value + 1)
     })
     return () => stream.close()
-  }, [])
+  }, [voiceCoach])
 
   useEffect(() => {
     const interval = window.setInterval(() => setNow(Date.now()), 1000)
@@ -187,7 +219,7 @@ function App() {
     <main className="main-content">
       <header className="topbar"><div className="mobile-brand"><div className="brand-mark"><span></span><span></span><span></span></div><strong>Cindy<span>Sense</span></strong></div><div className="breadcrumb"><span>Workspace</span><span>/</span><strong>{activePage === 'dashboard' ? 'Workout dashboard' : activePage === 'history' ? 'Workout history' : 'Cindy PT'}</strong></div><ConnectionStatus result={healthResult} /></header>
       <nav className="mobile-nav" aria-label="Mobile navigation">{[['dashboard', 'Dashboard'], ['history', 'History'], ['pt', 'Cindy PT']].map(([page, label]) => <button key={page} className={activePage === page ? 'active' : ''} onClick={() => setActivePage(page)}>{label}</button>)}</nav>
-      {activePage === 'dashboard' && <Dashboard secondsLeft={secondsLeft} formatTime={formatTime} timerProgress={timerProgress} workoutState={workoutState} setWorkoutState={setWorkoutState} resetWorkout={resetWorkout} reps={reps} rounds={rounds} activeExercise={activeExercise} setActiveExercise={setActiveExercise} incrementRep={incrementRep} currentExercise={currentExercise} autoSimulate={autoSimulate} setAutoSimulate={setAutoSimulate} liveResult={liveResult} snapshotResult={snapshotResult} webcamStatus={webcamStatus} webcamWorker={webcamWorker} lastKnownWorker={lastKnownWorker} workerAction={workerAction} controlWebcam={controlWebcam} lastSnapshot={lastSnapshot} displayMode={displayMode} setDisplayMode={setDisplayMode} now={now} voicePreferences={voicePreferences} setVoicePreferences={setVoicePreferences} voiceCoach={voiceCoach} fatigueResult={fatigueResult} fatigueSessionId={fatigueSessionId} />}
+      {activePage === 'dashboard' && <Dashboard secondsLeft={secondsLeft} formatTime={formatTime} timerProgress={timerProgress} workoutState={workoutState} setWorkoutState={setWorkoutState} resetWorkout={resetWorkout} reps={reps} rounds={rounds} activeExercise={activeExercise} setActiveExercise={setActiveExercise} incrementRep={incrementRep} currentExercise={currentExercise} autoSimulate={autoSimulate} setAutoSimulate={setAutoSimulate} liveResult={liveResult} snapshotResult={snapshotResult} webcamStatus={webcamStatus} webcamWorker={webcamWorker} lastKnownWorker={lastKnownWorker} workerAction={workerAction} controlWebcam={controlWebcam} lastSnapshot={displayedSnapshot} authoritativeSnapshot={lastSnapshot} displayMode={displayMode} setDisplayMode={setDisplayMode} now={now} voicePreferences={voicePreferences} setVoicePreferences={setVoicePreferences} voiceCoach={voiceCoach} fatigueResult={fatigueResult} fatigueSessionId={fatigueSessionId} paceWarning={visiblePaceWarning} sdtResult={sdtResult} flStatusResult={flStatusResult} flResultsResult={flResultsResult} />}
       {activePage === 'history' && <StoredHistoryPage result={historyResult} />}
       {activePage === 'pt' && <CindyPtPage summaryRevision={summaryRevision} />}
     </main>
@@ -211,7 +243,7 @@ function WebcamPreview() {
   </div>
 }
 
-function Dashboard({ secondsLeft, formatTime, timerProgress, workoutState, setWorkoutState, resetWorkout, reps, rounds, activeExercise, setActiveExercise, incrementRep, currentExercise, autoSimulate, setAutoSimulate, liveResult, snapshotResult, webcamStatus, webcamWorker, lastKnownWorker, workerAction, controlWebcam, lastSnapshot, displayMode, setDisplayMode, now, voicePreferences, setVoicePreferences, voiceCoach, fatigueResult, fatigueSessionId }) {
+function Dashboard({ secondsLeft, formatTime, timerProgress, workoutState, setWorkoutState, resetWorkout, reps, rounds, activeExercise, setActiveExercise, incrementRep, currentExercise, autoSimulate, setAutoSimulate, liveResult, snapshotResult, webcamStatus, webcamWorker, lastKnownWorker, workerAction, controlWebcam, lastSnapshot, authoritativeSnapshot, displayMode, setDisplayMode, now, voicePreferences, setVoicePreferences, voiceCoach, fatigueResult, fatigueSessionId, paceWarning, sdtResult, flStatusResult, flResultsResult }) {
   const demo = displayMode === 'demo'
   const worker = webcamWorker.status === 'success' ? webcamWorker.data : null
   const workerLive = displayMode === 'webcam' ? webcamWorkoutDisplay(worker) : null
@@ -222,7 +254,7 @@ function Dashboard({ secondsLeft, formatTime, timerProgress, workoutState, setWo
   const poseCurrent = displayMode === 'webcam' && webcamStatus.status === 'success' &&
     Number.isFinite(poseAge) && now - poseAge < 5000
   const sessionMismatch = poseCurrent && live && poseStatus.sessionId && poseStatus.sessionId !== live.sessionId
-  const confirmedForMode = lastSnapshot?.sources?.webcam?.counts?.[poseStatus?.exercise] ?? 0
+  const confirmedForMode = authoritativeSnapshot?.sources?.webcam?.counts?.[poseStatus?.exercise] ?? 0
   const pendingRepetitions = poseCurrent && !sessionMismatch && Number.isSafeInteger(poseStatus.detectedRepetitions)
     ? Math.max(0, poseStatus.detectedRepetitions - confirmedForMode) : null
   const shownReps = demo ? reps : live?.reps || INITIAL_REPS
@@ -272,10 +304,28 @@ function Dashboard({ secondsLeft, formatTime, timerProgress, workoutState, setWo
     <div className="hero-grid"><section className="timer-card panel"><div className="panel-header"><div><p className="eyebrow">CINDY AMRAP</p><h2>20-minute engine</h2></div><span className={`session-badge ${demo ? workoutState : live?.complete ? 'complete' : live ? 'running' : 'idle'}`}><span className="status-dot"></span>{statusLabel}</span></div><div className="timer-display"><div className="timer-ring" style={{ '--progress': `${shownProgress * 3.6}deg` }}><div><span>{formatTime(shownSeconds)}</span><small>{shownSeconds === 0 ? 'DONE' : 'REMAINING'}</small></div></div></div><div className="timer-controls">{demo ? <>{workoutState === 'running' ? <button className="control-btn primary" onClick={() => setWorkoutState('paused')}><Icon name="pause" size={16} /> Pause</button> : <button className="control-btn primary" onClick={() => setWorkoutState('running')}><Icon name="play" size={16} /> {workoutState === 'paused' ? 'Resume' : 'Start workout'}</button>}<button className="control-btn secondary" onClick={resetWorkout}><Icon name="rotate" size={16} /> Reset</button></> : <span className="live-timer-note">Timer follows the selected source session</span>}</div><div className="timer-meta"><span><b>20:00</b> target</span><span><b>{Math.round(shownProgress)}%</b> elapsed</span><span><b>AMRAP</b> format</span></div></section>
       <section className="round-card panel"><div className="panel-header"><div><p className="eyebrow">SESSION SCORE</p><h2>Round tracker</h2></div><div className="round-number"><span>ROUND</span><strong>{String(shownRounds + 1).padStart(2, '0')}</strong></div></div><div className="round-progress"><div className="round-progress-top"><span>Current round</span><strong>{Math.round((totalReps / 30) * 100)}%</strong></div><div className="progress-track"><span style={{ width: `${(totalReps / 30) * 100}%` }}></span></div></div><div className="exercise-list">{EXERCISES.map((exercise) => <button className={`exercise-row ${activeExercise === exercise.key ? 'selected' : ''}`} key={exercise.key} onClick={() => setActiveExercise(exercise.key)}><span className={`exercise-icon ${exercise.color}`}>{exercise.icon}</span><span className="exercise-name"><strong>{exercise.label}</strong><small>{shownReps[exercise.key] >= exercise.target ? 'Complete' : `${exercise.target - shownReps[exercise.key]} reps to go`}</small></span><span className="exercise-count"><b>{String(shownReps[exercise.key]).padStart(2, '0')}</b><i>/{exercise.target}</i></span>{shownReps[exercise.key] >= exercise.target && <Icon name="check" size={16} />}</button>)}</div><div className="round-total"><span>Completed rounds</span><strong>{shownRounds}</strong></div></section></div>
     {demo && <section className="rep-console panel"><div className="panel-header"><div><p className="eyebrow">DEMO CONTROLS</p><h2>Simulate movement</h2></div><label className="toggle-label"><span>Auto simulate</span><button className={`toggle ${autoSimulate ? 'on' : ''}`} onClick={() => setAutoSimulate(!autoSimulate)} aria-label="Toggle auto simulate"><span></span></button></label></div><div className="rep-console-body"><div className="focus-exercise"><span className={`exercise-icon ${currentExercise.color}`}>{currentExercise.icon}</span><div><small>ACTIVE MOVEMENT</small><strong>{currentExercise.label}</strong></div></div><button className="rep-btn" onClick={() => incrementRep()} disabled={reps[currentExercise.key] >= currentExercise.target}><span>+1</span> Add {currentExercise.label} rep</button><div className="exercise-shortcuts">{EXERCISES.map((exercise) => <button key={exercise.key} className={activeExercise === exercise.key ? 'active' : ''} onClick={() => { setActiveExercise(exercise.key); incrementRep(exercise.key) }}><span className={`mini-dot ${exercise.color}`}></span>{exercise.label}</button>)}</div></div><p className="demo-note"><Icon name="zap" size={14} /> Timer, exercise counters, and round score are simulated. Stored TinyIoT content below is read-only and does not update this session.</p></section>}
-    {!demo && <><PerformanceMonitor result={fatigueResult} sessionId={fatigueSessionId} /><FatiguePanel result={fatigueResult} sessionId={fatigueSessionId} live={Boolean(live && !live.stale)} /></>}
+    {!demo && <><SdtDevicePanel result={sdtResult} /><PerformanceMonitor result={fatigueResult} sessionId={fatigueSessionId} warning={paceWarning} /><FatiguePanel result={fatigueResult} sessionId={fatigueSessionId} live={Boolean(live && !live.stale)} /><FederatedLearningPanel status={flStatusResult} results={flResultsResult} /></>}
     <StoredRepetitionPanel result={liveResult} snapshot={lastSnapshot} />
     <section className="bottom-grid"><div className="insight-card panel"><div className="insight-icon">â†—</div><div><p className="eyebrow">TODAY'S INSIGHT</p><h3>Consistency beats intensity.</h3><p>Keep your transitions smooth and save your sprint for the final 3 minutes.</p></div><span className="insight-tag">SIMULATED</span></div><div className="mini-stats panel"><div><span>Last workout</span><strong>4 rounds</strong><small>+1 from average</small></div><div><span>Weekly volume</span><strong>12.4k</strong><small>reps logged</small></div><div><span>Streak</span><strong>06 days</strong><small>Personal best</small></div></div></section>
   </div>
+}
+
+function SdtDevicePanel({ result }) {
+  const device = result.data?.cindySenseWorkoutTracker
+  const tracking = device?.exerciseTracking
+  const session = device?.workoutSession
+  const pace = device?.paceMonitoring
+  const coaching = device?.coaching
+  return <section className="panel sdt-panel" aria-label="CindySense SDT device">
+    <div className="panel-header"><div><p className="eyebrow">DEVICE MODEL</p><h2>CindySense SDT</h2></div><span className="stored-tag">{result.status === 'success' && result.data?.available ? 'READ-ONLY' : 'UNAVAILABLE'}</span></div>
+    <p className="pt-message">cindySenseWorkoutTracker · {result.data?.modules?.length || 0} modules · existing oneM2M data</p>
+    <div className="sdt-grid">
+      <span><small>Exercise</small><strong>{tracking?.exerciseType || 'Unknown'} · {tracking?.repetitionCount ?? '—'} reps</strong></span>
+      <span><small>Session</small><strong>{session?.sessionStatus || 'Unknown'} · {session?.sessionId || '—'}</strong></span>
+      <span><small>Pace</small><strong>{pace?.performanceState || 'Unknown'}{pace?.slowdownPercent != null ? ` · ${pace.slowdownPercent}%` : ''}</strong></span>
+      <span><small>Coaching</small><strong>{coaching?.coachingStatus || 'Unknown'} · {coaching?.roundsRemaining ?? '—'} rounds left</strong></span>
+    </div>
+  </section>
 }
 
 export default App

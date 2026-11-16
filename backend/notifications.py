@@ -12,13 +12,14 @@ from uuid import uuid4
 from pydantic import ValidationError
 
 from .events import classify_repetition_content
+from .performance import PaceWarningAnalyzer, PaceWarningConfig
 from .tinyiot import TinyIoTError
 
 log = logging.getLogger(__name__)
 
 
 class NotificationHub:
-    def __init__(self):
+    def __init__(self, pace_warning_config: PaceWarningConfig | None = None):
         self.subscriptions = {}
         self.subscription_ids = {}
         self.listeners = set()
@@ -28,8 +29,18 @@ class NotificationHub:
         self.duplicate_callbacks = 0
         self.rejected_callbacks = 0
         self.sse_queue_drops = 0
+        self.notifications_received = 0
+        self.accepted_callbacks = 0
+        self.readback_failures = 0
+        self.last_successful_callback_at = None
+        self._subscription_activity = {}
         self.instance_id = uuid4().hex
+        # Validation performs network I/O before this point.  Serialize only
+        # the short deduplication/side-effect section so simultaneous CSE
+        # retries cannot both enqueue coaching or publish the same SSE event.
+        self._dedupe_lock = asyncio.Lock()
         self.on_summary = None
+        self.pace_warning_analyzer = PaceWarningAnalyzer(pace_warning_config)
 
     def publish(self, kind, data=None):
         for listener in tuple(self.listeners):
@@ -43,10 +54,23 @@ class NotificationHub:
     def metrics(self):
         """Aggregate delivery diagnostics; no tokens, resource contents, or originators."""
         return {'instanceId': self.instance_id,
+                'notificationsReceived': self.notifications_received,
+                'acceptedCallbacks': self.accepted_callbacks,
                 'validatedCallbacks': self.validated_callbacks,
                 'duplicateCallbacks': self.duplicate_callbacks,
                 'rejectedCallbacks': self.rejected_callbacks,
+                'readbackFailures': self.readback_failures,
+                'lastSuccessfulCallbackAt': self.last_successful_callback_at,
+                'subscriptionActivity': {
+                    key: dict(value) for key, value in self._subscription_activity.items()
+                },
                 'sseQueueDrops': self.sse_queue_drops}
+
+    def record_received(self):
+        self.notifications_received += 1
+
+    def record_rejected(self):
+        self.rejected_callbacks += 1
 
     def remember(self, key):
         if key in self.seen:
@@ -140,6 +164,7 @@ class NotificationHub:
         if not isinstance(signal, dict):
             raise ValueError('missing m2m:sgn')
         if signal.get('vrq') is True:
+            self.last_successful_callback_at = datetime.now(timezone.utc).isoformat(timespec='milliseconds')
             return 'verification', rqi
         nev = signal.get('nev')
         if not isinstance(nev, dict) or nev.get('net') not in (3, '3'):
@@ -158,6 +183,12 @@ class NotificationHub:
         if len(matches) != 1:
             raise ValueError('unknown subscription reference')
         kind = matches[0]
+        activity_key = sur_ri or normalized_sur
+        activity = self._subscription_activity.setdefault(
+            activity_key, {'received': 0, 'accepted': 0, 'duplicates': 0,
+                            'lastReceivedAt': None})
+        activity['received'] += 1
+        activity['lastReceivedAt'] = datetime.now(timezone.utc).isoformat(timespec='milliseconds')
         rep = nev.get('rep')
         cin = rep.get('m2m:cin') if isinstance(rep, dict) else None
         if not isinstance(cin, dict) or not isinstance(cin.get('rn'), str):
@@ -167,7 +198,11 @@ class NotificationHub:
         if not name or '/' in name or name in ('.', '..'):
             raise ValueError('invalid content instance name')
         read_origin = settings.workout_origin if kind == 'repetition' else settings.cindypt_origin
-        stored = await client.retrieve(f'{resource}/{name}', read_origin)
+        try:
+            stored = await client.retrieve(f'{resource}/{name}', read_origin)
+        except TinyIoTError:
+            self.readback_failures += 1
+            raise
         content, instance = client.parse_content_instance(stored)
         if cin.get('ri') and cin['ri'] != instance.get('ri'):
             raise ValueError('content instance identity mismatch')
@@ -196,25 +231,38 @@ class NotificationHub:
             if not isinstance(summary.status, str) or summary.status.lower() not in ('complete', 'completed'):
                 raise ValueError('workout summary is not completed')
         key = (kind, instance.get('ri') or f'{resource}/{name}')
-        # A CSE can retry the same notification.  Do not invoke the coaching
-        # enqueue callback twice for the same stored CIN; the durable SQLite
-        # queue is the second idempotency boundary, while this prevents
-        # duplicate callback side effects and needless work.
-        already_seen = key in self.seen
-        if kind == 'summary' and self.on_summary is not None and not already_seen and not (
-                isinstance(content, dict) and (content.get('synthetic') is True or
-                                               content.get('source') not in (None, 'webcam'))):
-            self.on_summary(f'{resource}/{name}', str(key[1]))
-        self.validated_callbacks += 1
-        if self.remember(key):
+        # A CSE can retry the same notification.  Retrieval/validation may
+        # happen concurrently, so the dedupe check and all local side effects
+        # must be one atomic section.  The lock is not held during TinyIoT I/O.
+        async with self._dedupe_lock:
+            self.validated_callbacks += 1
+            self.accepted_callbacks += 1
+            if key in self.seen:
+                self.duplicate_callbacks += 1
+                activity['duplicates'] += 1
+                self.last_successful_callback_at = datetime.now(timezone.utc).isoformat(timespec='milliseconds')
+                return kind, rqi
+            if kind == 'summary' and self.on_summary is not None and not (
+                    isinstance(content, dict) and (content.get('synthetic') is True or
+                                                   content.get('source') not in (None, 'webcam'))):
+                self.on_summary(f'{resource}/{name}', str(key[1]))
             data = {}
             if kind == 'repetition':
                 data = {'eventId': str(event.event_id), 'eventSequence': event.event_sequence,
                         'sessionId': event.session_id, 'source': event.source,
+                        'exercise': event.exercise, 'repetitions': event.repetitions,
+                        'round': event.round,
                         'timestamp': event.timestamp.isoformat(),
                         'cinCreatedAt': instance.get('ct'),
                         'callbackReceivedAt': datetime.now(timezone.utc).isoformat(timespec='milliseconds')}
             self.publish(kind, data)
-        else:
-            self.duplicate_callbacks += 1
+            if kind == 'repetition':
+                warning = self.pace_warning_analyzer.process(event)
+                if warning is not None:
+                    self.publish('pace_warning', warning)
+            # Mark only after local side effects succeed.  If the durable
+            # coaching enqueue raises, the CSE retry can safely retry this CIN.
+            self.remember(key)
+            activity['accepted'] += 1
+            self.last_successful_callback_at = datetime.now(timezone.utc).isoformat(timespec='milliseconds')
         return kind, rqi

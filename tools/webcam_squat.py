@@ -177,8 +177,13 @@ def main():
                       "visibility", "phase", "repCount", "angleDeg", "trackedSide",
                       "confidence", "bodyMovement", "exerciseReps", "rounds", "sessionId",
                       "headPosition", "lateralPosition", "detectorReason", "lastRejection",
+                      "squatCandidate", "squatCandidateMinAngleDeg", "squatCandidatePeakMovement",
+                      "squatCandidateAgeMs", "squatCandidateMissingFrames", "squatDecision",
+                      "squatFastCycle", "squatFastWindow", "squatFastDownFrames", "squatFastUpFrames",
+                      "squatSampleGapMs", "squatSmoothingMode",
                       "eventId", "eventQueueDepth", "captureWaitMs", "frameAgeMs",
-                      "droppedFrames", "frameGapMs", "poseMs"]
+                      "droppedFrames", "frameGapMs", "poseMs", "cameraReadFailures",
+                      "cameraConsecutiveReadFailures", "cameraRecoveries"]
             writer = csv.DictWriter(f, fieldnames=fields)
             writer.writeheader()
             while True:
@@ -342,6 +347,7 @@ def main():
                         "rounds": rounds_text, "sessionId": session_id,
                         **publisher.diagnostics(),
                     })
+                squat_diag = display_counter.squat_diagnostics(ts_ms)
                 writer.writerow({"timestampUtc": timestamp, "elapsedMs": ts_ms, "exercise": display_exercise,
                                  "kneeAngleDeg": f"{angle:.2f}" if display_exercise == "squat" and angle is not None else "",
                                  "trackedLeg": side if display_exercise == "squat" else "NONE",
@@ -354,12 +360,27 @@ def main():
                                  "headPosition": f"{head_position:.4f}" if head_position is not None else "",
                                  "lateralPosition": f"{lateral_position:.4f}" if lateral_position is not None else "",
                                  "detectorReason": reason, "lastRejection": display_counter.last_rejection or "",
+                                 "squatCandidate": squat_diag.get("candidate", False),
+                                 "squatCandidateMinAngleDeg": squat_diag.get("candidateMinAngleDeg") or "",
+                                 "squatCandidatePeakMovement": squat_diag.get("candidatePeakMovement", ""),
+                                 "squatCandidateAgeMs": squat_diag.get("candidateAgeMs") or "",
+                                 "squatCandidateMissingFrames": squat_diag.get("candidateMissingFrames", ""),
+                                 "squatDecision": squat_diag.get("decision") or "",
+                                 "squatFastCycle": squat_diag.get("fastCycle", False),
+                                 "squatFastWindow": squat_diag.get("fastWindow", False),
+                                 "squatFastDownFrames": squat_diag.get("fastDownFrames", 0),
+                                 "squatFastUpFrames": squat_diag.get("fastUpFrames", 0),
+                                 "squatSampleGapMs": squat_diag.get("sampleGapMs") or "",
+                                 "squatSmoothingMode": squat_diag.get("smoothingMode") or "",
                                  "eventId": event["eventId"] if event is not None else "",
                                  "eventQueueDepth": publisher.diagnostics()["eventQueueDepth"] if publisher else 0,
                                  "captureWaitMs": round(capture_ms, 1),
                                  "frameAgeMs": round(frame_age_ms, 1),
                                  "droppedFrames": camera.diagnostics()["droppedFrames"],
-                                 "frameGapMs": frame_gap_ms, "poseMs": pose_ms})
+                                 "frameGapMs": frame_gap_ms, "poseMs": pose_ms,
+                                 "cameraReadFailures": camera.diagnostics()["readFailures"],
+                                 "cameraConsecutiveReadFailures": camera.diagnostics()["consecutiveReadFailures"],
+                                 "cameraRecoveries": camera.diagnostics()["recoveries"]})
                 if dashboard and time.monotonic() - last_dashboard_update >= 0.15:
                     values = dict(state='running', sessionId=session_id,
                                      durationSeconds=workout.duration_seconds,

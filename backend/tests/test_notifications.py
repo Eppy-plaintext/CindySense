@@ -7,7 +7,7 @@ from uuid import uuid4
 import httpx
 
 from backend.notifications import NotificationHub
-from backend.tinyiot import TinyIoTClient
+from backend.tinyiot import TinyIoTClient, TinyIoTError
 from backend import main
 
 
@@ -202,6 +202,58 @@ class NotificationTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             await self.hub.receive(signal, headers, TOKEN, self.client, self.settings)
         self.assertTrue(listener.empty())
+
+    async def test_simultaneous_duplicate_callbacks_have_one_side_effect(self):
+        await self.hub.ensure(self.client, self.settings)
+        listener = __import__('asyncio').Queue()
+        self.hub.listeners.add(listener)
+        signal = {'m2m:sgn': {'sur': REPS + '/cindysense-fastapi-repetitions',
+                             'nev': {'net': 3, 'rep': {'m2m:cin': {'rn': 'event',
+                                                                  'ri': 'event-ri'}}}}}
+        headers = {'x-m2m-ri': 'concurrent', 'x-m2m-origin': 'TinyIoT', 'x-m2m-rvi': '4'}
+        results = await __import__('asyncio').gather(
+            self.hub.receive(signal, headers, TOKEN, self.client, self.settings),
+            self.hub.receive(signal, headers, TOKEN, self.client, self.settings),
+        )
+        self.assertEqual([item[0] for item in results], ['repetition', 'repetition'])
+        self.assertEqual(listener.qsize(), 1)
+        self.assertEqual(self.hub.metrics()['duplicateCallbacks'], 1)
+
+    async def test_equivalent_subscription_callbacks_share_cin_dedupe_key(self):
+        await self.hub.ensure(self.client, self.settings)
+        self.hub.subscriptions['repetition'].append(REPS + '/RepCount_Sub')
+        self.hub.subscription_ids['repetition'].append('legacy-repetition-ri')
+        listener = __import__('asyncio').Queue()
+        self.hub.listeners.add(listener)
+        headers = {'x-m2m-ri': 'equivalent', 'x-m2m-origin': 'TinyIoT', 'x-m2m-rvi': '4'}
+        for subscription in (REPS + '/cindysense-fastapi-repetitions',
+                             REPS + '/RepCount_Sub'):
+            signal = {'m2m:sgn': {'sur': subscription,
+                                 'nev': {'net': 3, 'rep': {'m2m:cin': {'rn': 'event',
+                                                                      'ri': 'event-ri'}}}}}
+            await self.hub.receive(signal, headers, TOKEN, self.client, self.settings)
+        self.assertEqual(listener.qsize(), 1)
+        self.assertEqual(self.hub.metrics()['duplicateCallbacks'], 1)
+
+    async def test_readback_failure_is_counted_and_retry_can_succeed(self):
+        await self.hub.ensure(self.client, self.settings)
+        signal = {'m2m:sgn': {'sur': REPS + '/cindysense-fastapi-repetitions',
+                             'nev': {'net': 3, 'rep': {'m2m:cin': {'rn': 'event',
+                                                                  'ri': 'event-ri'}}}}}
+        headers = {'x-m2m-ri': 'readback', 'x-m2m-origin': 'TinyIoT', 'x-m2m-rvi': '4'}
+        original = self.client.retrieve
+
+        async def unavailable(path, origin, expected_not_found=False):
+            if path.endswith('/event'):
+                raise TinyIoTError('tinyiot_unreachable', 'temporarily unavailable', 503)
+            return await original(path, origin, expected_not_found=expected_not_found)
+
+        with patch.object(self.client, 'retrieve', side_effect=unavailable):
+            with self.assertRaises(TinyIoTError):
+                await self.hub.receive(signal, headers, TOKEN, self.client, self.settings)
+        self.assertEqual(self.hub.metrics()['readbackFailures'], 1)
+        await self.hub.receive(signal, headers, TOKEN, self.client, self.settings)
+        self.assertEqual(self.hub.metrics()['acceptedCallbacks'], 1)
 
     async def test_synthetic_summary_is_validated_but_not_queued_for_coaching(self):
         await self.hub.ensure(self.client, self.settings)

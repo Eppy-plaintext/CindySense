@@ -29,6 +29,23 @@ class FakeCapture:
         self.released.set()
 
 
+class RecoveringCapture(FakeCapture):
+    def __init__(self, failures=2):
+        super().__init__()
+        self.failures = failures
+
+    def read(self):
+        self.value += 1
+        if self.value <= self.failures:
+            return False, None
+        return True, self.value
+
+
+class FailingCapture(FakeCapture):
+    def read(self):
+        return False, None
+
+
 class CameraBufferTests(unittest.TestCase):
     def test_consumer_receives_newest_frame_and_drops_stale_frames(self):
         capture = FakeCapture()
@@ -55,6 +72,31 @@ class CameraBufferTests(unittest.TestCase):
         with patch("tools.webcam_camera.cv2.VideoCapture", return_value=capture):
             with self.assertRaises(RuntimeError):
                 LatestFrameCamera().start(timeout=0.1)
+
+    def test_transient_read_failure_recovers_without_ending_capture(self):
+        capture = RecoveringCapture(failures=2)
+        with patch("tools.webcam_camera.cv2.VideoCapture", return_value=capture):
+            camera = LatestFrameCamera()
+            camera.start(timeout=2)
+            try:
+                ok, frame, _ = camera.read(timeout=1)
+                self.assertTrue(ok)
+                self.assertGreaterEqual(frame, 3)
+                diagnostics = camera.diagnostics()
+                self.assertEqual(diagnostics["readFailures"], 2)
+                self.assertEqual(diagnostics["recoveries"], 1)
+                self.assertEqual(diagnostics["consecutiveReadFailures"], 0)
+            finally:
+                camera.close()
+
+    def test_prolonged_read_failure_is_bounded_and_reported(self):
+        capture = FailingCapture()
+        with patch("tools.webcam_camera.cv2.VideoCapture", return_value=capture):
+            camera = LatestFrameCamera()
+            with self.assertRaisesRegex(RuntimeError, "did not deliver"):
+                camera.start(timeout=0.2)
+            self.assertGreaterEqual(camera.diagnostics()["readFailures"], 1)
+            camera.close()
 
 
 if __name__ == "__main__":

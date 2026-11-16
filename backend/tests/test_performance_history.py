@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 from backend.events import RepetitionEvent
-from backend.performance import analyze_performance
+from backend.performance import PaceWarningAnalyzer, PaceWarningConfig, analyze_performance
 from backend.workout_history import build_history
 
 
@@ -43,6 +43,49 @@ class PerformanceTests(unittest.TestCase):
         result = analyze_performance(first + shifted)
         self.assertEqual(result['exercises']['pushup']['intervalCount'], 6)
         self.assertEqual(len(result['rounds']), 2)
+
+    def test_live_warning_requires_sufficient_repeated_relative_slowdown(self):
+        analyzer = PaceWarningAnalyzer(PaceWarningConfig(cooldown_seconds=60))
+        observed = None
+        for item in events([2, 2, 2, 2, 4, 4, 4, 4, 4]):
+            observed = analyzer.process(item)
+        self.assertIsNotNone(observed)
+        self.assertEqual(observed['exercise'], 'pushup')
+        self.assertGreaterEqual(observed['paceChangePercent'], 35)
+
+    def test_live_warning_does_not_use_insufficient_or_possible_rest_data(self):
+        analyzer = PaceWarningAnalyzer()
+        self.assertIsNone(analyzer.process(events([2])[0]))
+        gap_events = events([2, 2, 2, 2, 12, 2, 2, 2, 2, 2])
+        warnings = [analyzer.process(item) for item in gap_events]
+        self.assertFalse(any(warnings))
+
+    def test_live_warning_rearms_after_recovery_and_respects_cooldown(self):
+        analyzer = PaceWarningAnalyzer(PaceWarningConfig(cooldown_seconds=60))
+        first = None
+        items = events([2, 2, 2, 2, 4, 4, 4, 4, 4])
+        for item in items:
+            first = analyzer.process(item) or first
+        self.assertIsNotNone(first)
+        stable = events([2, 2, 2, 2], exercise='pushup')
+        stable = [item.model_copy(update={'session_id': 'webcam-real',
+                                         'event_sequence': item.event_sequence + 9,
+                                         'repetitions': item.repetitions + 9,
+                                         'timestamp': item.timestamp + timedelta(seconds=20)})
+                  for item in stable]
+        for item in stable:
+            analyzer.process(item)
+        self.assertTrue(analyzer.armed['pushup'])
+
+    def test_live_warning_state_resets_for_a_new_session(self):
+        analyzer = PaceWarningAnalyzer()
+        for item in events([2, 2, 2, 2, 4, 4, 4, 4, 4]):
+            analyzer.process(item)
+        self.assertEqual(analyzer.session_id, 'webcam-real')
+        new_event = events([2])[0].model_copy(update={'session_id': 'webcam-new'})
+        self.assertIsNone(analyzer.process(new_event))
+        self.assertEqual(analyzer.session_id, 'webcam-new')
+        self.assertEqual(len(analyzer.events), 1)
 
 
 class HistoryTests(unittest.TestCase):

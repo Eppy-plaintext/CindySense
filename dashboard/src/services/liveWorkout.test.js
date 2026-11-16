@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { applyLiveEvent, EMPTY_LIVE_WORKOUTS } from './liveWorkout.js'
+import { applyLiveEvent, EMPTY_LIVE_WORKOUTS, mergeLiveEventsIntoSnapshot } from './liveWorkout.js'
 
 const event = (exercise, repetitions, eventId, extras = {}) => ({
   eventId, sessionId: 'webcam-session-1', source: 'webcam', exercise,
@@ -47,4 +47,27 @@ test('events without a valid source or identity do not change counts', () => {
   const invalid = event('squat', 1, 'one', { source: 'unknown' })
   assert.equal(applyLiveEvent(EMPTY_LIVE_WORKOUTS, invalid), EMPTY_LIVE_WORKOUTS)
   assert.equal(applyLiveEvent(EMPTY_LIVE_WORKOUTS, event('squat', 1, '')), EMPTY_LIVE_WORKOUTS)
+})
+
+test('out-of-order events from one session still advance another exercise', () => {
+  let state = applyLiveEvent(EMPTY_LIVE_WORKOUTS, event('squat', 2, 's2', { timestamp: '2026-11-06T12:00:02Z' }))
+  state = applyLiveEvent(state, event('pushup', 1, 'p1', { timestamp: '2026-11-06T12:00:01Z' }))
+  assert.deepEqual(state.webcam.counts, { pullUps: 0, pushUps: 1, squats: 2 })
+})
+
+test('duplicate SSE event and stale absolute count do not change state', () => {
+  const first = applyLiveEvent(EMPTY_LIVE_WORKOUTS, event('squat', 2, 's2'))
+  assert.equal(applyLiveEvent(first, event('squat', 2, 's2')), first)
+  assert.equal(applyLiveEvent(first, event('squat', 1, 'older')), first)
+})
+
+test('SSE counts appear immediately while snapshot metadata remains authoritative', () => {
+  const base = { retrievedAt: '2026-11-06T12:00:05Z', snapshotRevision: 4, sources: { webcam: {
+    sessionId: 'webcam-session-1', counts: { pullup: 0, pushup: 0, squat: 1 },
+    completedRounds: 0, startAt: '2026-11-06T12:00:00Z', lastEventAt: '2026-11-06T12:00:05Z',
+  } } }
+  const state = applyLiveEvent(EMPTY_LIVE_WORKOUTS, event('squat', 2, 'two', { timestamp: '2026-11-06T12:00:06Z' }))
+  const shown = mergeLiveEventsIntoSnapshot(base, state)
+  assert.equal(shown.sources.webcam.counts.squat, 2)
+  assert.equal(shown.sources.webcam.startAt, base.sources.webcam.startAt)
 })

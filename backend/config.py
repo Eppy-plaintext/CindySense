@@ -39,6 +39,14 @@ class Settings:
     notification_token: str = os.getenv('CINDYSENSE_NOTIFICATION_TOKEN', '')
     subscription_origin: str = os.getenv('TINYIOT_SUBSCRIPTION_ORIGIN', '')
     notification_origin: str = os.getenv('TINYIOT_NOTIFICATION_ORIGIN', '')
+    pace_warning_slowdown_ratio: float = float(os.getenv('CINDYSENSE_PACE_WARNING_RATIO', '1.35'))
+    pace_warning_minimum_intervals: int = int(os.getenv('CINDYSENSE_PACE_WARNING_MIN_INTERVALS', '7'))
+    pace_warning_required_evidence: int = int(os.getenv('CINDYSENSE_PACE_WARNING_EVIDENCE', '2'))
+    pace_warning_cooldown_seconds: int = int(os.getenv('CINDYSENSE_PACE_WARNING_COOLDOWN_SECONDS', '60'))
+    subscription_monitor_enabled: bool = os.getenv('CINDYSENSE_SUBSCRIPTION_MONITOR_ENABLED', 'true').lower() == 'true'
+    subscription_monitor_interval_seconds: float = float(os.getenv('CINDYSENSE_SUBSCRIPTION_MONITOR_INTERVAL_SECONDS', '60'))
+    subscription_recovery_enabled: bool = os.getenv('CINDYSENSE_SUBSCRIPTION_RECOVERY_ENABLED', 'true').lower() == 'true'
+    subscription_monitor_max_backoff_seconds: float = float(os.getenv('CINDYSENSE_SUBSCRIPTION_MONITOR_MAX_BACKOFF_SECONDS', '300'))
 
 
 settings = Settings()

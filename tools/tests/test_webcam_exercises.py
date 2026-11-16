@@ -169,6 +169,82 @@ class ExerciseCounterTests(unittest.TestCase):
             stamp += 32
         self.assertEqual((counter.reps, detections), (1, 1))
 
+    def test_squat_preserves_down_state_through_temporary_landmark_loss(self):
+        counter = ExerciseCounter("squat")
+        stamp = 0
+        for _ in range(8):
+            counter.update(170, .40, timestamp_ms=stamp)
+            stamp += 32
+        for _ in range(4):
+            counter.update(80, .52, timestamp_ms=stamp)
+            stamp += 32
+        self.assertEqual(counter.phase, "DOWN")
+        for _ in range(3):
+            self.assertFalse(counter.update(None, None, timestamp_ms=stamp))
+            stamp += 32
+        detected = 0
+        for _ in range(6):
+            detected += counter.update(170, .40, timestamp_ms=stamp)
+            stamp += 32
+        self.assertEqual((counter.reps, detected), (1, 1))
+        diagnostics = counter.squat_diagnostics(stamp)
+        self.assertFalse(diagnostics["candidate"])
+        self.assertIn("accepted:", diagnostics["decision"])
+        self.assertIn("mode=", diagnostics["decision"])
+        self.assertLessEqual(diagnostics["candidateMinAngleDeg"], 115.0)
+
+    def test_squat_diagnostics_expose_fast_confirmation_without_console_logging(self):
+        counter = ExerciseCounter("squat")
+        stamp = 0
+        for _ in range(8):
+            counter.update(170, .40, timestamp_ms=stamp)
+            stamp += 32
+        for angle, position in ((130, .44), (80, .52), (70, .56)):
+            counter.update(angle, position, timestamp_ms=stamp)
+            stamp += 32
+        diagnostics = counter.squat_diagnostics(stamp)
+        self.assertTrue(diagnostics["candidate"])
+        self.assertGreaterEqual(diagnostics["fastDownFrames"], 0)
+        self.assertIn("candidate:", diagnostics["decision"])
+
+    def test_rapid_squat_cycles_with_one_missing_frame_count_once(self):
+        counter = ExerciseCounter("squat")
+        stamp = 0
+        detected = 0
+        for _ in range(8):
+            detected += counter.update(170, .40, timestamp_ms=stamp)
+            stamp += 32
+        for cycle in range(2):
+            if cycle:
+                for _ in range(6):
+                    detected += counter.update(170, .40, timestamp_ms=stamp)
+                    stamp += 32
+            for angle, position in ((130, .44), (80, .50), (70, .52),
+                                    (105, .50), (145, .44), (170, .40), (170, .40)):
+                if cycle == 0 and angle == 145:
+                    detected += counter.update(None, None, timestamp_ms=stamp)
+                else:
+                    detected += counter.update(angle, position, timestamp_ms=stamp)
+                stamp += 32
+        self.assertEqual((counter.reps, detected), (2, 2))
+
+    def test_long_squat_landmark_loss_records_rejection_evidence(self):
+        counter = ExerciseCounter("squat")
+        for _ in range(8):
+            counter.update(170, .40)
+        for _ in range(6):
+            counter.update(80, .52)
+        self.assertEqual(counter.phase, "DOWN")
+        for _ in range(ExerciseCounter.MAX_MISSING_FRAMES):
+            counter.update(None, None)
+        diagnostics = counter.squat_diagnostics()
+        self.assertEqual(counter.phase, "UNKNOWN")
+        self.assertEqual(counter.reps, 0)
+        self.assertEqual(counter.rejected_candidates, 1)
+        self.assertFalse(diagnostics["candidate"])
+        self.assertIn("rejected:", diagnostics["decision"])
+        self.assertIn("landmarks missing", diagnostics["decision"])
+
     def test_fast_path_does_not_bridge_sparse_frames_or_long_dropout(self):
         down = [(130, .44), (80, .50), (70, .52)]
         up = [(105, .50), (145, .44), (170, .40), (170, .40)]
@@ -186,6 +262,29 @@ class ExerciseCounterTests(unittest.TestCase):
             self.assertFalse(interrupted.update(170, .40, timestamp_ms=stamp))
             stamp += 32
         self.assertEqual(interrupted.reps, 0)
+
+    def test_squat_gap_recovery_catches_up_filter_without_one_frame_count(self):
+        counter = ExerciseCounter("squat")
+        stamp = 0
+        for _ in range(8):
+            counter.update(170, .40, timestamp_ms=stamp)
+            stamp += 32
+        # Simulate a pose-processing stall while the squat is descending.
+        counter.update(80, .52, timestamp_ms=stamp + 400)
+        self.assertEqual(counter.squat_diagnostics()["smoothingMode"], "gap_recovery")
+        counter.update(80, .52, timestamp_ms=stamp + 432)
+        counter.update(80, .52, timestamp_ms=stamp + 464)
+        self.assertFalse(counter.update(170, .40, timestamp_ms=stamp + 496))
+        # Multiple confirmed return samples are required; one post-stall frame
+        # cannot fabricate a repetition.
+        self.assertFalse(counter.update(170, .40, timestamp_ms=stamp + 528))
+        self.assertFalse(counter.update(170, .40, timestamp_ms=stamp + 560))
+        self.assertFalse(counter.update(170, .40, timestamp_ms=stamp + 592))
+        detected = False
+        for offset in (624, 656, 688):
+            detected = counter.update(170, .40, timestamp_ms=stamp + offset) or detected
+        self.assertTrue(detected)
+        self.assertEqual(counter.reps, 1)
 
     def test_requires_full_cycle_and_stable_transitions(self):
         counter = ExerciseCounter("squat")

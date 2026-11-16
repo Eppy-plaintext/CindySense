@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+from datetime import datetime, timedelta, timezone
+from time import perf_counter
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -10,7 +12,9 @@ from uuid import uuid4
 import httpx
 
 from backend import main
+from backend.events import RepetitionEvent
 from backend.notifications import NotificationHub
+from backend.sdt import build_device_sdt
 from backend.tinyiot import TinyIoTClient
 from backend.workout_snapshot import WorkoutSnapshot
 from tools.webcam_tinyiot import TinyIoTClient as WebcamClient
@@ -135,12 +139,15 @@ class RoundIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 data = json.loads(sse.split('data: ', 1)[1])
                 self.assertEqual((data['eventId'], data['eventSequence'], data['sessionId']),
                                  (event['eventId'], sequence, session))
+                self.assertEqual((data['exercise'], data['repetitions'], data['round']),
+                                 (exercise, count, 1))
                 self.assertIn('callbackReceivedAt', data)
                 self.assertIn('sseEmittedAt', data)
         self.assertEqual(len(self.cse.records[REPS]), 30)
         snapshot = (await self.api.get('/api/workout/snapshot')).json()
         self.assertEqual(snapshot['sources']['webcam']['counts'], {'pullup': 5, 'pushup': 10, 'squat': 15})
         self.assertEqual(snapshot['sources']['webcam']['completedRounds'], 1)
+
         self.assertEqual(snapshot['sources']['webcam']['eventCount'], 30)
         last = self.cse.records[REPS][-1]
         self.assertEqual((await self.deliver(REPS, last)).status_code, 200)
@@ -176,6 +183,25 @@ class RoundIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn((REPS + '/' + last['rn'], 'CDashboard'), self.cse.reads)
         self.assertIn((SUMMARIES + '/' + self.cse.records[SUMMARIES][-1]['rn'], 'CCindyPT'), self.cse.reads)
 
+    async def test_repeated_relative_slowdown_publishes_pace_warning_sse(self):
+        session = 'webcam-20261111T010000Z-a1b2c3d4'
+        elapsed = 0
+        for sequence, gap in enumerate((2, 2, 2, 2, 4, 4, 4, 4, 4), 1):
+            elapsed += gap
+            event = {'eventId': str(uuid4()), 'eventSequence': sequence, 'sessionId': session,
+                     'exercise': 'pushup', 'repetitions': sequence, 'round': 1,
+                     'timestamp': f'2026-11-11T01:00:{elapsed:02d}Z', 'source': 'webcam'}
+            self.assertEqual(self.publisher.publish_event(event), '2001')
+            response = await self.deliver(REPS, self.cse.records[REPS][-1])
+            self.assertEqual(response.status_code, 200)
+            repetition = await asyncio.wait_for(anext(self.stream), 1)
+            self.assertIn('event: repetition', repetition)
+            if sequence == 9:
+                warning = await asyncio.wait_for(anext(self.stream), 1)
+                self.assertIn('event: pace_warning', warning)
+                payload = json.loads(warning.split('data: ', 1)[1])
+                self.assertEqual(payload['sessionId'], session)
+                self.assertIn('Your pace is slowing down.', payload['message'])
     async def test_outage_retry_reconciliation_and_rejected_callback(self):
         event = {'eventId': str(uuid4()), 'eventSequence': 1,
                  'sessionId': 'webcam-20261111T000000Z-retry', 'exercise': 'pullup',
@@ -226,3 +252,104 @@ class RoundIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('event: reconcile', await anext(self.stream))
         snapshot = (await self.api.get('/api/workout/snapshot')).json()
         self.assertEqual(snapshot['sources']['webcam']['counts']['pullup'], 1)
+
+    async def test_isolated_twenty_minute_rehearsal_preserves_counts_and_summary(self):
+        """Rehearse two Cindy cycles without writing to a live TinyIoT CSE."""
+        session = 'webcam-20261116T120000Z-20a1beef'
+        elapsed = [0.0]
+        workout = CindyWorkout(1200, clock=lambda: elapsed[0])
+        start = datetime(2026, 11, 16, 12, 0, tzinfo=timezone.utc)
+        rows = []
+        sequence = 0
+        # Variable but bounded intervals and a short inter-round pause. The
+        # final clock advance represents the remaining workout time, not an
+        # invented repetition.
+        intervals = (2.0, 2.4, 1.8, 3.1, 2.2, 2.7)
+        for round_number in (1, 2):
+            for exercise, target in (('pullup', 5), ('pushup', 10), ('squat', 15)):
+                for count in range(1, target + 1):
+                    sequence += 1
+                    elapsed[0] += intervals[(sequence - 1) % len(intervals)]
+                    timestamp = start + timedelta(seconds=elapsed[0])
+                    event = {
+                        'eventId': str(uuid4()), 'eventSequence': sequence,
+                        'sessionId': session, 'exercise': exercise,
+                        # The production webcam publisher sends absolute
+                        # session counts; the round field remains contextual.
+                        'repetitions': (round_number - 1) * target + count,
+                        'round': round_number,
+                        'timestamp': timestamp.isoformat(), 'source': 'webcam',
+                    }
+                    if sequence == 17:
+                        self.cse.failed_posts = 1
+                        with self.assertRaises(Exception):
+                            self.publisher.publish_event(event)
+                    self.assertEqual(self.publisher.publish_event(event), '2001')
+                    workout.record_rep(exercise)
+                    rows.append(self.cse.records[REPS][-1])
+                elapsed[0] += 8.0  # between-exercise pause
+            elapsed[0] += 75.0  # between-round pause
+
+        self.assertEqual(workout.rounds, 2)
+        elapsed[0] = 1200.0
+        self.assertTrue(workout.finished)
+
+        # Deliver the retained rows out of order and leave two notifications
+        # delayed until the end, as if the backend had briefly disconnected.
+        delivery_order = [row for index, row in enumerate(rows)
+                          if index not in (11, 42)]
+        delivery_order[11], delivery_order[12] = delivery_order[12], delivery_order[11]
+        delivery_order.extend([rows[11], rows[42]])
+        latencies_ms = []
+        for row in delivery_order:
+            started = perf_counter()
+            response = await self.deliver(REPS, row)
+            latencies_ms.append((perf_counter() - started) * 1000)
+            self.assertEqual((response.status_code, response.headers['X-M2M-RSC']), (200, '2000'))
+            # Every row in this first delivery pass is unique, so each
+            # validated callback produces one repetition signal.
+            await asyncio.wait_for(anext(self.stream), 1)
+
+        # A duplicate notification is accepted without a second event.
+        duplicate_before = self.hub.duplicate_callbacks
+        self.assertEqual((await self.deliver(REPS, rows[-1])).status_code, 200)
+        self.assertEqual(self.hub.duplicate_callbacks, duplicate_before + 1)
+        self.assertTrue(next(iter(self.hub.listeners)).empty())
+
+        snapshot = (await self.api.get('/api/workout/snapshot')).json()
+        webcam = snapshot['sources']['webcam']
+        self.assertEqual(webcam['counts'], {'pullup': 10, 'pushup': 20, 'squat': 30})
+        self.assertEqual(webcam['completedRounds'], 2)
+        self.assertEqual(webcam['eventCount'], 60)
+
+        self.cse.records[GOALS].append({'rn': 'goal-2', 'ri': 'ri-goal-2',
+            'con': json.dumps({'targetRounds': 2, 'durationSeconds': 1200})})
+        summary = completed_summary(session, workout,
+                                    {'pullup': 10, 'pushup': 20, 'squat': 30}, 'timer')
+        self.assertEqual(summary['durationSeconds'], 1200)
+        summary_publisher = SummaryPublisher(self.publisher, attempts=2, retry_delay=0)
+        self.assertEqual(summary_publisher.publish(summary), 'created')
+        summary_row = self.cse.records[SUMMARIES][-1]
+        self.assertEqual((await self.deliver(SUMMARIES, summary_row)).status_code, 200)
+        await asyncio.wait_for(anext(self.stream), 1)
+
+        progress = (await self.api.get('/api/cindypt/progress')).json()
+        self.assertTrue(progress['goalAchieved'])
+        self.assertEqual(progress['workout']['roundsCompleted'], 2)
+
+        events = [RepetitionEvent.model_validate(json.loads(row['con'])) for row in rows]
+        sdt = build_device_sdt(snapshot, events,
+                               goal={'targetRounds': 2},
+                               worker={'state': 'stopped', 'sessionId': session},
+                               summaries=[{'workoutId': session, 'durationSeconds': 1200,
+                                           'roundsCompleted': 2, 'completionReason': 'timer'}])
+        device = sdt['cindySenseWorkoutTracker']
+        self.assertEqual(device['workoutSession']['sessionStatus'], 'completed')
+        self.assertEqual(device['exerciseTracking']['completedRounds'], 2)
+        self.assertEqual(device['coaching']['roundsRemaining'], 0)
+        self.assertLess(max(latencies_ms), 1000)
+        print('SIMULATION_METRICS ' + json.dumps({
+            'events': len(rows), 'p50DeliveryMs': round(sorted(latencies_ms)[len(latencies_ms) // 2], 3),
+            'maxDeliveryMs': round(max(latencies_ms), 3), 'snapshotEvents': webcam['eventCount'],
+            'duplicateCallbacks': self.hub.duplicate_callbacks,
+        }))

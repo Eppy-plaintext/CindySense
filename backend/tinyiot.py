@@ -23,8 +23,10 @@ class TinyIoTClient:
         self.base_url = base_url.rstrip('/')
         self._client = client
 
-    async def retrieve(self, resource_path: str, origin: str) -> dict:
-        return await self._request('GET', resource_path, origin)
+    async def retrieve(self, resource_path: str, origin: str,
+                       expected_not_found: bool = False) -> dict:
+        return await self._request('GET', resource_path, origin,
+                                   expected_not_found=expected_not_found)
 
     async def discover(self, resource_path: str, origin: str, resource_type: int | None = None,
                        label: str | None = None) -> list[str]:
@@ -222,7 +224,8 @@ class TinyIoTClient:
         return True
 
     async def _request(self, method: str, resource_path: str, origin: str, body: dict | None = None,
-                       params: dict | None = None, content_type: str | None = None) -> dict:
+                       params: dict | None = None, content_type: str | None = None,
+                       expected_not_found: bool = False) -> dict:
         if not origin:
             raise TinyIoTError('origin_not_configured', 'The oneM2M originator is not configured.', 503)
         path = resource_path.strip('/')
@@ -247,13 +250,15 @@ class TinyIoTClient:
             raise TinyIoTError('tinyiot_unreachable', 'TinyIoT could not be reached.', 503) from exc
 
         rsc = response.headers.get('X-M2M-RSC')
-        if response.is_error or (rsc and not rsc.startswith('2')):
+        is_not_found = response.status_code == 404 or rsc == '4004'
+        if ((response.is_error or (rsc and not rsc.startswith('2'))) and
+                not (expected_not_found and is_not_found)):
             # Never log the request body or notification URI: it carries a token.
             log.warning('oneM2M request failed method=%s resource=%s http=%s rsc=%s',
                         method, path, response.status_code, rsc or 'absent')
         if response.status_code == 403 or rsc == '4103':
             raise TinyIoTError('tinyiot_forbidden', 'The configured oneM2M originator has no privilege for this resource.', 403)
-        if response.status_code == 404 or rsc == '4004':
+        if is_not_found:
             raise TinyIoTError('resource_not_found', 'The configured oneM2M resource does not exist.', 404)
         if response.status_code == 409 or rsc == '4105':
             raise TinyIoTError('resource_conflict', 'A content instance with this event ID already exists.', 409)

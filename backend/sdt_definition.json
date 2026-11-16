@@ -1,0 +1,24 @@
+{
+  "domain": "org.cindysense.device",
+  "deviceClass": "cindySenseWorkoutTracker",
+  "description": "Custom CindySense webcam workout tracker information model; not a standardized TS-0023 DeviceClass.",
+  "modules": {
+    "exerciseTracking": {
+      "dataPoints": {"exerciseType": "xs:string", "repetitionCount": "xs:integer", "completedRounds": "xs:integer", "lastRepetitionTime": "m2m:timestamp"},
+      "properties": {"detectionSource": "xs:string"}, "actions": {}, "events": {"repetitionDetected": "event"}, "readWrite": "R"
+    },
+    "workoutSession": {
+      "dataPoints": {"sessionStatus": "xs:string", "elapsedSeconds": "xs:float"},
+      "properties": {"sessionId": "xs:string", "durationSeconds": "xs:float", "startTime": "m2m:timestamp"}, "actions": {}, "events": {"sessionCompleted": "event"}, "readWrite": "R"
+    },
+    "paceMonitoring": {
+      "dataPoints": {"performanceState": "xs:string", "paceSecondsPerRep": "xs:float", "slowdownPercent": {"type": "xs:float", "finite": true, "signed": true, "unit": "pct"}, "warningStatus": "xs:string", "latestWarningTime": "m2m:timestamp"},
+      "properties": {}, "actions": {}, "events": {"paceWarningRaised": "event"}, "readWrite": "R"
+    },
+    "coaching": {
+      "dataPoints": {"roundsRemaining": "xs:integer", "recommendation": "xs:string", "coachingStatus": "xs:string"},
+      "properties": {"targetRounds": "xs:integer"}, "actions": {}, "events": {}, "readWrite": "R"
+    }
+  },
+  "semantics": {"readWrite": "All exposed values are read-only in Phase 1; Actions are intentionally absent."}
+}

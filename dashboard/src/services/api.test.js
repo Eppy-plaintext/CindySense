@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { API_BASE_URL, generateCindyPtRecommendation, getBackendHealth, getCindyPtGoal, getCindyPtProgress, getCindyPtRecommendations, getWorkoutFatigue, getWebcamWorker, startWebcamWorker, stopWebcamWorker, webcamPreviewUrl, saveCindyPtGoal, previewCindyPtPlan, saveCindyPtPlan, getSavedCindyPtPlan, getCindyPtRecovery } from './api.js'
+import { API_BASE_URL, generateCindyPtRecommendation, getBackendHealth, getCindyPtGoal, getCindyPtProgress, getCindyPtRecommendations, getFederatedLearningResults, getFederatedLearningStatus, getWorkoutFatigue, getWebcamWorker, startWebcamWorker, stopWebcamWorker, webcamPreviewUrl, saveCindyPtGoal, previewCindyPtPlan, saveCindyPtPlan, getSavedCindyPtPlan, getCindyPtRecovery } from './api.js'
 
 test('local API and webcam routes use FastAPI port 8000', async () => {
   const originalFetch = globalThis.fetch
@@ -111,6 +111,25 @@ test('fatigue API is a read-only session-scoped GET', async () => {
     assert.equal(new URL(calls[0].url).searchParams.get('sessionId'), 'webcam/current')
     assert.equal(calls[0].options.method, 'GET')
     assert.equal(calls[0].options.body, undefined)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('FL status and results are separate read-only GETs', async () => {
+  const originalFetch = globalThis.fetch
+  const calls = []
+  globalThis.fetch = async (url, options) => {
+    calls.push({ path: new URL(url).pathname, method: options.method })
+    return { ok: true, status: 200, json: async () => ({ available: false, status: 'not_trained' }) }
+  }
+  try {
+    await getFederatedLearningStatus()
+    await getFederatedLearningResults()
+    assert.deepEqual(calls, [
+      { path: '/api/fl/status', method: 'GET' },
+      { path: '/api/fl/results', method: 'GET' },
+    ])
   } finally {
     globalThis.fetch = originalFetch
   }

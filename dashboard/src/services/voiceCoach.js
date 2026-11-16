@@ -20,13 +20,17 @@ export class VoiceCoach {
     this.active = false
     this.generation = 0
     this.current = null
+    this.warningCooldownMs = 60000
+    this.lastWarningAt = 0
+    this.warningIds = new Set()
     try { this.synth?.getVoices() } catch { /* optional browser voices */ }
   }
 
-  configure({ enabled, volume, rate }) {
+  configure({ enabled, volume, rate, warningCooldownMs = 60000 }) {
     this.enabled = enabled
     this.volume = volume
     this.rate = rate
+    this.warningCooldownMs = Math.max(0, Number(warningCooldownMs) || 60000)
     if (!enabled) this.clear()
   }
 
@@ -56,6 +60,8 @@ export class VoiceCoach {
     this.seen.clear()
     this.milestones.clear()
     this.lastSequence = 0
+    this.lastWarningAt = 0
+    this.warningIds.clear()
     this.active = true
     this.sayPriority('Workout started. Five pull-ups. Let’s go!')
   }
@@ -77,6 +83,8 @@ export class VoiceCoach {
     this.seen.clear()
     this.milestones.clear()
     this.lastSequence = 0
+    this.lastWarningAt = 0
+    this.warningIds.clear()
   }
 
   timer(sessionId, minutes) {
@@ -118,6 +126,21 @@ export class VoiceCoach {
     if (this.current?.kind === 'count' && !this.current.startedAt) this.clear()
     this.pendingCount = null
     this.priority = [{ text, timing, kind: 'priority' }]
+    this.drain()
+  }
+
+  warning({ sessionId, warningId, message, timestamp }) {
+    if (!this.active || !this.enabled || sessionId !== this.sessionId ||
+        !warningId || !message || this.warningIds.has(warningId)) return
+    const now = Date.now()
+    if (now - this.lastWarningAt < this.warningCooldownMs) return
+    this.warningIds.add(warningId)
+    this.lastWarningAt = now
+    // Queue behind speech already audible, but ahead of ordinary pending rep
+    // numbers. This keeps one voice and preserves repetition notifications.
+    if (this.current?.kind === 'count' && !this.current.startedAt) this.clear()
+    this.pendingCount = null
+    this.priority.push({ text: message, kind: 'warning', timing: { warningId, timestamp } })
     this.drain()
   }
 
@@ -167,5 +190,6 @@ export function handleLocalVoiceEvent(coach, event) {
   if (event.type === 'timer') coach.timer(event.sessionId, event.minutes)
   if (event.type === 'complete') coach.end(event.sessionId)
   if (event.type === 'stop') coach.end(event.sessionId, false)
+  if (event.type === 'pace_warning') coach.warning(event)
   if (event.type === 'reset') coach.reset()
 }
