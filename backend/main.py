@@ -25,6 +25,8 @@ from .events import RepetitionEvent, classify_repetition_content
 from .fatigue_history import FatigueHistoryCache
 from .federated_learning import read_result
 from .notifications import NotificationHub
+from .mec_notifications import (MecSubscriptionBindingRegistry,
+                                 MecNotificationConfig, MecNotificationReceiver)
 from .subscription_monitor import SubscriptionMonitor
 from .performance import PaceWarningConfig
 from .sdt import build_device_sdt
@@ -85,6 +87,15 @@ notification_hub = NotificationHub(PaceWarningConfig(
 coaching_jobs = CoachingJobs(os.getenv('CINDYSENSE_COACHING_DB', 'data/cindypt_jobs.sqlite3'))
 webcam_worker = WebcamWorker()
 notification_hub.on_summary = coaching_jobs.enqueue
+mec_notification_receiver = MecNotificationReceiver(
+    tinyiot,
+    MecNotificationConfig(
+        enabled=getattr(settings, 'mec_notifications_enabled', False),
+        callback_token=getattr(settings, 'mec_callback_token', ''),
+        bridge_origin=getattr(settings, 'mec_bridge_origin', ''),
+    ),
+    bindings=MecSubscriptionBindingRegistry(),
+)
 
 
 def register_verified_subscriptions(required):
@@ -230,6 +241,63 @@ async def onem2m_notification(token: str, request: Request):
         raise api_error(exc) from exc
     return JSONResponse({'m2m:rsp': {'rsc': 2000, 'rqi': rqi}},
                         headers={'X-M2M-RSC': '2000', 'X-M2M-RI': rqi, 'X-M2M-RVI': '4'})
+
+
+def _refresh_mec_notification_receiver() -> MecNotificationReceiver:
+    """Apply current settings without replacing the receiver or its dedupe cache."""
+    mec_notification_receiver.tinyiot = tinyiot
+    mec_notification_receiver.config = MecNotificationConfig(
+        enabled=getattr(settings, 'mec_notifications_enabled', False),
+        callback_token=getattr(settings, 'mec_callback_token', ''),
+        max_body_bytes=int(getattr(settings, 'mec_callback_max_body_bytes', 64 * 1024)),
+        notification_container=getattr(settings, 'mec_notification_container',
+                                       'MECBridge_AE/WLANNotifications'),
+        bridge_origin=getattr(settings, 'mec_bridge_origin', ''),
+        allowed_subscription_ids=tuple(getattr(settings, 'mec_allowed_subscription_ids', ())),
+    )
+    return mec_notification_receiver
+
+
+@app.post('/api/mec/notifications/{token}')
+async def mec_notification(token: str, request: Request):
+    """Receive MEC callbacks through a separate, disabled-by-default contract."""
+    receiver = _refresh_mec_notification_receiver()
+    max_body_bytes = receiver.config.max_body_bytes
+    content_type = request.headers.get('content-type', '').split(';', 1)[0].strip().lower()
+    if content_type != 'application/json':
+        raise HTTPException(status_code=415, detail='Unsupported MEC notification representation.')
+    declared_length = request.headers.get('content-length')
+    try:
+        if declared_length is not None and int(declared_length) > max_body_bytes:
+            raise HTTPException(status_code=413, detail='MEC notification body is too large.')
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail='Invalid content length.') from exc
+    raw_body = await request.body()
+    if len(raw_body) > max_body_bytes:
+        raise HTTPException(status_code=413, detail='MEC notification body is too large.')
+    try:
+        body = json.loads(raw_body)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=400, detail='Malformed MEC notification JSON.') from exc
+    result = await receiver.receive(
+        body,
+        token=token,
+        subscription_id=request.headers.get('X-MEC-Subscription-ID'),
+        body_size=len(raw_body),
+        headers=request.headers,
+    )
+    status_by_code = {
+        'notifications_disabled': 404,
+        'invalid_callback_credentials': 401,
+        'body_too_large': 413,
+        'unknown_subscription': 403,
+        'malformed_or_unsupported_payload': 400,
+        'publication_timeout': 504,
+        'publication_failed': 503,
+        'readback_failed': 502,
+    }
+    status = status_by_code.get(result['code'], 200 if result['accepted'] else 400)
+    return JSONResponse(status_code=status, content=result)
 
 
 @app.get('/api/integration/events')

@@ -51,6 +51,12 @@ class Settings:
     mec_bridge_origin: str = os.getenv('MEC_BRIDGE_ORIGIN', '')
     mec_bridge_ae: str = os.getenv('MEC_BRIDGE_AE', 'MECBridge_AE')
     mec_bridge_wlan_container: str = os.getenv('MEC_BRIDGE_WLAN_CONTAINER', 'WLANInformation')
+    mec_notifications_enabled: bool = os.getenv('MEC_NOTIFICATIONS_ENABLED', 'false').lower() == 'true'
+    mec_callback_token: str = os.getenv('MEC_CALLBACK_TOKEN', '')
+    mec_callback_public_base_url: str = os.getenv('MEC_CALLBACK_PUBLIC_BASE_URL', '').strip()
+    mec_subscriptions_enabled: bool = os.getenv('MEC_SUBSCRIPTIONS_ENABLED', 'false').lower() == 'true'
+    mec_allowed_subscription_ids: tuple[str, ...] = tuple(
+        item.strip() for item in os.getenv('MEC_ALLOWED_SUBSCRIPTION_IDS', '').split(',') if item.strip())
     pace_warning_slowdown_ratio: float = float(os.getenv('CINDYSENSE_PACE_WARNING_RATIO', '1.35'))
     pace_warning_minimum_intervals: int = int(os.getenv('CINDYSENSE_PACE_WARNING_MIN_INTERVALS', '7'))
     pace_warning_required_evidence: int = int(os.getenv('CINDYSENSE_PACE_WARNING_EVIDENCE', '2'))
