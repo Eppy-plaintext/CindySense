@@ -18,6 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .config import settings
 from .cindypt import Goal, analyze, read_goal, read_summaries, recommend
+from .discovery import CONTAINER_TYPE, DiscoveryStatus, ResourceResolver
 from .coaching_selection import select_workout
 from .coaching_jobs import CoachingJobs
 from .events import RepetitionEvent, classify_repetition_content
@@ -68,6 +69,10 @@ app.add_middleware(
 )
 
 tinyiot = TinyIoTClient(settings.base_url, httpx.AsyncClient(timeout=5.0))
+discovery_resolver = ResourceResolver(
+    tinyiot, settings.discovery_origin,
+    ttl_seconds=getattr(settings, 'discovery_ttl_seconds', 30.0),
+)
 fatigue_history_cache = FatigueHistoryCache()
 simulation_publisher = SimulationPublisher()
 workout_snapshot = WorkoutSnapshot()
@@ -102,8 +107,46 @@ subscription_monitor = SubscriptionMonitor(
     recovery_enabled=getattr(settings, 'subscription_recovery_enabled', True),
     max_backoff_seconds=getattr(settings, 'subscription_monitor_max_backoff_seconds', 300),
     on_verified=register_verified_subscriptions,
+    discovery_resolver=discovery_resolver,
 )
 recommendation_lock = asyncio.Lock()
+
+
+def _discovery_client():
+    """Keep test-injected TinyIoT clients aligned with the shared resolver."""
+    discovery_origin = getattr(settings, 'discovery_origin', '')
+    if discovery_resolver.client is not tinyiot:
+        discovery_resolver.client = tinyiot
+        discovery_resolver.invalidate()
+    if discovery_resolver.discovery_origin != discovery_origin:
+        discovery_resolver.discovery_origin = discovery_origin
+        discovery_resolver.invalidate()
+    return discovery_resolver
+
+
+def _discovery_error(result):
+    code_by_status = {
+        DiscoveryStatus.FORBIDDEN: ('tinyiot_forbidden', 403),
+        DiscoveryStatus.MISSING: ('resource_not_found', 404),
+        DiscoveryStatus.UNAVAILABLE: ('tinyiot_unreachable', 503),
+        DiscoveryStatus.INVALID_RESPONSE: ('invalid_tinyiot_response', 502),
+        DiscoveryStatus.UNSUPPORTED: ('tinyiot_error', 502),
+        DiscoveryStatus.INVALID_REQUEST: ('invalid_resource_path', 503),
+    }
+    code, status = code_by_status.get(result.diagnostics.status, ('tinyiot_error', 502))
+    return TinyIoTError(code, result.diagnostics.message or 'Resource discovery failed.', status)
+
+
+async def _resolve_read_resource(ae_scope, name, operation_origin, fallback_path):
+    if not operation_origin:
+        raise TinyIoTError('origin_not_configured', 'The oneM2M operation originator is not configured.', 503)
+    result = await _discovery_client().resolve(
+        ae_scope=ae_scope, name=name, resource_type=CONTAINER_TYPE,
+        operation_origin=operation_origin, fallback_path=fallback_path,
+    )
+    if not result.path:
+        raise _discovery_error(result)
+    return result.path
 
 
 def local_webcam_request(request):
@@ -285,6 +328,49 @@ async def onem2m_discovery(label: str | None = Query(default=None, min_length=1,
         raise api_error(exc) from exc
 
 
+@app.get('/api/onem2m/discovery/status')
+async def onem2m_discovery_status():
+    """Return read-only, non-sensitive discovery diagnostics."""
+    resolver = _discovery_client()
+    discovery_configured = bool(getattr(settings, 'discovery_origin', ''))
+    results = await asyncio.gather(
+        resolver.discover_aes(),
+        resolver.discover_containers('CindySense_AE'),
+        resolver.discover_containers('CindyPT_AE'),
+        resolver.discover_subscriptions('CindySense_AE', 'RepetitionCount'),
+        resolver.discover_subscriptions('CindySense_AE', 'WorkoutSummary'),
+    )
+    names = ('aes', 'cindySenseContainers', 'cindyPtContainers',
+             'repetitionSubscriptions', 'summarySubscriptions')
+    serialized = {name: result.as_dict() for name, result in zip(names, results)}
+    diagnostics = [result.diagnostics for result in results]
+    errors = [item.as_dict() for item in diagnostics
+              if item.status != DiscoveryStatus.DISCOVERED]
+    return {
+        'source': 'TinyIoT',
+        'discovery': {
+            'configured': discovery_configured,
+            'available': discovery_configured and not all(
+                item.status in (DiscoveryStatus.FORBIDDEN, DiscoveryStatus.UNAVAILABLE,
+                                DiscoveryStatus.ERROR, DiscoveryStatus.INVALID_REQUEST)
+                for item in diagnostics),
+        },
+        'results': serialized,
+        'cache': resolver.cache_status(),
+        'errors': errors,
+        'fallback': {
+            'configured': {
+                'repetition': bool(settings.repetition_resource),
+                'summary': bool(settings.workout_summary_resource),
+                'cindyPt': bool(settings.target_plan_resource and settings.recommendations_resource),
+                'plans': bool(settings.training_plans_resource and settings.workout_schedule_resource and
+                              settings.recovery_resource),
+            },
+            'used': any(item.diagnostics.status == DiscoveryStatus.FALLBACK for item in results),
+        },
+    }
+
+
 @app.get('/api/onem2m/workout-timeseries')
 async def workout_timeseries_history():
     """Read bounded workout history directly from TinyIoT; never write or alter CindyPT."""
@@ -393,15 +479,24 @@ async def sdt_device():
     worker = await asyncio.to_thread(webcam_worker.status)
     if settings.cindypt_origin:
         try:
-            goal = await read_goal(tinyiot, settings.target_plan_resource, settings.cindypt_origin)
+            goal_resource = await _resolve_read_resource(
+                'CindyPT_AE', 'FitnessGoals', settings.cindypt_origin,
+                settings.target_plan_resource)
+            goal = await read_goal(tinyiot, goal_resource, settings.cindypt_origin)
         except TinyIoTError as exc:
             errors.append({'source': 'FitnessGoals', 'code': exc.code})
         try:
-            summaries = await read_summaries(tinyiot, settings.workout_summary_resource, settings.cindypt_origin)
+            summary_resource = await _resolve_read_resource(
+                'CindySense_AE', 'WorkoutSummary', settings.cindypt_origin,
+                settings.workout_summary_resource)
+            summaries = await read_summaries(tinyiot, summary_resource, settings.cindypt_origin)
         except TinyIoTError as exc:
             errors.append({'source': 'WorkoutSummary', 'code': exc.code})
         try:
-            recommendation, _ = await tinyiot.latest_content(settings.recommendations_resource, settings.cindypt_origin)
+            recommendation_resource = await _resolve_read_resource(
+                'CindyPT_AE', 'AIRecommendations', settings.cindypt_origin,
+                settings.recommendations_resource)
+            recommendation, _ = await tinyiot.latest_content(recommendation_resource, settings.cindypt_origin)
             if not isinstance(recommendation, dict):
                 recommendation = None
         except TinyIoTError as exc:
@@ -508,8 +603,14 @@ async def simulate_repetition_event(
 async def workout_history():
     try:
         observed = await fatigue_history_cache.read(tinyiot, settings.repetition_resource, settings.workout_origin)
-        summaries = await read_summaries(tinyiot, settings.workout_summary_resource, settings.cindypt_origin)
-        goal = await read_goal(tinyiot, settings.target_plan_resource, settings.cindypt_origin)
+        summary_resource = await _resolve_read_resource(
+            'CindySense_AE', 'WorkoutSummary', settings.cindypt_origin,
+            settings.workout_summary_resource)
+        goal_resource = await _resolve_read_resource(
+            'CindyPT_AE', 'FitnessGoals', settings.cindypt_origin,
+            settings.target_plan_resource)
+        summaries = await read_summaries(tinyiot, summary_resource, settings.cindypt_origin)
+        goal = await read_goal(tinyiot, goal_resource, settings.cindypt_origin)
         return build_history(observed, summaries, goal)
     except TinyIoTError as exc:
         raise api_error(exc) from exc
@@ -535,23 +636,26 @@ async def workout_performance(sessionId: str | None = Query(default=None, min_le
 @app.get('/api/cindypt/recommendations')
 async def recommendations():
     try:
+        resource = await _resolve_read_resource(
+            'CindyPT_AE', 'AIRecommendations', settings.cindypt_origin,
+            settings.recommendations_resource)
         try:
-            content, instance = await tinyiot.latest_content(settings.recommendations_resource, settings.cindypt_origin)
+            content, instance = await tinyiot.latest_content(resource, settings.cindypt_origin)
         except TinyIoTError as exc:
             if exc.code != 'resource_not_found':
                 raise
-            container = await tinyiot.retrieve(settings.recommendations_resource, settings.cindypt_origin)
+            container = await tinyiot.retrieve(resource, settings.cindypt_origin)
             if 'm2m:cnt' not in container:
                 raise TinyIoTError('invalid_resource', 'Recommendation resource is not a container.', 502) from exc
             return {'available': False, 'source': 'TinyIoT',
-                    'resource_path': settings.recommendations_resource, 'recommendations': None,
+                    'resource_path': resource, 'recommendations': None,
                     'recorded_at': None}
         if not isinstance(content, (dict, list, str)):
             raise TinyIoTError('invalid_content', 'Latest recommendation content has an unsupported format.', 502)
         return {
             'available': True,
             'source': 'TinyIoT',
-            'resource_path': settings.recommendations_resource,
+            'resource_path': resource,
             'recommendations': content,
             'recorded_at': instance.get('ct'),
         }
@@ -562,7 +666,10 @@ async def recommendations():
 @app.get('/api/cindypt/goal')
 async def cindypt_goal():
     try:
-        goal = await read_goal(tinyiot, settings.target_plan_resource, settings.cindypt_origin)
+        resource = await _resolve_read_resource(
+            'CindyPT_AE', 'FitnessGoals', settings.cindypt_origin,
+            settings.target_plan_resource)
+        goal = await read_goal(tinyiot, resource, settings.cindypt_origin)
         return {'available': goal is not None, 'goal': goal, 'source': 'TinyIoT'}
     except TinyIoTError as exc:
         raise api_error(exc) from exc
@@ -578,12 +685,18 @@ async def set_cindypt_goal(goal: Goal):
 
 
 async def _cindypt_progress():
-    goal = await read_goal(tinyiot, settings.target_plan_resource, settings.cindypt_origin)
+    goal_resource = await _resolve_read_resource(
+        'CindyPT_AE', 'FitnessGoals', settings.cindypt_origin,
+        settings.target_plan_resource)
+    goal = await read_goal(tinyiot, goal_resource, settings.cindypt_origin)
     if goal is None:
         return {'available': False, 'goal': None, 'workout': None, 'latestWorkout': None,
                 'coachingWorkout': None, 'selectionStatus': 'insufficient_data',
                 'message': 'No Cindy goal is stored.'}
-    summaries = await read_summaries(tinyiot, settings.workout_summary_resource, settings.cindypt_origin)
+    summary_resource = await _resolve_read_resource(
+        'CindySense_AE', 'WorkoutSummary', settings.cindypt_origin,
+        settings.workout_summary_resource)
+    summaries = await read_summaries(tinyiot, summary_resource, settings.cindypt_origin)
     observed = await fatigue_history_cache.read(tinyiot, settings.repetition_resource, settings.workout_origin)
     return select_workout(build_history(observed, summaries, goal), summaries, goal)
 
@@ -618,7 +731,10 @@ async def generate_cindypt_recommendation():
                 raise HTTPException(status_code=409, detail={'code': progress.get('selectionStatus', 'insufficient_data'),
                                                              'message': progress.get('selectionReason') or progress.get('message')})
             advice = recommend(progress)
-            goal_content, goal_instance = await tinyiot.latest_content(settings.target_plan_resource,
+            goal_resource = await _resolve_read_resource(
+                'CindyPT_AE', 'FitnessGoals', settings.cindypt_origin,
+                settings.target_plan_resource)
+            goal_content, goal_instance = await tinyiot.latest_content(goal_resource,
                                                                         settings.cindypt_origin)
             try:
                 current_goal = Goal.model_validate(goal_content).model_dump()
@@ -640,10 +756,16 @@ async def generate_cindypt_recommendation():
 
 
 async def _weekly_preview(preferences: PlanPreferences):
-    goal = await read_goal(tinyiot, settings.target_plan_resource, settings.cindypt_origin)
+    goal_resource = await _resolve_read_resource(
+        'CindyPT_AE', 'FitnessGoals', settings.cindypt_origin,
+        settings.target_plan_resource)
+    summary_resource = await _resolve_read_resource(
+        'CindySense_AE', 'WorkoutSummary', settings.cindypt_origin,
+        settings.workout_summary_resource)
+    goal = await read_goal(tinyiot, goal_resource, settings.cindypt_origin)
     if goal is None:
         raise HTTPException(status_code=409, detail={'code': 'missing_goal', 'message': 'Save a Cindy goal before planning.'})
-    summaries = await read_summaries(tinyiot, settings.workout_summary_resource, settings.cindypt_origin)
+    summaries = await read_summaries(tinyiot, summary_resource, settings.cindypt_origin)
     observed = await fatigue_history_cache.read(tinyiot, settings.repetition_resource, settings.workout_origin)
     history = build_history(observed, summaries, goal)
     qualified = {row['sessionId'] for row in history['sessions'] if row['comparable'] and row['summaryVerified']
@@ -701,14 +823,23 @@ async def _latest_optional(resource: str):
 @app.get('/api/cindypt/plans')
 async def get_saved_weekly_plan():
     try:
-        result = await _latest_optional(settings.training_plans_resource)
+        training_resource = await _resolve_read_resource(
+            'CindyPT_AE', 'TrainingPlans', settings.cindypt_origin,
+            settings.training_plans_resource)
+        result = await _latest_optional(training_resource)
         if result is None:
             return {'available': False, 'plan': None, 'source': 'TinyIoT'}
         plan, instance = result
         if not isinstance(plan, dict) or not isinstance(plan.get('planId'), str):
             raise TinyIoTError('invalid_content', 'Stored weekly plan is malformed.', 502)
         name = 'plan-' + plan['planId']
-        for resource in (settings.workout_schedule_resource, settings.recovery_resource):
+        related_resources = (
+            await _resolve_read_resource('CindyPT_AE', 'WorkoutSchedule', settings.cindypt_origin,
+                                         settings.workout_schedule_resource),
+            await _resolve_read_resource('CindyPT_AE', 'RecoveryRecommendations', settings.cindypt_origin,
+                                         settings.recovery_resource),
+        )
+        for resource in related_resources:
             try:
                 content, _ = tinyiot.parse_content_instance(
                     await tinyiot.retrieve(f'{resource}/{name}', settings.cindypt_origin))
@@ -726,7 +857,10 @@ async def get_saved_weekly_plan():
 @app.get('/api/cindypt/recovery')
 async def get_saved_recovery():
     try:
-        result = await _latest_optional(settings.recovery_resource)
+        recovery_resource = await _resolve_read_resource(
+            'CindyPT_AE', 'RecoveryRecommendations', settings.cindypt_origin,
+            settings.recovery_resource)
+        result = await _latest_optional(recovery_resource)
         if result is None:
             return {'available': False, 'recovery': None, 'source': 'TinyIoT'}
         content, instance = result

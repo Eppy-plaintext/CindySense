@@ -18,6 +18,7 @@ class Settings:
     base_url: str = tinyiot_base_url()
     workout_origin: str = os.getenv('TINYIOT_WORKOUT_ORIGIN', '')
     discovery_origin: str = os.getenv('TINYIOT_DISCOVERY_ORIGIN', '')
+    discovery_ttl_seconds: float = float(os.getenv('TINYIOT_DISCOVERY_TTL_SECONDS', '30'))
     group_origin: str = os.getenv('TINYIOT_GROUP_ORIGIN', '')
     group_resource: str = os.getenv('TINYIOT_GROUP_RESOURCE', 'CindySense_AE/WorkoutMonitoring_GRP')
     cindypt_origin: str = os.getenv('TINYIOT_CINDYPT_ORIGIN', '')
@@ -39,6 +40,13 @@ class Settings:
     notification_token: str = os.getenv('CINDYSENSE_NOTIFICATION_TOKEN', '')
     subscription_origin: str = os.getenv('TINYIOT_SUBSCRIPTION_ORIGIN', '')
     notification_origin: str = os.getenv('TINYIOT_NOTIFICATION_ORIGIN', '')
+    mec_enabled: bool = os.getenv('MEC_ENABLED', 'false').lower() == 'true'
+    mec_wlan_api_base_url: str = os.getenv('MEC_WLAN_API_BASE_URL', '').strip()
+    mec_request_timeout_seconds: float = float(os.getenv('MEC_REQUEST_TIMEOUT_SECONDS', '10'))
+    mec_bridge_enabled: bool = os.getenv('MEC_BRIDGE_ENABLED', 'false').lower() == 'true'
+    mec_bridge_origin: str = os.getenv('MEC_BRIDGE_ORIGIN', '')
+    mec_bridge_ae: str = os.getenv('MEC_BRIDGE_AE', 'MECBridge_AE')
+    mec_bridge_wlan_container: str = os.getenv('MEC_BRIDGE_WLAN_CONTAINER', 'WLANInformation')
     pace_warning_slowdown_ratio: float = float(os.getenv('CINDYSENSE_PACE_WARNING_RATIO', '1.35'))
     pace_warning_minimum_intervals: int = int(os.getenv('CINDYSENSE_PACE_WARNING_MIN_INTERVALS', '7'))
     pace_warning_required_evidence: int = int(os.getenv('CINDYSENSE_PACE_WARNING_EVIDENCE', '2'))

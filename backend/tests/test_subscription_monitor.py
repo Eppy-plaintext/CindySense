@@ -49,6 +49,27 @@ class FakeCSE:
         return {"m2m:sub": self.subscriptions[resource + "/" + name]}
 
 
+class FakeDiscovery:
+    def __init__(self):
+        self.calls = []
+        self.invalidated = []
+
+    async def discover_subscriptions(self, scope, container_name):
+        self.calls.append((scope, container_name))
+        from types import SimpleNamespace
+        return SimpleNamespace(
+            resources=(scope + "/" + container_name + "/RepCount_Sub",),
+            diagnostics=SimpleNamespace(
+                status=SimpleNamespace(value="discovered"),
+                as_dict=lambda: {"status": "discovered", "scope": scope,
+                                 "resource_type": 23},
+            ),
+        )
+
+    def invalidate(self, **kwargs):
+        self.invalidated.append(kwargs)
+
+
 def sub(resource, name, url=URL, net=None):
     return resource + "/" + name, {"rn": name, "ri": "ri-" + name,
         "nu": [url], "enc": {"net": [3] if net is None else net}, "nct": 1}
@@ -65,6 +86,17 @@ class SubscriptionMonitorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["required"]["summary"]["status"], "healthy")
         self.assertEqual(cse.create_calls, [])
         self.assertEqual(observed[0]["repetition"]["subscriptionIds"], ["ri-RepCount_Sub"])
+
+    async def test_discovery_adds_subscription_reference_without_mutation(self):
+        cse = FakeCSE()
+        cse.subscriptions.update(dict([sub(REPS, "RepCount_Sub"), sub(SUMMARIES, "Summary_Sub")]))
+        discovery = FakeDiscovery()
+        monitor = SubscriptionMonitor(interval_seconds=1, discovery_resolver=discovery)
+        result = await monitor.check_once(cse, settings(), recover=False)
+        self.assertEqual(result["verificationStatus"], "verified")
+        self.assertEqual(discovery.calls, [("CindySense_AE", "RepetitionCount"),
+                                           ("CindySense_AE", "WorkoutSummary")])
+        self.assertEqual(cse.create_calls, [])
 
     async def test_missing_subscriptions_recover_once_and_are_idempotent(self):
         cse = FakeCSE()

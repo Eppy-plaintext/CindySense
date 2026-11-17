@@ -170,7 +170,15 @@ class PlanApiTests(unittest.IsolatedAsyncioTestCase):
         again = await self.api.post('/api/cindypt/plans', json=request)
         self.assertTrue(again.json()['alreadySaved'])
         self.assertEqual(len([call for call in self.calls if call.method == 'POST']), 3)
-        self.assertTrue(all(call.headers['X-M2M-Origin'] == 'pt-origin' for call in self.calls))
+        writes = [call for call in self.calls if call.method == 'POST']
+        discovery_reads = [call for call in self.calls
+                           if call.method == 'GET' and call.url.params.get('fu') == '1']
+        operation_reads = [call for call in self.calls if call.method == 'GET' and call not in discovery_reads]
+        self.assertTrue(all(call.headers['X-M2M-Origin'] == 'pt-origin' for call in writes))
+        self.assertTrue(discovery_reads)
+        self.assertTrue(all(call.headers['X-M2M-Origin'] == main.settings.discovery_origin
+                            for call in discovery_reads))
+        self.assertTrue(all(call.headers['X-M2M-Origin'] == 'pt-origin' for call in operation_reads))
 
     async def test_stale_preview_and_missing_goal_do_not_write(self):
         plan = (await self.preview()).json()['plan']

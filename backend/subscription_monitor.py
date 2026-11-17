@@ -35,12 +35,13 @@ def sanitize_notification_url(value: str | None) -> str | None:
 
 class SubscriptionMonitor:
     def __init__(self, enabled=True, interval_seconds=60.0, recovery_enabled=True,
-                 max_backoff_seconds=300.0, on_verified=None):
+                 max_backoff_seconds=300.0, on_verified=None, discovery_resolver=None):
         self.enabled = bool(enabled)
         self.interval_seconds = max(1.0, float(interval_seconds))
         self.recovery_enabled = bool(recovery_enabled)
         self.max_backoff_seconds = max(self.interval_seconds, float(max_backoff_seconds))
         self.on_verified = on_verified
+        self.discovery_resolver = discovery_resolver
         self._recovery_lock = asyncio.Lock()
         self._task = None
         self._stop = asyncio.Event()
@@ -59,6 +60,7 @@ class SubscriptionMonitor:
             "retryAttempt": 0,
             "backoffSeconds": 0,
             "nextRetryAt": None,
+            "discovery": {},
         }
 
     @staticmethod
@@ -102,6 +104,24 @@ class SubscriptionMonitor:
         if "m2m:cnt" not in parent:
             raise TinyIoTError("invalid_resource", f"{resource} is not a container.", 502)
         subscriptions = await client.embedded_subscriptions(resource, origin)
+        if self.discovery_resolver is not None:
+            scope, container_name = resource.rsplit('/', 1)
+            discovered = await self.discovery_resolver.discover_subscriptions(scope, container_name)
+            self._state["discovery"][resource] = discovered.diagnostics.as_dict()
+            if discovered.diagnostics.status.value == "discovered":
+                for path in discovered.resources:
+                    try:
+                        payload = await client.retrieve(path, origin, expected_not_found=True)
+                    except TinyIoTError as exc:
+                        if exc.code == "resource_not_found":
+                            self.discovery_resolver.invalidate(ae_scope=scope, resource_type=23)
+                            continue
+                        raise
+                    subscription = payload.get("m2m:sub")
+                    if isinstance(subscription, dict) and not any(
+                            existing.get("rn") == subscription.get("rn")
+                            for existing in subscriptions if isinstance(existing, dict)):
+                        subscriptions.append(subscription)
         known = {sub.get("rn") for sub in subscriptions if isinstance(sub, dict)}
         for name in names:
             if name in known:

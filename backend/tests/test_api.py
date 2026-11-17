@@ -122,7 +122,9 @@ class APITests(unittest.IsolatedAsyncioTestCase):
         response = await self.api.get('/api/cindypt/recommendations')
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()['recommendations'], self.recommendation_content)
-        self.assertEqual(self.requests[0].headers['X-M2M-Origin'], 'authorized-pt-origin')
+        self.assertEqual(self.requests[0].headers['X-M2M-Origin'], 'authorized-discovery-origin')
+        self.assertTrue(any(request.headers['X-M2M-Origin'] == 'authorized-pt-origin'
+                            for request in self.requests[1:]))
 
     async def test_json_string_recommendation_content(self):
         self.recommendation_content = '{"roundsCompleted":1,"durationSeconds":180,"recommendation":"Build endurance.","source":"rule-based"}'
@@ -139,7 +141,9 @@ class APITests(unittest.IsolatedAsyncioTestCase):
                                            'performance': {'state': 'stable_performance'}}]}
         with patch.object(main.fatigue_history_cache, 'read', AsyncMock(return_value=observed)), \
              patch.object(main, 'read_summaries', AsyncMock(return_value=[])), \
-             patch.object(main, 'read_goal', AsyncMock(return_value=None)):
+             patch.object(main, 'read_goal', AsyncMock(return_value=None)), \
+             patch.object(main, '_resolve_read_resource', AsyncMock(side_effect=[
+                 'CindySense_AE/WorkoutSummary', 'CindyPT_AE/FitnessGoals'])):
             response = await self.api.get('/api/workout/history')
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()['sessions'][0]['status'], 'no_verified_summary')
@@ -162,7 +166,10 @@ class APITests(unittest.IsolatedAsyncioTestCase):
         with patch.object(main.workout_snapshot, 'read', AsyncMock(return_value=snapshot)), \
              patch.object(main.workout_snapshot, 'validated_events', return_value=[]), \
              patch.object(main, 'read_goal', AsyncMock(return_value={'targetRounds': 3})), \
-             patch.object(main.tinyiot, 'latest_content', AsyncMock(return_value=({'recommendation': 'Keep form.'}, {}))):
+             patch.object(main.tinyiot, 'latest_content', AsyncMock(return_value=({'recommendation': 'Keep form.'}, {}))), \
+             patch.object(main, '_resolve_read_resource', AsyncMock(side_effect=[
+                 'CindyPT_AE/FitnessGoals', 'CindySense_AE/WorkoutSummary',
+                 'CindyPT_AE/AIRecommendations'])):
             response = await self.api.get('/api/sdt/device')
         self.assertEqual(response.status_code, 200)
         body = response.json()
@@ -202,6 +209,20 @@ class APITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request.url.params['rcn'], '11')
         self.assertEqual(request.url.params['ty'], '3')
         self.assertEqual(request.headers['X-M2M-Origin'], 'authorized-discovery-origin')
+
+    async def test_discovery_status_is_read_only_and_non_sensitive(self):
+        response = await self.api.get('/api/onem2m/discovery/status')
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertIn('discovery', body)
+        self.assertIn('results', body)
+        self.assertIn('cache', body)
+        self.assertIn('errors', body)
+        self.assertIn('fallback', body)
+        self.assertIn('aes', body['results'])
+        self.assertIn('cindySenseContainers', body['results'])
+        self.assertIn('cindyPtContainers', body['results'])
+        self.assertNotIn('authorized-discovery-origin', str(body))
 
     async def test_cors_allows_local_vite_origins_for_reads_and_webcam_preflight(self):
         for port in (5173, 5174):
