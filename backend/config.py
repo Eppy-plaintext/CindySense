@@ -54,6 +54,11 @@ class Settings:
     mec_notifications_enabled: bool = os.getenv('MEC_NOTIFICATIONS_ENABLED', 'false').lower() == 'true'
     mec_callback_token: str = os.getenv('MEC_CALLBACK_TOKEN', '')
     mec_callback_public_base_url: str = os.getenv('MEC_CALLBACK_PUBLIC_BASE_URL', '').strip()
+    mec_callback_binding_key: str = os.getenv('MEC_CALLBACK_BINDING_KEY', '')
+    mec_callback_binding_state_path: str = os.getenv(
+        'MEC_CALLBACK_BINDING_STATE_PATH', '~/.cindysense/mec_callback_bindings.json')
+    mec_callback_pending_ttl_seconds: float = float(
+        os.getenv('MEC_CALLBACK_PENDING_TTL_SECONDS', '60'))
     mec_subscriptions_enabled: bool = os.getenv('MEC_SUBSCRIPTIONS_ENABLED', 'false').lower() == 'true'
     mec_allowed_subscription_ids: tuple[str, ...] = tuple(
         item.strip() for item in os.getenv('MEC_ALLOWED_SUBSCRIPTION_IDS', '').split(',') if item.strip())

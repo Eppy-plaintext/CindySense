@@ -11,6 +11,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Mapping
 
+from .mec_binding_store import MecBindingStateError, MecBindingStateStore, PersistedMecBinding
 from .mec_schemas import MecAssocStaNotification, MecTestNotification, parse_mec_notification
 
 
@@ -22,6 +23,7 @@ class MecNotificationConfig:
     notification_container: str = 'MECBridge_AE/WLANNotifications'
     bridge_origin: str = ''
     allowed_subscription_ids: tuple[str, ...] = ()
+    pending_ttl_seconds: float = 60.0
 
 
 @dataclass(frozen=True)
@@ -34,61 +36,135 @@ class MecSubscriptionBinding:
 class MecSubscriptionBindingRegistry:
     """In-memory callbackReference bindings; mutations are explicit and local."""
 
-    def __init__(self, *, clock=time.time):
+    def __init__(self, *, clock=time.time, state_store: MecBindingStateStore | None = None):
         self._clock = clock
+        self._state_store = state_store
         self._bindings: dict[str, MecSubscriptionBinding] = {}
-        self._pending: set[str] = set()
+        self._pending: dict[str, float] = {}
 
-    def add_pending(self, callback_token: str) -> None:
+    def _digest(self, callback_token: str) -> str:
+        if self._state_store is not None:
+            return self._state_store.digest(callback_token)
+        return hashlib.sha256(callback_token.encode('utf-8')).hexdigest()
+
+    @property
+    def has_persistent_state(self) -> bool:
+        return self._state_store is not None
+
+    def add_pending(self, callback_token: str, *, callback_reference: str | None = None,
+                    ttl_seconds: float = 60.0) -> None:
         if not callback_token:
             raise ValueError('callback token is required')
-        self._pending.add(callback_token)
+        if ttl_seconds <= 0:
+            raise ValueError('pending binding TTL must be positive')
+        digest = self._digest(callback_token)
+        deadline = self._clock() + ttl_seconds
+        self._pending[digest] = deadline
+        if self._state_store is not None:
+            if not callback_reference:
+                raise MecBindingStateError('Callback reference is required for persistent pending bindings.')
+            self._state_store.upsert_pending(callback_token, callback_reference, deadline)
 
     def register(self, subscription_id: str, callback_token: str,
-                 *, expires_at: float | None = None) -> None:
+                 *, callback_reference: str | None = None,
+                 expires_at: float | None = None, persist: bool = True) -> None:
         if not subscription_id or not callback_token:
             raise ValueError('subscription identity and callback token are required')
-        self._bindings[callback_token] = MecSubscriptionBinding(
+        digest = self._digest(callback_token)
+        self._bindings[digest] = MecSubscriptionBinding(
             subscription_id, callback_token, expires_at)
-        self._pending.discard(callback_token)
+        self._pending.pop(digest, None)
+        if persist and self._state_store is not None:
+            if not callback_reference:
+                raise MecBindingStateError('Callback reference is required for persistent bindings.')
+            self._state_store.upsert(subscription_id, callback_token, callback_reference, expires_at)
 
     def activate(self, callback_token: str, subscription_id: str,
-                 *, expires_at: float | None = None) -> None:
-        if callback_token not in self._pending:
+                 *, callback_reference: str | None = None,
+                 expires_at: float | None = None) -> None:
+        if not self.is_pending(callback_token):
             raise ValueError('callback token is not pending')
-        self.register(subscription_id, callback_token, expires_at=expires_at)
+        self.register(subscription_id, callback_token, callback_reference=callback_reference,
+                      expires_at=expires_at)
 
     def revoke_pending(self, callback_token: str) -> bool:
-        if callback_token in self._pending:
-            self._pending.remove(callback_token)
+        digest = self._digest(callback_token)
+        if digest in self._pending:
+            del self._pending[digest]
+            if self._state_store is not None:
+                self._state_store.remove_token(callback_token)
             return True
         return False
 
     def is_pending(self, callback_token: str) -> bool:
-        return callback_token in self._pending
+        self.sync_pending()
+        self.cleanup_expired_pending()
+        return self._digest(callback_token) in self._pending
+
+    def cleanup_expired_pending(self) -> int:
+        now = self._clock()
+        expired = [digest for digest, deadline in self._pending.items() if deadline <= now]
+        for digest in expired:
+            del self._pending[digest]
+        if expired and self._state_store is not None:
+            self._state_store.remove_pending_digests(set(expired))
+        return len(expired)
+
+    def sync_pending(self) -> None:
+        if self._state_store is None:
+            return
+        now = self._clock()
+        for item in self._state_store.load():
+            if item.status == 'pending' and item.expires_at is not None and item.expires_at > now:
+                self._pending[item.token_digest] = item.expires_at
+
+    def clear_active(self) -> None:
+        self._bindings.clear()
 
     def revoke(self, subscription_id: str) -> bool:
-        removed = [token for token, binding in self._bindings.items()
+        removed = [digest for digest, binding in self._bindings.items()
                    if binding.subscription_id == subscription_id]
-        for token in removed:
-            del self._bindings[token]
-        self._pending.difference_update(removed)
+        for digest in removed:
+            del self._bindings[digest]
+        if self._state_store is not None:
+            self._state_store.remove(subscription_id)
         return bool(removed)
 
     def resolve(self, callback_token: str) -> str | None:
-        for stored_token, binding in tuple(self._bindings.items()):
-            if not secrets.compare_digest(callback_token, stored_token):
+        self.cleanup_expired_pending()
+        digest = self._digest(callback_token)
+        for stored_digest, binding in tuple(self._bindings.items()):
+            if not secrets.compare_digest(digest, stored_digest):
                 continue
             if binding.expires_at is not None and binding.expires_at <= self._clock():
-                del self._bindings[stored_token]
+                del self._bindings[stored_digest]
+                if self._state_store is not None:
+                    self._state_store.remove(binding.subscription_id)
                 return None
             return binding.subscription_id
         return None
+
+    def restore_verified(self, subscription_id: str, callback_token: str,
+                         callback_reference: str, *, expires_at: float | None = None) -> None:
+        if self._state_store is None:
+            raise MecBindingStateError('Persistent binding state is not configured.')
+        records = self._state_store.load()
+        record = next((item for item in records if item.subscription_id == subscription_id), None)
+        if record is None or not self._state_store.matches(record, callback_token, callback_reference):
+            raise MecBindingStateError('Verified MEC subscription does not match stored binding state.')
+        self.register(subscription_id, callback_token, callback_reference=callback_reference,
+                      expires_at=expires_at, persist=False)
+
+    def persisted_bindings(self) -> list[PersistedMecBinding]:
+        if self._state_store is None:
+            return []
+        return self._state_store.load()
 
     def diagnostics(self) -> dict[str, Any]:
         now = self._clock()
         active = [binding for binding in self._bindings.values()
                   if binding.expires_at is None or binding.expires_at > now]
+        self.cleanup_expired_pending()
         return {'registered_count': len(active), 'pending_count': len(self._pending),
                 'subscription_ids': sorted(binding.subscription_id for binding in active)}
 
@@ -101,10 +177,13 @@ class MecNotificationReceiver:
         self._seen: dict[str, float] = {}
 
     def register_subscription(self, subscription_id: str, callback_token: str,
-                              *, expires_at: float | None = None) -> None:
+                              *, callback_reference: str | None = None,
+                              expires_at: float | None = None) -> None:
         if self.config.allowed_subscription_ids and subscription_id not in self.config.allowed_subscription_ids:
             raise ValueError('subscription identity is not allowlisted')
-        self.bindings.register(subscription_id, callback_token, expires_at=expires_at)
+        self.bindings.register(subscription_id, callback_token,
+                               callback_reference=callback_reference,
+                               expires_at=expires_at)
 
     def revoke_subscription(self, subscription_id: str) -> bool:
         return self.bindings.revoke(subscription_id)

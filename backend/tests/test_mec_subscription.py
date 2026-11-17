@@ -1,10 +1,14 @@
 import unittest
+import tempfile
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import httpx
 
 from backend.mec_registry import MecServiceDiscoveryDiagnostics, MecService, MecServiceSelection
 from backend.mec_notifications import MecNotificationConfig, MecNotificationReceiver, MecSubscriptionBindingRegistry
+from backend.mec_binding_store import MecBindingStateError, MecBindingStateStore
 from backend.mec_subscription import (MecSubscriptionClient, MecSubscriptionConfig,
                                        MecSubscriptionError, MecSubscriptionRequest,
                                        MecSubscriptionLifecycle, MecSubscriptionLifecycleError)
@@ -19,6 +23,59 @@ def selection():
 
 
 class MecSubscriptionTests(unittest.IsolatedAsyncioTestCase):
+    def test_persistent_state_contains_digests_only_and_recovers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'bindings.json'
+            store = MecBindingStateStore(path, 'x' * 32)
+            bindings = MecSubscriptionBindingRegistry(state_store=store)
+            callback = 'https://callback.test/api/mec/notifications/opaque-token'
+            bindings.register('sub-persisted', 'opaque-token', callback_reference=callback)
+            raw = path.read_text(encoding='utf-8')
+            self.assertNotIn('opaque-token', raw)
+            restarted = MecSubscriptionBindingRegistry(state_store=MecBindingStateStore(path, 'x' * 32))
+            restarted.restore_verified('sub-persisted', 'opaque-token', callback)
+            self.assertEqual(restarted.resolve('opaque-token'), 'sub-persisted')
+
+    def test_corrupt_persistent_state_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'bindings.json'
+            path.write_text('{not-json', encoding='utf-8')
+            with self.assertRaises(MecBindingStateError):
+                MecBindingStateStore(path, 'x' * 32).load()
+
+    def test_pending_binding_expires(self):
+        now = [100.0]
+        bindings = MecSubscriptionBindingRegistry(clock=lambda: now[0])
+        bindings.add_pending('pending', ttl_seconds=5)
+        self.assertTrue(bindings.is_pending('pending'))
+        now[0] = 106.0
+        self.assertFalse(bindings.is_pending('pending'))
+
+    def test_concurrent_state_transactions_preserve_updates_and_revocation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MecBindingStateStore(Path(directory) / 'bindings.json', 'c' * 32)
+            for index in range(10):
+                store.upsert(f'initial-{index}', f'token-{index}',
+                             f'https://callback.test/{index}', None)
+
+            def add(index):
+                store.upsert(f'concurrent-{index}', f'new-token-{index}',
+                             f'https://callback.test/new/{index}', None)
+
+            def revoke():
+                store.remove('initial-0')
+
+            with ThreadPoolExecutor(max_workers=8) as workers:
+                futures = [workers.submit(add, index) for index in range(30)]
+                futures.extend(workers.submit(revoke) for _ in range(8))
+                for future in futures:
+                    future.result()
+
+            records = store.load()
+            self.assertEqual(len(records), 39)
+            self.assertNotIn('initial-0', {item.subscription_id for item in records})
+            self.assertEqual(len({item.subscription_id for item in records}), 39)
+
     async def test_request_payload_preserves_ap_identity_and_optional_values(self):
         payload = MecSubscriptionRequest(
             'https://callback.test/mec', '005c07070707', True,

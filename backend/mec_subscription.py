@@ -123,7 +123,9 @@ class MecSubscriptionLifecycle:
         request = MecSubscriptionRequest(callback, bssid, request_test_notification,
                                          expiry_deadline, notification_event)
         request.as_payload()
-        self.receiver.bindings.add_pending(token)
+        self.receiver.bindings.add_pending(
+            token, callback_reference=callback,
+            ttl_seconds=self.receiver.config.pending_ttl_seconds)
         return PendingMecSubscription(token, callback, request)
 
     @staticmethod
@@ -153,7 +155,10 @@ class MecSubscriptionLifecycle:
                 raise MecSubscriptionLifecycleError(
                     MecSubscriptionErrorCode.INVALID_RESPONSE,
                     'MEC subscription identity or callback reference was not verified.', 502)
-            self.receiver.bindings.activate(pending.callback_token, identity)
+            self.receiver.bindings.activate(
+                pending.callback_token, identity,
+                callback_reference=pending.callback_reference,
+            )
             return response
         except Exception:
             self.receiver.bindings.revoke_pending(pending.callback_token)
@@ -172,7 +177,15 @@ class MecSubscriptionLifecycle:
             raise MecSubscriptionLifecycleError(
                 MecSubscriptionErrorCode.INVALID_RESPONSE,
                 'Verified MEC subscription does not match callback binding.', 502)
-        self.receiver.bindings.register(subscription_id, callback_token, expires_at=expires_at)
+        if self.receiver.bindings.has_persistent_state:
+            self.receiver.bindings.restore_verified(
+                subscription_id, callback_token, expected_callback, expires_at=expires_at)
+        else:
+            # Backward-compatible in-memory recovery for isolated callers and
+            # tests. The callback-only production app supplies persistent state.
+            self.receiver.bindings.register(
+                subscription_id, callback_token,
+                callback_reference=expected_callback, expires_at=expires_at)
 
 
 class MecSubscriptionClient:

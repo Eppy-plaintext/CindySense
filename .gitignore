@@ -5,6 +5,8 @@
 tools/collector.local.json
 tools/collector.json
 data/recordings/
+data/mec_callback_bindings.json
+data/mec_callback_bindings.json.lock
 data/fl/
 data/webcam-worker-ipc/
 data/webcam-camera.lock
