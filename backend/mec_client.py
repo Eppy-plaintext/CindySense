@@ -79,6 +79,21 @@ class MecWlanClient:
             path += self.AP_INFORMATION_PATH
         return urlunsplit((parsed.scheme, parsed.netloc, path, '', ''))
 
+    def with_base_url(self, api_base_url: str) -> 'MecWlanClient':
+        """Return a client for a validated discovered endpoint.
+
+        The underlying HTTP transport is reused when one was injected, which
+        keeps discovery and WLAN retrieval within the same request lifecycle.
+        """
+        return MecWlanClient(
+            MecWlanConfig(
+                enabled=self.config.enabled,
+                api_base_url=api_base_url,
+                timeout_seconds=self.config.timeout_seconds,
+            ),
+            self._client,
+        )
+
     async def fetch_access_points(self) -> list[dict[str, Any]]:
         if not self.config.enabled:
             raise MecClientError(MecErrorCode.DISABLED,

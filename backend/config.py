@@ -43,6 +43,10 @@ class Settings:
     mec_enabled: bool = os.getenv('MEC_ENABLED', 'false').lower() == 'true'
     mec_wlan_api_base_url: str = os.getenv('MEC_WLAN_API_BASE_URL', '').strip()
     mec_request_timeout_seconds: float = float(os.getenv('MEC_REQUEST_TIMEOUT_SECONDS', '10'))
+    mec_service_mgmt_api_base_url: str = os.getenv('MEC_SERVICE_MGMT_API_BASE_URL', '').strip()
+    mec_service_discovery_ttl_seconds: float = float(os.getenv('MEC_SERVICE_DISCOVERY_TTL_SECONDS', '30'))
+    mec_service_discovery_enabled: bool = os.getenv('MEC_SERVICE_DISCOVERY_ENABLED', 'false').lower() == 'true'
+    mec_allow_configured_fallback: bool = os.getenv('MEC_ALLOW_CONFIGURED_FALLBACK', 'false').lower() == 'true'
     mec_bridge_enabled: bool = os.getenv('MEC_BRIDGE_ENABLED', 'false').lower() == 'true'
     mec_bridge_origin: str = os.getenv('MEC_BRIDGE_ORIGIN', '')
     mec_bridge_ae: str = os.getenv('MEC_BRIDGE_AE', 'MECBridge_AE')

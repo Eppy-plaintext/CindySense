@@ -14,6 +14,7 @@ from uuid import uuid4
 
 from backend.mec_client import MecClientError, MecWlanClient
 from backend.mec_mapping import MecWlanMappingError, SIMULATED_SOURCE, map_wlan_access_points
+from backend.mec_registry import MecRegistryError, MecServiceRegistry
 from backend.tinyiot import TinyIoTClient, TinyIoTError
 
 
@@ -27,6 +28,8 @@ class MecBridgeConfig:
     origin: str = ''
     ae: str = 'MECBridge_AE'
     wlan_container: str = 'WLANInformation'
+    dynamic_service_discovery: bool = False
+    allow_configured_fallback: bool = False
 
     def validate(self) -> None:
         if not self.enabled:
@@ -53,6 +56,11 @@ class MecBridgeResult:
     total_associated_stations: int = 0
     source: str = SIMULATED_SOURCE
     status_code: int = 200
+    discovery_status: str = 'not_requested'
+    discovery_source: str = 'configured'
+    selected_service_name: str | None = None
+    selected_service_instance_id: str | None = None
+    discovery_error: dict[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -68,6 +76,11 @@ class MecBridgeResult:
             'total_associated_stations': self.total_associated_stations,
             'source': self.source,
             'status_code': self.status_code,
+            'discovery_status': self.discovery_status,
+            'discovery_source': self.discovery_source,
+            'selected_service_name': self.selected_service_name,
+            'selected_service_instance_id': self.selected_service_instance_id,
+            'discovery_error': self.discovery_error,
         }
 
 
@@ -75,11 +88,13 @@ class MecBridge:
     """Synchronize one MEC 028 snapshot into a dedicated oneM2M container."""
 
     def __init__(self, mec_client: MecWlanClient, tinyiot: TinyIoTClient,
-                 config: MecBridgeConfig, *, clock: Callable[[], datetime] | None = None):
+                 config: MecBridgeConfig, *, clock: Callable[[], datetime] | None = None,
+                 registry: MecServiceRegistry | None = None):
         config.validate()
         self.mec_client = mec_client
         self.tinyiot = tinyiot
         self.config = config
+        self.registry = registry
         self._clock = clock or (lambda: datetime.now(timezone.utc))
 
     @property
@@ -99,15 +114,72 @@ class MecBridge:
             return MecBridgeResult(False, request_id, 'bridge_disabled',
                                    'MEC bridge is disabled.', resource_path, status_code=503)
 
+        mec_client = self.mec_client
+        discovery_status = 'not_requested'
+        discovery_source = 'configured'
+        discovery_error = None
+        selected_service_name = None
+        selected_service_instance_id = None
+        if self.config.dynamic_service_discovery:
+            if self.registry is None:
+                return MecBridgeResult(
+                    False, request_id, 'mec_service_discovery_not_configured',
+                    'MEC service discovery is enabled but no registry is configured.',
+                    resource_path, status_code=503,
+                    discovery_status='not_configured',
+                    discovery_source='none',
+                    discovery_error={'code': 'registry_not_configured'})
+            try:
+                selection = await self.registry.select_wlan()
+                discovery_status = selection.diagnostics.status
+                discovery_source = selection.diagnostics.source
+                discovery_error = selection.diagnostics.error
+                if not selection.dynamic_discovery and not self.config.allow_configured_fallback:
+                    return MecBridgeResult(
+                        False, request_id, 'mec_service_discovery_fallback_disabled',
+                        'MEC service discovery failed and configured fallback is disabled.',
+                        resource_path, status_code=503,
+                        discovery_status=discovery_status,
+                        discovery_source=discovery_source,
+                        discovery_error=discovery_error)
+                if not selection.endpoint:
+                    return MecBridgeResult(
+                        False, request_id, 'mec_service_discovery_no_endpoint',
+                        'MEC service discovery returned no usable WLAN endpoint.',
+                        resource_path, status_code=502,
+                        discovery_status=discovery_status,
+                        discovery_source=discovery_source,
+                        discovery_error=discovery_error)
+                if selection.service is not None:
+                    selected_service_name = selection.service.name
+                    selected_service_instance_id = selection.service.instance_id
+                mec_client = self.mec_client.with_base_url(selection.endpoint)
+            except MecRegistryError as exc:
+                return MecBridgeResult(
+                    False, request_id, f'mec_discovery_{exc.code}', exc.message,
+                    resource_path, status_code=exc.status_code,
+                    discovery_status='error', discovery_source='mec011',
+                    discovery_error=exc.as_dict())
+
         try:
-            payload = await self.mec_client.fetch_access_points()
+            payload = await mec_client.fetch_access_points()
             access_points = map_wlan_access_points(payload)
         except MecClientError as exc:
             return MecBridgeResult(False, request_id, f'mec_{exc.code}', exc.message,
-                                   resource_path, status_code=exc.status_code)
+                                   resource_path, status_code=exc.status_code,
+                                   discovery_status=discovery_status,
+                                   discovery_source=discovery_source,
+                                   discovery_error=discovery_error,
+                                   selected_service_name=selected_service_name,
+                                   selected_service_instance_id=selected_service_instance_id)
         except MecWlanMappingError as exc:
             return MecBridgeResult(False, request_id, exc.code, str(exc),
-                                   resource_path, status_code=502)
+                                   resource_path, status_code=502,
+                                   discovery_status=discovery_status,
+                                   discovery_source=discovery_source,
+                                   discovery_error=discovery_error,
+                                   selected_service_name=selected_service_name,
+                                   selected_service_instance_id=selected_service_instance_id)
 
         content = {
             'schema': 'cindysense.mec.wlan.v1',
@@ -124,10 +196,20 @@ class MecBridge:
                 resource_path, self.config.origin, name, content)
         except TinyIoTError as exc:
             return MecBridgeResult(False, request_id, f'onem2m_{exc.code}', str(exc),
-                                   resource_path, name, status_code=exc.status_code)
+                                   resource_path, name, status_code=exc.status_code,
+                                   discovery_status=discovery_status,
+                                   discovery_source=discovery_source,
+                                   discovery_error=discovery_error,
+                                   selected_service_name=selected_service_name,
+                                   selected_service_instance_id=selected_service_instance_id)
 
         return MecBridgeResult(True, request_id, 'published_and_verified',
                                'MEC WLAN snapshot published and verified by readback.',
                                resource_path, name, created=created, verified=True,
                                access_point_count=len(access_points),
-                               total_associated_stations=content['totalAssociatedStations'])
+                               total_associated_stations=content['totalAssociatedStations'],
+                               discovery_status=discovery_status,
+                               discovery_source=discovery_source,
+                               discovery_error=discovery_error,
+                               selected_service_name=selected_service_name,
+                               selected_service_instance_id=selected_service_instance_id)

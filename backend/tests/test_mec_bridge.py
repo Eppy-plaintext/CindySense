@@ -1,10 +1,17 @@
 import unittest
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 from backend.mec_bridge import MecBridge, MecBridgeConfig
 from backend.mec_client import MecClientError, MecErrorCode
 from backend.mec_mapping import MecWlanMappingError, SIMULATED_SOURCE
+from backend.mec_registry import (
+    MecRegistryError,
+    MecRegistryErrorCode,
+    MecService,
+    MecServiceDiscoveryDiagnostics,
+    MecServiceSelection,
+)
 from backend.tinyiot import TinyIoTError
 
 
@@ -94,3 +101,86 @@ class MecBridgeTests(unittest.IsolatedAsyncioTestCase):
     def test_configuration_requires_origin_when_enabled(self):
         with self.assertRaises(ValueError):
             MecBridge(self.mec, self.tinyiot, MecBridgeConfig(True, ''))
+
+    def _dynamic_selection(self, endpoint='https://mec.test/session/wai/v2'):
+        service = MecService('wai-instance', 'mep1-mec028-1', 'waiId', 'WAI',
+                             'ACTIVE', (endpoint,))
+        diagnostics = MecServiceDiscoveryDiagnostics(
+            'discovered', 'mec011', 6, service.instance_id, endpoint, False)
+        return MecServiceSelection(service, endpoint, True, diagnostics)
+
+    async def test_dynamic_discovery_selects_endpoint_and_preserves_identity(self):
+        discovered_client = AsyncMock()
+        discovered_client.fetch_access_points.return_value = PAYLOAD
+        self.mec.with_base_url = Mock(return_value=discovered_client)
+        registry = AsyncMock()
+        registry.select_wlan.return_value = self._dynamic_selection()
+        bridge = MecBridge(
+            self.mec, self.tinyiot,
+            MecBridgeConfig(True, 'bridge-origin', dynamic_service_discovery=True),
+            registry=registry)
+
+        result = await bridge.synchronize_once('dynamic-request')
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.discovery_status, 'discovered')
+        self.assertEqual(result.discovery_source, 'mec011')
+        self.assertEqual(result.selected_service_name, 'mep1-mec028-1')
+        self.assertEqual(result.selected_service_instance_id, 'wai-instance')
+        self.mec.with_base_url.assert_called_once_with('https://mec.test/session/wai/v2')
+        discovered_client.fetch_access_points.assert_awaited_once_with()
+        self.tinyiot.create_named_verified_content.assert_awaited_once()
+
+    async def test_discovery_failure_does_not_publish_without_explicit_fallback(self):
+        registry = AsyncMock()
+        registry.select_wlan.side_effect = MecRegistryError(
+            MecRegistryErrorCode.TIMEOUT, 'discovery timed out', 504)
+        bridge = MecBridge(
+            self.mec, self.tinyiot,
+            MecBridgeConfig(True, 'bridge-origin', dynamic_service_discovery=True),
+            registry=registry)
+
+        result = await bridge.synchronize_once('discovery-timeout')
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.code, 'mec_discovery_service_discovery_timeout')
+        self.assertEqual(result.discovery_status, 'error')
+        self.tinyiot.create_named_verified_content.assert_not_awaited()
+        self.mec.fetch_access_points.assert_not_awaited()
+
+    async def test_explicit_configured_fallback_is_reported_and_publishes(self):
+        fallback = MecServiceSelection(
+            None, 'https://mec.test/session/wai/v2', False,
+            MecServiceDiscoveryDiagnostics(
+                'fallback', 'configured_fallback', 0,
+                error={'code': 'mec028_service_not_found'}, fallback_used=True))
+        registry = AsyncMock()
+        registry.select_wlan.return_value = fallback
+        fallback_client = AsyncMock()
+        fallback_client.fetch_access_points.return_value = PAYLOAD
+        self.mec.with_base_url = Mock(return_value=fallback_client)
+        bridge = MecBridge(
+            self.mec, self.tinyiot,
+            MecBridgeConfig(True, 'bridge-origin', dynamic_service_discovery=True,
+                            allow_configured_fallback=True),
+            registry=registry)
+
+        result = await bridge.synchronize_once('fallback-request')
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.discovery_status, 'fallback')
+        self.assertEqual(result.discovery_source, 'configured_fallback')
+        self.assertIsNone(result.selected_service_name)
+        self.assertEqual(result.discovery_error['code'], 'mec028_service_not_found')
+        self.mec.with_base_url.assert_called_once_with('https://mec.test/session/wai/v2')
+        fallback_client.fetch_access_points.assert_awaited_once_with()
+
+    async def test_legacy_configured_only_mode_does_not_use_registry(self):
+        registry = AsyncMock()
+        bridge = MecBridge(self.mec, self.tinyiot, self.config, registry=registry)
+
+        result = await bridge.synchronize_once('configured-only')
+
+        self.assertTrue(result.success)
+        registry.select_wlan.assert_not_awaited()
+        self.mec.fetch_access_points.assert_awaited_once_with()
