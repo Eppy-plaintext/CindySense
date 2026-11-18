@@ -554,6 +554,35 @@ class ExerciseCounterTests(unittest.TestCase):
             detected += counter.update(170, .40)
         self.assertEqual((counter.reps, detected), (1, 1))
 
+    def test_pushup_repositioning_after_mode_switch_needs_new_valid_top(self):
+        counter = ExerciseCounter("pushup")
+        for angle, shoulder, frames in ((170, .30, 8), (70, .20, 8), (145, .21, 8)):
+            for _ in range(frames):
+                self.assertFalse(counter.update(angle, shoulder))
+        self.assertEqual(counter.reps, 0)
+        for _ in range(counter.MAX_MISSING_FRAMES):
+            counter.update(None, None)
+        detections = 0
+        for angle, shoulder, frames in ((170, .55, 8), (70, .70, 8), (170, .55, 8)):
+            for _ in range(frames):
+                detections += counter.update(angle, shoulder)
+        self.assertEqual((counter.reps, detections), (1, 1))
+
+    def test_squat_late_set_with_sparse_frames_and_brief_occlusion_counts_once(self):
+        counter = ExerciseCounter("squat")
+        detections = 0
+        timestamp = 900_000
+        for repetition in range(15):
+            for angle, position, frames in ((170, .40, 8), (80, .62, 8), (170, .40, 10)):
+                for _ in range(frames):
+                    timestamp += 120
+                    detections += counter.update(angle, position, timestamp_ms=timestamp)
+            if repetition % 3 == 2:
+                for _ in range(2):
+                    timestamp += 120
+                    detections += counter.update(None, None, timestamp_ms=timestamp)
+        self.assertEqual((counter.reps, detections), (15, 15))
+
     def test_pushup_recorded_style_top_angle_needs_full_torso_return(self):
         counter = ExerciseCounter("pushup")
         detected = 0

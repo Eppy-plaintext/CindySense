@@ -17,14 +17,21 @@ exercise modes preserves counts and re-arms the selected detector. The overlay
 shows mode, count, phase, and the 20-minute AMRAP clock. The CSV under
 `data/recordings/` records measurements locally.
 
-To use the existing oneM2M resources, first check/create the webcam AE and
-PoseData container with the already configured TinyIoT originators:
+For a connected workout, first verify the existing `Webcam_AE/PoseData`,
+`CindySense_AE/RepetitionCount`, and `CindySense_AE/WorkoutSummary` resources
+and non-admin publisher permissions. Configure verified origins in
+`backend/.env` and start the workout through the dashboard. For a manual
+runner session, pass the same verified origins:
 
 ```powershell
-.\.venv-webcam\Scripts\python.exe tools/webcam_tinyiot.py --origin CWebcam setup
-.\.venv-webcam\Scripts\python.exe tools/webcam_tinyiot.py --origin CWebcam test
-.\.venv-webcam\Scripts\python.exe tools/webcam_squat.py --exercise cindy --tinyiot --tinyiot-origin CWebcam --tinyiot-event-origin CAdmin
+$eventOrigin = 'your-verified-event-origin'
+$summaryOrigin = 'your-verified-summary-origin'
+.\.venv-webcam\Scripts\python.exe tools/webcam_squat.py --exercise cindy --tinyiot --tinyiot-origin CWebcam --tinyiot-event-origin $eventOrigin --tinyiot-summary-origin $summaryOrigin
 ```
+
+The runner rejects `CAdmin` for event and summary publishing. Do not run
+`setup`, `test`, or a workout publisher as a read-only preflight; those commands
+can create oneM2M resources or content instances.
 
 Use `--tinyiot-base` if TinyIoT is not at the default local address. Pose
 readings go to `Webcam_AE/PoseData` about once per second. Completed
@@ -42,14 +49,14 @@ container after flushing repetition events. It includes `sessionId`,
 `rounds`, and `durationSeconds`. A manual-mode session is not summarized.
 `Q`, reset, camera failure, and unexpected exceptions do not produce a
 completed summary. The writer uses a stable name derived from the session ID,
-reads back the exact content, and retries transient failures up to three times.
-The terminal prints `PERSISTED` only after readback; `PERSISTENCE UNCONFIRMED`
-means the named CIN needs a read-only check before any manual retry. The optional
+reads back the exact content, and retains pending work in the local event journal
+for a later retry. Check `summaryPublication`, `eventJournalPending`, and
+`summaryPending` in worker status before treating the workout as stored. The optional
 `--tinyiot-summary-origin` defaults to `--tinyiot-event-origin`; configure it
 separately if an approved dedicated summary writer is available. The optional
 `--summary-container` changes only the target path; it never creates a
-container. CindyPT reads the new completed snapshot on its next progress GET,
-while recommendation generation still requires the dashboard button.
+container. CindyPT reads the new completed snapshot on its next progress GET;
+a verified timer summary can also enqueue an automatic coaching job.
 
 The camera thread never waits for TinyIoT. Pose readings use a five-slot
 queue and stale readings are discarded. Each validated repetition event is
@@ -107,24 +114,24 @@ check state-machine behavior; they do not establish real-world accuracy.
 
 ## Live synchronization check
 
-In Windows PowerShell, from the repository root, check and raise the existing
-repetition container's retention limit before a workout:
+From the repository root, inspect the existing repetition container's retention
+and subscription status through read-only backend endpoints:
 
 ```powershell
-.\.venv-webcam\Scripts\python.exe tools/webcam_tinyiot.py retention --admin-origin CAdmin --min-events 1000
+Invoke-RestMethod http://127.0.0.1:8000/api/health | ConvertTo-Json -Depth 8
+Invoke-RestMethod http://127.0.0.1:8000/api/workout/snapshot | ConvertTo-Json -Depth 8
 ```
 
-This updates only `CindySense_AE/RepetitionCount` when its `mni` is too small.
-It does not restore events already evicted. The backend retrieves oneM2M
+Do not change retention during a backend preflight. The backend retrieves oneM2M
 `rcn=6` references in pages of 100 and reads newly seen events. Its snapshot
 reports `retention.mni`, `retention.mbs`, `retainedInstanceCount`,
-`retentionAtCapacity`, `retrievedAt`, and `retrievalMs`. The dashboard polls
-the snapshot every 750 ms after each response and webcam pose status every
-1.5 seconds. A separate publisher thread prioritizes repetition events;
+`retentionAtCapacity`, `retrievedAt`, and `retrievalMs`. The dashboard refreshes
+its stored snapshot on validated events, with a five-second fallback poll, and
+polls webcam pose status every 1.5 seconds. A separate publisher thread prioritizes repetition events;
 PoseData readings are rate limited and stale readings can be dropped.
 
-To measure a real repetition, compare its `[REP] detectedAt`, `[TinyIoT]
-Event queued`, and `[TinyIoT] Event confirmed` log lines by `eventId`. Then
+To measure a real repetition, compare its `[REP] detectedAt` and `[TinyIoT]
+Event confirmed` log lines by `eventId`. Then
 compare the FastAPI snapshot `retrievedAt` and the browser console's
 `[CindySense] dashboard rendered` timestamp for the same session and count.
 New webcam CSVs include detector reasons, optional head/lateral measurements,
@@ -132,10 +139,10 @@ event IDs, and queue depth so a missed physical repetition can be investigated.
 The dashboard shows webcam queue depth, retries, overflow, pending count
 estimate, stale pose status, and session mismatch. Pending count compares
 PoseData's absolute exercise count with confirmed RepetitionCount events;
-it can temporarily lag by a pose upload interval. A full 20-minute webcam
-and TinyIoT run is still required to measure detection-to-render latency and
-verify the 1-2 second target in the actual environment.
+it can temporarily lag by a pose upload interval. A completed 20-minute webcam
+run was recorded, but it did not include independently
+timed physical repetitions or timestamped dashboard captures, so physical
+accuracy and detection-to-render latency remain unverified.
 With 121 retained local events, an isolated backend restart took 4.9 seconds
 to fill its cache; three subsequent snapshot requests took 262-266 ms each.
-The 750 ms poll begins after each response. Startup recovery is therefore
-slower than steady-state updates.
+Startup recovery is therefore slower than steady-state updates.

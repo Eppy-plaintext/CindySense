@@ -168,6 +168,8 @@ def main():
                    "jpegMs": 0.0, "statusMs": 0.0, "frameGapMs": 0.0, "droppedFrames": 0,
                    "lastFrameAgeMs": None, "lastConfirmLatencyMs": None}
     summary_result = None
+    publication_diagnostics = {}
+    last_publication_diagnostics_ms = -250
     if dashboard:
         dashboard.status(state='running', sessionId=session_id, durationSeconds=workout.duration_seconds,
                          remainingSeconds=workout.remaining, counts=dict(total_reps), completedRounds=0,
@@ -298,6 +300,11 @@ def main():
                         publisher.offer_event(event)
 
                 elapsed_s = (time.monotonic() - start)
+                if publisher and (event is not None or ts_ms - last_publication_diagnostics_ms >= 250):
+                    # Journal metrics open SQLite connections. Sample them at
+                    # a bounded rate, and immediately after a new event.
+                    publication_diagnostics = publisher.diagnostics()
+                    last_publication_diagnostics_ms = ts_ms
                 display_exercise = frame_exercise
                 display_counter = counters[display_exercise]
                 if workout:
@@ -348,7 +355,7 @@ def main():
                         "repCount": total_reps[display_exercise] - session_baseline[display_exercise],
                         "repEvent": counted,
                         "rounds": rounds_text, "sessionId": session_id,
-                        **publisher.diagnostics(),
+                        **publication_diagnostics,
                     })
                 squat_diag = display_counter.squat_diagnostics(ts_ms)
                 writer.writerow({"timestampUtc": timestamp, "elapsedMs": ts_ms, "exercise": display_exercise,
@@ -376,7 +383,7 @@ def main():
                                  "squatSampleGapMs": squat_diag.get("sampleGapMs") or "",
                                  "squatSmoothingMode": squat_diag.get("smoothingMode") or "",
                                  "eventId": event["eventId"] if event is not None else "",
-                                 "eventQueueDepth": publisher.diagnostics()["eventQueueDepth"] if publisher else 0,
+                                 "eventQueueDepth": publication_diagnostics["eventQueueDepth"] if publisher else 0,
                                  "captureWaitMs": round(capture_ms, 1),
                                  "frameAgeMs": round(frame_age_ms, 1),
                                  "droppedFrames": camera.diagnostics()["droppedFrames"],
@@ -391,7 +398,7 @@ def main():
                                          name: total_reps[name] - session_baseline[name] for name in TARGETS},
                                      completedRounds=workout.rounds, activeExercise=active,
                                      positioning=positioning,
-                                     eventQueueDepth=publisher.diagnostics()['eventQueueDepth'] if publisher else 0)
+                                     eventQueueDepth=publication_diagnostics['eventQueueDepth'] if publisher else 0)
                     if performance_enabled:
                         metrics = dict(performance)
                         frames = max(1, performance["frames"])

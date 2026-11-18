@@ -10,7 +10,13 @@ Run the service from the repository root as `backend.main:app`. The interactive 
 | `GET /api/workout/live` | Reads the repetition container and its `/la` content instance; returns stored content, timestamp, and classification as a structured event or legacy unclassified value. A stored count is not a current-session exercise score. |
 | `GET /api/workout/snapshot` | Lists retained repetition content instances, retrieves unseen events, and returns the latest session for each live source with absolute exercise counts and completed Cindy rounds. Events are deduplicated by `eventId`; the backend keeps a bounded in-memory cache across dashboard refreshes. |
 | `GET /api/workout/webcam-status` | Reads the latest Webcam_AE/PoseData diagnostic reading for session, detected count, queue depth, retries, and overflow. It does not count repetitions. |
-| `GET /api/workout/history` | Returns `available: false` and an empty `sessions` list. This route exists, but real session history is **not integrated**. |
+| `GET /api/workout/webcam-worker` | Returns the local webcam worker state, session, counts, completion reason, and publication diagnostics. |
+| `POST /api/workout/webcam-worker/start` | Starts one local Cindy webcam worker only when configured with verified non-admin event and summary origins. |
+| `POST /api/workout/webcam-worker/stop` | Requests a bounded, orderly stop and completed summary; the worker reports persistence status afterward. |
+| `GET /api/workout/webcam-worker/preview` | Streams the local worker's annotated JPEG preview to a loopback client. |
+| `POST /api/onem2m/notify/{token}` | Validates a configured oneM2M subscription callback, reads the referenced CIN back from TinyIoT, deduplicates delivery, and acknowledges it. |
+| `GET /api/integration/metrics` | Reports notification, coaching job, and summary reconciliation diagnostics without exposing callback credentials. |
+| `GET /api/workout/history` | Joins retained repetition events with completed summaries by session ID. Reports evidence and comparability for each session; older sessions may be incomplete after TinyIoT retention removes events. |
 | `GET /api/cindypt/recommendations` | Reads the latest stored Cindy PT recommendation content from TinyIoT. |
 | `GET /api/cindypt/goal` | Reads the latest goal from `CindyPT_AE/FitnessGoals`; returns `available: false` for an empty container. |
 | `POST /api/cindypt/goal` | Validates `targetRounds`, `durationSeconds`, and optional `label`, then appends a goal content instance to the existing FitnessGoals container. |
@@ -45,8 +51,9 @@ The snapshot also reports `retrievedAt`, `retrievalMs`, and retention fields. Th
 ## Planned, not implemented
 
 - Trusted device event ingestion and recognition-derived repetition updates.
-- Real workout session storage and history retrieval.
-- A real webcam-to-TinyIoT completion run. The webcam runner now writes `WorkoutSummary` only after the 20-minute timer or an explicit `S` stop, with `sessionId`, `status: "completed"`, `completionReason`, `rounds`, `pullups`, `pushups`, `squats`, and `durationSeconds`. The inspected historical summary has the same result fields without an ID or reason. Cindy PT also accepts optional `workoutId` and an optional `reps` object (`pullup`, `pushup`, `squat`). A missing ID falls back to the oneM2M instance ID. Ongoing or statusless summaries are ignored; same-ID conflicting summaries fail visibly. Duration and reps are never inferred from live events. Mocked API coverage verifies the newly published shape updates progress and can be used by the explicit recommendation route. A real write remains untested pending approval and hardware availability.
+- Durable history beyond TinyIoT retention.
+
+The webcam runner writes `WorkoutSummary` only after the 20-minute timer or an explicit `S` stop, with `sessionId`, `status: "completed"`, `completionReason`, `rounds`, `pullups`, `pushups`, `squats`, and `durationSeconds`. Summary publication waits until all journaled repetition events for that session are confirmed. Cindy PT also accepts optional `workoutId` and an optional `reps` object (`pullup`, `pushup`, `squat`). Ongoing or statusless summaries are ignored; same-ID conflicting summaries fail visibly. Duration and reps are never inferred from live events.
 
 The dashboard uses the live webcam snapshot by default; Demo Mode remains available from its source selector.
 The Cindy PT page independently polls its three read-only GET routes. Its goal form writes only on submit, and recommendation generation requires confirmation; polling never creates CINs. A saved recommendation for the same workout and goal disables the generate button.

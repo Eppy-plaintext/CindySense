@@ -1,6 +1,6 @@
 # CindySense full-workout readiness checklist
 
-This checklist is for the supervised 20-minute workout. It is intentionally read-only until the operator clicks **Start Workout** tomorrow. Do not run the webcam tonight.
+This checklist is for a supervised 20-minute workout. Its preflight commands are read-only. Start the webcam only when the operator intentionally begins a new workout.
 
 ## 1. Start or verify WSL services
 
@@ -24,11 +24,11 @@ Use the original source binary only if that is the approved deployment for the m
 From the repository root, verify the environment file first:
 
 ```powershell
-Get-Content .\backend\.env
+Test-Path .\backend\.env
 Test-Path .\.venv-webcam\Scripts\python.exe
 ```
 
-The current configuration uses `http://127.0.0.1:3001/TinyIoT`, `CDashboard` for reads, `CWebcam` for webcam event and summary publishing, `CCindyPT` for CindyPT resources, and `CINDYSENSE_PERF_LOGGING=1`. Start one backend process:
+Set the values in `backend/.env` using `backend/.env.example` as a guide. Keep tokens and originators out of shared terminal output. For a read-only preflight of an existing resource tree, set `CINDYSENSE_SUBSCRIPTION_RECOVERY_ENABLED=false`; the default is `true` and can create a missing subscription. `CINDYSENSE_SUMMARY_RECONCILIATION_ENABLED` defaults to `false`; enabling it scans summaries and may enqueue advice publication. Start one backend process:
 
 ```powershell
 & .\backend\.venv\Scripts\python.exe -m uvicorn backend.main:app --host 0.0.0.0 --port 8000
@@ -58,7 +58,7 @@ Expected pre-workout state: TinyIoT reachable, worker `idle` or `stopped`, no we
 ## 5. Confirm local webcam prerequisites without opening the camera
 
 ```powershell
-$py = 'C:\Users\USER\Documents\CindySense-GitHub\.venv-webcam\Scripts\python.exe'
+$py = '.\.venv-webcam\Scripts\python.exe'
 & $py -c "import sys, cv2, mediapipe; print(sys.executable); print(cv2.__version__); print(mediapipe.__version__)"
 Test-Path .\models\pose_landmarker_lite.task
 Get-CimInstance Win32_Process | Where-Object {$_.Name -match 'python' -and $_.CommandLine -match 'webcam_squat|webcam_worker'}
@@ -81,7 +81,7 @@ During the session, verify:
 - counts advance in the order of 5 pull-ups, 10 push-ups, 15 squats per round;
 - the active session ID is stable;
 - queue depth stays bounded and `eventOverflow` remains zero;
-- the dashboard and `GET /api/workout/snapshot` show the same confirmed counts.
+- the dashboard's confirmed TinyIoT panel catches up with the local worker count after publication; brief lag is expected.
 
 ## 8. Safe stop
 
@@ -123,7 +123,6 @@ Copy the session ID, final counts, rounds, completion reason, performance metric
 
 ## Readiness classification
 
-- **VERIFIED tonight:** TinyIoT/FastAPI health, resource tree, ACP read permissions, GRP read/fan-out, existing subscription destinations, interpreter/imports/model presence, worker stopped, and automated tests.
-- **MOCK-TESTED:** notification parsing, duplicate suppression, durable coaching jobs, recommendation publication with `CCindyPT`, and dashboard refresh behavior.
-- **CONFIGURED BUT UNVERIFIED:** live `CWebcam` CREATE/RETRIEVE POST path and a genuine completed timer summary. A live write is intentionally deferred until tomorrow's supervised workout.
-- **BLOCKED:** none for the supervised start, provided the preflight checks above pass. Zero event loss cannot be guaranteed because in-memory events can be lost by an unclean process or machine failure.
+- **Verified operational path:** a completed webcam workout delivered its journaled repetition events and timer summary. Read-only FastAPI health reported reachable TinyIoT, a verified repetition resource, and healthy repetition and summary subscriptions. These results do not replace a fresh preflight before another demonstration. Keep session-specific counts and identifiers in local evidence only.
+- **Mock-tested:** notification parsing, duplicate suppression, durable coaching jobs, recommendation publication, reconciliation, and dashboard refresh behavior.
+- **Remaining limits:** physical repetition accuracy requires an independently timed video comparison; notification delivery and CindyPT behavior should be checked again for each new session. The subscription recovery default can write a missing subscription unless disabled for read-only inspection.

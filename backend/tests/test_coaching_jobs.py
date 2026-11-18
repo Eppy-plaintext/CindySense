@@ -69,6 +69,13 @@ class CoachingJobTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.jobs.metrics(), {'done': 1})
         self.assertEqual(self.client.saved, {})
 
+    async def test_mismatched_webcam_workout_identity_is_discarded(self):
+        self.client.summary['workoutId'] = 'another-session'
+        self.jobs.enqueue('summary', 'summary-ri')
+        await self.jobs.process_one(self.client, self.settings)
+        self.assertEqual(self.jobs.metrics(), {'done': 1})
+        self.assertEqual(self.client.saved, {})
+
     async def test_full_summary_without_matching_events_does_not_publish_advice(self):
         self.client.summary['pushups'] = 19
         self.jobs.enqueue('summary', 'summary-ri')

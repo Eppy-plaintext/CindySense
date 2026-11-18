@@ -85,6 +85,8 @@ class CoachingJobs:
             if isinstance(content, dict) and (content.get('synthetic') is True or
                                               content.get('source') != 'webcam'):
                 raise ValueError('summary is not a real webcam workout')
+            if not summary.sessionId or summary.workoutId not in (None, summary.sessionId):
+                raise ValueError('webcam workout identity does not match its session')
             # A short explicit stop or a crash must never trigger a target-based recommendation.
             if content.get('completionReason') != 'timer' or summary.durationSeconds < 1140:
                 self.finish(identity)
