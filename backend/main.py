@@ -21,6 +21,7 @@ from .cindypt import Goal, analyze, read_goal, read_summaries, recommend
 from .discovery import CONTAINER_TYPE, DiscoveryStatus, ResourceResolver
 from .coaching_selection import select_workout
 from .coaching_jobs import CoachingJobs
+from .summary_reconciliation import SummaryReconciler
 from .events import RepetitionEvent, classify_repetition_content
 from .fatigue_history import FatigueHistoryCache
 from .federated_learning import read_result
@@ -41,7 +42,10 @@ from .webcam_worker import WebcamWorker
 @asynccontextmanager
 async def lifespan(app):
     subscription_task = None
+    reconciliation_task = None
     coaching_task = asyncio.create_task(coaching_jobs.run(tinyiot, settings, notification_hub.publish))
+    if summary_reconciler.enabled:
+        reconciliation_task = asyncio.create_task(summary_reconciler.run(tinyiot, settings))
     if subscription_monitor.enabled:
         subscription_task = await subscription_monitor.start(tinyiot, settings)
     try:
@@ -55,6 +59,12 @@ async def lifespan(app):
             pass
         if subscription_task:
             await subscription_monitor.stop()
+        if reconciliation_task:
+            reconciliation_task.cancel()
+            try:
+                await reconciliation_task
+            except asyncio.CancelledError:
+                pass
         await tinyiot._client.aclose()
 
 
@@ -85,6 +95,8 @@ notification_hub = NotificationHub(PaceWarningConfig(
     cooldown_seconds=settings.pace_warning_cooldown_seconds,
 ))
 coaching_jobs = CoachingJobs(os.getenv('CINDYSENSE_COACHING_DB', 'data/cindypt_jobs.sqlite3'))
+summary_reconciler = SummaryReconciler(
+    coaching_jobs, enabled=settings.summary_reconciliation_enabled)
 webcam_worker = WebcamWorker()
 notification_hub.on_summary = coaching_jobs.enqueue
 mec_notification_receiver = MecNotificationReceiver(
@@ -323,7 +335,8 @@ async def integration_events():
 
 @app.get('/api/integration/metrics')
 async def integration_metrics():
-    return {**notification_hub.metrics(), 'coachingJobs': coaching_jobs.metrics()}
+    return {**notification_hub.metrics(), 'coachingJobs': coaching_jobs.metrics(),
+            'summaryReconciliation': summary_reconciler.metrics()}
 
 
 @app.get('/api/fl/status')

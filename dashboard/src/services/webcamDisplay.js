@@ -2,6 +2,26 @@ export function canStartWebcamWorker(worker) {
   return Boolean(worker && ['idle', 'stopped', 'completed', 'error'].includes(worker.state))
 }
 
+export function webcamPersistenceStatus(worker) {
+  if (!worker || !['completed', 'stopped', 'error'].includes(worker.state)) return null
+  const eventsFailed = worker.eventJournalFailed || 0
+  const summariesFailed = worker.summaryFailed || 0
+  const eventsPending = worker.eventJournalPending || 0
+  const summariesPending = worker.summaryPending || 0
+  if (worker.eventJournalError || eventsFailed || summariesFailed || worker.summaryPublication === 'failed') {
+    return `Workout persistence failed: ${eventsFailed} event(s), ${summariesFailed} summary(s). Inspect the worker log before another workout.`
+  }
+  if (eventsPending || summariesPending || worker.summaryPublication === 'pending') {
+    return `Workout persistence pending: ${eventsPending} event(s), ${summariesPending} summary(s). Confirm recovery before another workout.`
+  }
+  if (['delivered', 'created', 'verified'].includes(worker.summaryPublication)) {
+    return worker.eventJournalPending === 0 && worker.eventJournalFailed === 0
+      ? 'Workout stored: repetition events and summary confirmed.'
+      : 'Workout summary stored; event status unavailable in this worker record.'
+  }
+  return worker.completionReason ? 'Workout persistence unconfirmed. Inspect the worker log.' : null
+}
+
 export function webcamWorkoutDisplay(worker) {
   if (!worker?.sessionId || !['running', 'stopping', 'completed', 'stopped'].includes(worker.state)) return null
   const counts = worker.counts || {}

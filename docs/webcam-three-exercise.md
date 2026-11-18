@@ -52,13 +52,19 @@ container. CindyPT reads the new completed snapshot on its next progress GET,
 while recommendation generation still requires the dashboard button.
 
 The camera thread never waits for TinyIoT. Pose readings use a five-slot
-queue and stale readings are discarded. Repetition events use a 1,024-slot
-RAM queue with retries and explicit overflow/retry/confirmation diagnostics.
-At normal shutdown, the publisher has a bounded flush period and saves any
-unconfirmed events to `data/recordings/webcam_pending_events.json` for
-idempotent replay on the next run. A crash before shutdown, a full queue, or
-a spool-write failure can still lose an event; watch the diagnostics. The
-camera loop exits when the 20-minute Cindy timer finishes.
+queue and stale readings are discarded. Each validated repetition event is
+committed to `data/recordings/webcam_pending_events.sqlite3` before network
+delivery. The single event worker retries in journal order with backoff and
+marks events delivered only after exact TinyIoT readback. Pending events replay
+after a crash; an existing JSON shutdown spool is imported once. Journal
+capacity or disk errors stop the workout rather than silently dropping an
+event. Failed events block later delivery until investigated. Check the
+pending/delivered/retried/failed diagnostics before starting another workout.
+The camera loop exits when the 20-minute Cindy timer finishes.
+The completed summary is sealed locally with its session event count. If any
+event or summary readback is pending, it is not reported as persisted and is
+retried when the webcam publisher next starts. The completion wait is bounded;
+check `summaryPending` and `eventJournalPending` diagnostics before a new run.
 The webcam client connects to local `localhost` through `127.0.0.1` on
 Windows, avoiding the measured IPv6 connection fallback delay. Configure
 a different host explicitly when TinyIoT is remote.

@@ -87,7 +87,8 @@ class WebcamWorker:
                 lines = handle.read().decode('utf-8', errors='replace').splitlines()
             errors = [line.strip() for line in lines if line.lstrip().startswith(
                 ('PermissionError:', 'FileNotFoundError:', 'RuntimeError:',
-                 'ModuleNotFoundError:', 'ImportError:', 'OSError:', 'ValueError:'))]
+                 'ModuleNotFoundError:', 'ImportError:', 'OSError:', 'ValueError:',
+                 'EventJournalError:'))]
             if errors:
                 message += f' {errors[-1]}'
         except OSError:

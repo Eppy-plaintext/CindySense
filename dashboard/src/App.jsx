@@ -9,7 +9,7 @@ import { usePolling } from './hooks/usePolling.js'
 import { getBackendHealth, getFederatedLearningResults, getFederatedLearningStatus, getLatestRepetition, getSdtDevice, getWebcamStatus, getWebcamWorker, getWorkoutFatigue, getWorkoutHistory, getWorkoutSnapshot, integrationEventUrl, startWebcamWorker, stopWebcamWorker, webcamPreviewUrl } from './services/api.js'
 import { acceptSnapshot, liveDisplay } from './services/workoutDisplay.js'
 import { applyLiveEvent, EMPTY_LIVE_WORKOUTS, mergeLiveEventsIntoSnapshot } from './services/liveWorkout.js'
-import { canStartWebcamWorker, webcamWorkoutDisplay } from './services/webcamDisplay.js'
+import { canStartWebcamWorker, webcamPersistenceStatus, webcamWorkoutDisplay } from './services/webcamDisplay.js'
 import { VoiceCoach, handleLocalVoiceEvent } from './services/voiceCoach.js'
 import './App.css'
 
@@ -246,6 +246,7 @@ function WebcamPreview() {
 function Dashboard({ secondsLeft, formatTime, timerProgress, workoutState, setWorkoutState, resetWorkout, reps, rounds, activeExercise, setActiveExercise, incrementRep, currentExercise, autoSimulate, setAutoSimulate, liveResult, snapshotResult, webcamStatus, webcamWorker, lastKnownWorker, workerAction, controlWebcam, lastSnapshot, authoritativeSnapshot, displayMode, setDisplayMode, now, voicePreferences, setVoicePreferences, voiceCoach, fatigueResult, fatigueSessionId, paceWarning, sdtResult, flStatusResult, flResultsResult }) {
   const demo = displayMode === 'demo'
   const worker = webcamWorker.status === 'success' ? webcamWorker.data : null
+  const persistenceStatus = displayMode === 'webcam' ? webcamPersistenceStatus(worker) : null
   const workerLive = displayMode === 'webcam' ? webcamWorkoutDisplay(worker) : null
   const live = workerLive || (displayMode === 'webcam' && worker?.state && worker.state !== 'idle'
     ? null : liveDisplay(lastSnapshot, displayMode, now))
@@ -291,7 +292,7 @@ function Dashboard({ secondsLeft, formatTime, timerProgress, workoutState, setWo
       <div className="webcam-actions">
         <button className="control-btn primary" onClick={() => controlWebcam('start')} disabled={workerAction.busy || !canStartWebcamWorker(worker)}>Start Workout</button>
         <button className="control-btn secondary" onClick={() => controlWebcam('stop')} disabled={workerAction.busy || (worker && ['idle', 'stopped', 'completed'].includes(worker.state))}>Stop Workout</button>
-        <span role="status">{workerAction.error || (workerAction.stopRequestedAt && worker?.state === 'stopped' ? `Stopped. Summary: ${worker.summaryPublication || 'unconfirmed'}` : null) ||
+        <span role="status">{workerAction.error || persistenceStatus ||
           (workerAction.stopRequestedAt && now - workerAction.stopRequestedAt > 15000 && worker?.state !== 'stopped' ? `Failed to stop promptly. Worker PID ${worker?.pid || lastKnownWorker?.pid || 'unknown'}; retry Stop Workout or inspect the worker log.` : null) ||
           (workerAction.stopRequestedAt ? 'Stopping webcam and saving the completed workoutâ€¦' : null) || worker?.message ||
           (webcamWorker.status === 'error' ? `${webcamWorker.error} Last known PID ${lastKnownWorker?.pid || 'unknown'}.` : `Camera ${worker?.state || 'checking'}`)}</span>

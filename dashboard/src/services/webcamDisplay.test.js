@@ -1,6 +1,18 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { canStartWebcamWorker, webcamWorkoutDisplay } from './webcamDisplay.js'
+import { canStartWebcamWorker, webcamWorkoutDisplay, webcamPersistenceStatus } from './webcamDisplay.js'
+
+test('completed worker persistence is reported after dashboard reload', () => {
+  assert.match(webcamPersistenceStatus({ state: 'stopped', completionReason: 'explicit_stop',
+    summaryPublication: 'delivered', eventJournalPending: 0, summaryPending: 0 }), /stored/i)
+  assert.match(webcamPersistenceStatus({ state: 'stopped', completionReason: 'explicit_stop',
+    summaryPublication: 'pending', eventJournalPending: 2, summaryPending: 1 }), /pending/i)
+  assert.match(webcamPersistenceStatus({ state: 'error', eventJournalFailed: 1,
+    summaryFailed: 1 }), /failed/i)
+  assert.match(webcamPersistenceStatus({ state: 'stopped', completionReason: 'explicit_stop',
+    summaryPublication: 'created' }), /event status unavailable/i)
+  assert.equal(webcamPersistenceStatus({ state: 'running' }), null)
+})
 
 test('a crashed worker can be restarted while an active worker cannot', () => {
   assert.equal(canStartWebcamWorker({ state: 'error' }), true)

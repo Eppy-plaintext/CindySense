@@ -39,8 +39,9 @@ class CoachingJobs:
 
     def enqueue(self, resource: str, identity: str):
         with self._db() as db:
-            db.execute('INSERT OR IGNORE INTO jobs(identity, resource, due) VALUES (?, ?, ?)',
-                       (identity, resource, time.time()))
+            result = db.execute('INSERT OR IGNORE INTO jobs(identity, resource, due) VALUES (?, ?, ?)',
+                                (identity, resource, time.time()))
+            return result.rowcount == 1
 
     def due(self):
         with self._db() as db:
@@ -138,6 +139,16 @@ class CoachingJobs:
         return True
 
     async def run(self, client, settings, on_saved=None):
+        database_retry_delay = 2
         while True:
-            await self.process_one(client, settings, on_saved)
+            try:
+                await self.process_one(client, settings, on_saved)
+            except sqlite3.Error:
+                # A temporary disk/SQLite failure must not permanently stop
+                # the only consumer of the durable coaching queue.
+                log.error('Coaching job queue unavailable; retrying local database')
+                await asyncio.sleep(database_retry_delay)
+                database_retry_delay = min(database_retry_delay * 2, 30)
+                continue
+            database_retry_delay = 2
             await asyncio.sleep(2)

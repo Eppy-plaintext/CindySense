@@ -23,6 +23,11 @@ import uuid
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
+try:
+    from .event_journal import EventJournal, EventJournalError
+except ImportError:  # webcam_squat.py runs directly from tools/
+    from event_journal import EventJournal, EventJournalError
+
 DEFAULT_BASE = os.environ.get("CINDYSENSE_TINYIOT_URL", "http://127.0.0.1:3001/TinyIoT")
 DEFAULT_ORIGIN = os.environ.get("CINDYSENSE_TINYIOT_ORIGIN", "CWebcam")
 AE_NAME = "Webcam_AE"
@@ -40,6 +45,10 @@ class TinyIoTConnectionError(TinyIoTError):
 
 
 class RetryableSummaryError(TinyIoTError):
+    pass
+
+
+class RetryableEventError(TinyIoTError):
     pass
 
 
@@ -191,7 +200,7 @@ class TinyIoTClient:
               f"cni={container.get('cni')}; previously evicted events cannot be recovered")
 
     def publish_event(self, event, container=EVENT_CONTAINER):
-        """Create an idempotent event CIN; verify an existing CIN on retry."""
+        """Create an idempotent event CIN; require exact readback before acknowledgement."""
         path = "/" + container.strip("/")
         resource_name = "webcam-" + event["eventId"].replace("-", "")
         item_path = f"{path}/{resource_name}"
@@ -199,19 +208,24 @@ class TinyIoTClient:
         if status == 200:
             self._verify_event(data, event, item_path)
             return "verified"
+        if status in (500, 502, 503, 504):
+            raise RetryableEventError("Repetition event lookup temporarily unavailable")
         if status != 404:
             raise TinyIoTError(f"Checking event {item_path} failed: HTTP {status}, body={data}")
         payload = {"m2m:cin": {"rn": resource_name, "cnf": "application/json:0",
                                 "con": json.dumps(event, separators=(",", ":"))}}
         status, rsc, data = self._request("POST", path, payload, ty=4)
-        if status == 201:
-            return rsc
-        if status in (409, 500, 502, 503, 504):
-            # A timeout/server error can mean POST committed but its reply was lost.
+        if status in (201, 409, 500, 502, 503, 504):
+            # A success or ambiguous response is not durable proof until GET confirms it.
             check_status, _, check_body = self._request("GET", item_path)
             if check_status == 200:
                 self._verify_event(check_body, event, item_path)
-                return "verified"
+                return rsc if status == 201 else "verified"
+            if check_status == 404:
+                raise RetryableEventError("Repetition event not visible after POST")
+            if check_status in (500, 502, 503, 504):
+                raise RetryableEventError("Repetition event readback temporarily unavailable")
+            raise TinyIoTError(f"Repetition event readback failed: HTTP {check_status}")
         self._check(status, rsc, data, 201, "POST repetition event CIN")
 
     def publish_summary(self, summary, container=SUMMARY_CONTAINER):
@@ -298,7 +312,8 @@ class PosePublisher:
 
     def __init__(self, base=DEFAULT_BASE, origin=DEFAULT_ORIGIN, interval=1.0,
                  event_container=EVENT_CONTAINER, event_origin=None, event_spool=None,
-                 shutdown_grace=10.0):
+                 shutdown_grace=10.0, session_id=None, journal_path=None,
+                 event_capacity=20000):
         self.client = TinyIoTClient(base, origin)
         self.event_client = TinyIoTClient(base, event_origin or origin)
         self.interval = interval
@@ -306,9 +321,12 @@ class PosePublisher:
         self.shutdown_grace = shutdown_grace
         self.last_queued = 0.0
         self.pending = queue.Queue(maxsize=5)
-        # A full 20-minute offline Cindy session must fit while retries continue.
-        self.events = queue.Queue(maxsize=20000)
         self.event_spool = Path(event_spool) if event_spool else Path(__file__).resolve().parent.parent / "data" / "recordings" / "webcam_pending_events.json"
+        self.journal = EventJournal(journal_path or self.event_spool.with_suffix('.sqlite3'), event_capacity)
+        self.session_id = session_id
+        self.event_wake = threading.Event()
+        self.fatal_error = None
+        self.summary_publisher = None
         self.event_overflow = 0
         self.event_confirmed = 0
         self.event_retries = 0
@@ -323,13 +341,11 @@ class PosePublisher:
                 pending = json.loads(self.event_spool.read_text(encoding="utf-8"))
                 if not isinstance(pending, list) or len(pending) > 20001:
                     raise ValueError("spool is not a bounded event list")
-                self.events.maxsize = max(self.events.maxsize, len(pending))
                 for event in pending:
-                    if not isinstance(event, dict) or not event.get("eventId"):
-                        raise ValueError("spool contains an invalid event")
-                    self.events.put_nowait(event)
-                print(f"[TinyIoT] Restored {len(pending)} pending repetition events")
-            except (OSError, ValueError, queue.Full) as exc:
+                    self.journal.append(event, event['sessionId'])
+                self.event_spool.unlink()
+                print(f"[TinyIoT] Imported {len(pending)} legacy pending repetition events")
+            except (OSError, ValueError, KeyError, TypeError, EventJournalError) as exc:
                 raise TinyIoTError(f"Cannot restore pending event spool {self.event_spool}: {exc}") from exc
         self.worker = threading.Thread(target=self._run, name="tinyiot-webcam", daemon=True)
         self.event_worker = threading.Thread(target=self._run_events, name="tinyiot-events", daemon=True)
@@ -369,74 +385,143 @@ class PosePublisher:
                 print(f"[TinyIoT] Upload failed: {exc}")
 
     def offer_event(self, event):
+        if self.fatal_error is not None:
+            raise EventJournalError('Repetition delivery worker stopped; event journal needs attention')
         try:
-            self.events.put_nowait(event)
-            getattr(self, "event_queued_at", {})[event["eventId"]] = time.monotonic()
-            print(f"[TinyIoT] Event queued at={datetime.now(timezone.utc).isoformat(timespec='milliseconds')} "
-                  f"id={event.get('eventId')} seq={event.get('eventSequence')} "
-                  f"{event.get('exercise')} rep={event.get('repetitions')} depth={self.events.qsize()}")
-            return True
-        except queue.Full:
-            self.event_overflow += 1
-            print(f"[TinyIoT] EVENT QUEUE FULL; overflow={self.event_overflow}; repetition counted locally but event not queued")
-            return False
+            inserted = self.journal.append(event, self.session_id)
+        except EventJournalError as exc:
+            if 'full' in str(exc):
+                self.event_overflow += 1
+            raise
+        if inserted:
+            self.event_queued_at[event['eventId']] = time.monotonic()
+            self.event_wake.set()
+        return inserted
+
+    def set_session(self, session_id):
+        if not session_id:
+            raise EventJournalError('Workout session identity is required')
+        self.session_id = session_id
+
+    def set_summary_publisher(self, publisher):
+        self.summary_publisher = publisher
+        self.event_wake.set()
+
+    def complete_summary(self, summary, event_count, timeout=10.0):
+        """Seal, then wait only a bounded time for ordered event and summary delivery."""
+        if summary.get('sessionId') != self.session_id:
+            raise EventJournalError('Summary belongs to a different workout session')
+        self.journal.queue_summary(summary, event_count)
+        self.event_wake.set()
+        deadline = time.monotonic() + max(0, timeout)
+        while time.monotonic() < deadline:
+            status = self.journal.summary_status(self.session_id)
+            if status in ('delivered', 'failed') or self.fatal_error is not None:
+                return status
+            time.sleep(0.05)
+        return self.journal.summary_status(self.session_id)
 
     def diagnostics(self):
-        return {"eventQueueDepth": self.events.qsize() + int(self.inflight_event is not None),
+        counts = self.journal.metrics()
+        summaries = self.journal.summary_metrics()
+        return {"eventQueueDepth": counts['pending'] + counts['failed'],
                 "eventConfirmed": self.event_confirmed, "eventRetries": self.event_retries,
                 "eventOverflow": self.event_overflow,
+                "eventJournalPending": counts['pending'],
+                "eventJournalDelivered": counts['delivered'],
+                "eventJournalRetried": counts['retried'],
+                "eventJournalFailed": counts['failed'],
+                "eventJournalError": self.fatal_error is not None,
+                "summaryPending": summaries['pending'],
+                "summaryDelivered": summaries['delivered'],
+                "summaryRetried": summaries['retried'],
+                "summaryFailed": summaries['failed'],
                 "eventLastLatencyMs": getattr(self, "event_last_latency_ms", None),
                 "eventMaxLatencyMs": getattr(self, "event_max_latency_ms", 0)}
 
     def _run_events(self):
         delay = 1.0
-        while not self.stopping.is_set() or not self.events.empty():
-            if self.shutdown_deadline is not None and time.monotonic() >= self.shutdown_deadline:
+        while True:
+            if self.stopping.is_set() and time.monotonic() >= self.shutdown_deadline:
                 return
             try:
-                event = self.events.get(timeout=0.2)
-            except queue.Empty:
-                continue
-            self.inflight_event = event
-            while True:
-                if self.shutdown_deadline is not None and time.monotonic() >= self.shutdown_deadline:
-                    self.events.put_nowait(event)
-                    self.inflight_event = None
-                    return
-                try:
-                    result = self.event_client.publish_event(event, self.event_container)
-                    self.event_confirmed += 1
-                    self.inflight_event = None
-                    queued_at = getattr(self, "event_queued_at", {}).pop(event.get("eventId"), None)
-                    if queued_at is not None:
-                        self.event_last_latency_ms = round((time.monotonic() - queued_at) * 1000, 1)
-                        self.event_max_latency_ms = max(getattr(self, "event_max_latency_ms", 0), self.event_last_latency_ms)
-                    detected_at = datetime.fromisoformat(event["timestamp"].replace("Z", "+00:00"))
-                    age_ms = round((datetime.now(timezone.utc) - detected_at).total_seconds() * 1000)
-                    print(f"[TinyIoT] Event confirmed at={datetime.now(timezone.utc).isoformat(timespec='milliseconds')} "
-                          f"id={event.get('eventId')} seq={event.get('eventSequence')} "
-                          f"ageMs={age_ms} depth={self.events.qsize()} ({result})")
-                    delay = 1.0
-                    break
-                except TinyIoTError as exc:
-                    self.event_retries += 1
-                    print(f"[TinyIoT] Event retry seq={event.get('eventSequence')} in {delay:.0f}s: {exc}")
-                    if self.shutdown_deadline is not None:
-                        remaining = self.shutdown_deadline - time.monotonic()
-                        if remaining <= 0:
-                            self.events.put_nowait(event)
-                            self.inflight_event = None
+                if self.summary_publisher is not None:
+                    ready = self.journal.ready_summary()
+                    if ready is not None:
+                        summary_session, summary, state = ready
+                        if state == 'failed':
+                            self.fatal_error = 'failed_summary'
                             return
-                        time.sleep(min(delay, remaining))
-                    else:
-                        self.stopping.wait(delay)
-                    delay = min(delay * 2, 30.0)
+                        try:
+                            result = self.summary_publisher.publish(summary)
+                            self.journal.update_summary(summary_session, 'delivered')
+                            print(f'[TinyIoT] Workout summary confirmed session={summary_session} ({result})')
+                            delay = 1.0
+                        except (TinyIoTConnectionError, RetryableSummaryError) as exc:
+                            self.journal.update_summary(summary_session, 'pending', type(exc).__name__)
+                            time.sleep(min(delay, max(0, self.shutdown_deadline - time.monotonic()))
+                                       if self.stopping.is_set() else delay)
+                            delay = min(delay * 2, 30.0)
+                        except TinyIoTError as exc:
+                            self.journal.update_summary(summary_session, 'failed', type(exc).__name__)
+                            self.fatal_error = 'permanent_summary_error'
+                            print(f'[TinyIoT] Workout summary delivery halted: {exc}')
+                            return
+                        continue
+                head = self.journal.head()
+                if head is None:
+                    if self.stopping.is_set():
+                        return
+                    self.event_wake.wait(0.2)
+                    self.event_wake.clear()
+                    continue
+                row_id, event, state = head
+                if state == 'failed':
+                    self.fatal_error = 'failed_event'
+                    return
+                self.inflight_event = event
+                result = self.event_client.publish_event(event, self.event_container)
+                self.journal.acknowledge(row_id)
+                self.event_confirmed += 1
+                self.inflight_event = None
+                queued_at = self.event_queued_at.pop(event['eventId'], None)
+                if queued_at is not None:
+                    self.event_last_latency_ms = round((time.monotonic() - queued_at) * 1000, 1)
+                    self.event_max_latency_ms = max(self.event_max_latency_ms, self.event_last_latency_ms)
+                print(f"[TinyIoT] Event confirmed id={event['eventId']} seq={event['eventSequence']} ({result})")
+                delay = 1.0
+            except (TinyIoTConnectionError, RetryableEventError) as exc:
+                try:
+                    self.journal.attempt(row_id, type(exc).__name__)
+                except EventJournalError:
+                    self.fatal_error = 'journal_write_error'
+                    return
+                self.event_retries += 1
+                self.inflight_event = None
+                remaining = (max(0, self.shutdown_deadline - time.monotonic())
+                             if self.stopping.is_set() else delay)
+                time.sleep(min(delay, remaining))
+                delay = min(delay * 2, 30.0)
+            except TinyIoTError as exc:
+                try:
+                    self.journal.attempt(row_id, type(exc).__name__, permanent=True)
+                except EventJournalError:
+                    self.fatal_error = 'journal_write_error'
+                    return
+                self.fatal_error = 'permanent_delivery_error'
+                print(f'[TinyIoT] Repetition delivery halted at seq={event["eventSequence"]}: {exc}')
+                return
+            except EventJournalError as exc:
+                self.fatal_error = 'journal_error'
+                print(f'[TinyIoT] Repetition journal error; delivery halted: {exc}')
+                return
 
     def close(self):
         self.shutdown_deadline = time.monotonic() + self.shutdown_grace
         self.stopping.set()
+        self.event_wake.set()
         self.worker.join(timeout=6.0)
-        self.event_worker.join(timeout=20.0)
+        self.event_worker.join(timeout=self.shutdown_grace + 6.0)
         if not self.worker.is_alive():
             self.client.close()
         if not self.event_worker.is_alive():
@@ -444,30 +529,17 @@ class PosePublisher:
         if self.worker.is_alive():
             print("[TinyIoT] Publisher stopped with some requests still in progress")
         if self.event_worker.is_alive():
-            print("[TinyIoT] Event worker still in request; spooling its in-flight event for idempotent retry")
-        with self.events.mutex:
-            pending = list(self.events.queue)
-        if self.inflight_event is not None:
-            pending.append(self.inflight_event)
-        pending = list({event["eventId"]: event for event in pending}.values())
-        spool_status = "none"
+            print('[TinyIoT] Event worker still in request; journal retains its in-flight event')
         try:
-            if pending:
-                self.event_spool.parent.mkdir(parents=True, exist_ok=True)
-                temporary = self.event_spool.with_suffix(".tmp")
-                temporary.write_text(json.dumps(pending, separators=(",", ":")), encoding="utf-8")
-                os.replace(temporary, self.event_spool)
-                spool_status = f"saved:{len(pending)}"
-                print(f"[TinyIoT] Saved {len(pending)} undelivered events for next run")
-            elif self.event_spool.exists():
-                self.event_spool.unlink()
-        except OSError as exc:
-            spool_status = "FAILED"
-            print(f"[TinyIoT] ERROR saving undelivered events: {exc}")
+            counts = self.journal.metrics()
+            summaries = self.journal.summary_metrics()
+        except EventJournalError as exc:
+            print(f'[TinyIoT] ERROR reading repetition journal at shutdown: {exc}')
+            return
         print(f"[TinyIoT] Event summary confirmed={self.event_confirmed} "
-              f"queued={self.events.qsize()} retries={self.event_retries} "
-              f"overflow={self.event_overflow} spool={spool_status}; "
-              "a crash before shutdown can lose RAM-only events")
+              f"pending={counts['pending']} failed={counts['failed']} "
+              f"retries={self.event_retries} overflow={self.event_overflow} "
+              f"summariesPending={summaries['pending']} summariesFailed={summaries['failed']}")
 
 
 def main():

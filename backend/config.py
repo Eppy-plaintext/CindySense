@@ -70,6 +70,7 @@ class Settings:
     subscription_monitor_interval_seconds: float = float(os.getenv('CINDYSENSE_SUBSCRIPTION_MONITOR_INTERVAL_SECONDS', '60'))
     subscription_recovery_enabled: bool = os.getenv('CINDYSENSE_SUBSCRIPTION_RECOVERY_ENABLED', 'true').lower() == 'true'
     subscription_monitor_max_backoff_seconds: float = float(os.getenv('CINDYSENSE_SUBSCRIPTION_MONITOR_MAX_BACKOFF_SECONDS', '300'))
+    summary_reconciliation_enabled: bool = os.getenv('CINDYSENSE_SUMMARY_RECONCILIATION_ENABLED', 'false').lower() == 'true'
 
 
 settings = Settings()

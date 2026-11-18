@@ -61,4 +61,5 @@ class SummaryPublisher:
                 last_error = exc
                 if attempt + 1 < self.attempts:
                     time.sleep(self.retry_delay * (2 ** attempt))
-        raise TinyIoTError(f"Workout summary not confirmed after {self.attempts} attempts: {last_error}") from last_error
+        raise RetryableSummaryError(
+            f"Workout summary not confirmed after {self.attempts} attempts: {last_error}") from last_error

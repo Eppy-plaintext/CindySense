@@ -1,4 +1,6 @@
 import tempfile
+import asyncio
+import sqlite3
 import unittest
 from unittest.mock import AsyncMock, patch
 from pathlib import Path
@@ -124,3 +126,25 @@ class CoachingJobTests(unittest.IsolatedAsyncioTestCase):
             db.execute('UPDATE jobs SET due=0')
         await self.jobs.process_one(self.client, self.settings)
         self.assertEqual(self.jobs.metrics(), {'done': 1})
+
+    async def test_worker_recovers_after_local_database_failure(self):
+        recovered = asyncio.Event()
+        calls = 0
+
+        async def process(*args):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise sqlite3.OperationalError('disk temporarily unavailable')
+            recovered.set()
+            return False
+
+        with patch.object(self.jobs, 'process_one', side_effect=process):
+            task = asyncio.create_task(self.jobs.run(self.client, self.settings))
+            try:
+                await asyncio.wait_for(recovered.wait(), timeout=4)
+            finally:
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+        self.assertGreaterEqual(calls, 2)

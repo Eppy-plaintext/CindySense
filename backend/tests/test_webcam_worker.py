@@ -140,6 +140,15 @@ class WebcamWorkerTests(unittest.TestCase):
         self.assertEqual(len(self.commands), 2)
         self.assertFalse((self.worker.directory / 'stop').exists())
 
+    def test_journal_failure_is_visible_in_worker_status(self):
+        self.start()
+        (self.worker.directory / 'worker.log').write_text(
+            'EventJournalError: Cannot persist repetition event\n', encoding='utf-8')
+        self.processes[0].exit_code = 1
+        crashed = self.worker.status()
+        self.assertEqual(crashed['state'], 'error')
+        self.assertIn('EventJournalError: Cannot persist', crashed['message'])
+
     def test_rejects_unverified_or_missing_publisher(self):
         for origin in (None, 'CAdmin'):
             with self.assertRaises(ValueError):

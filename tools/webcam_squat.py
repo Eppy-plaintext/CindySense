@@ -16,7 +16,7 @@ import mediapipe as mp
 from webcam_exercises import (CindyWorkout, ExerciseCounter, body_movement_measurement,
                               exercise_measurement, pullup_auxiliary_measurement,
                               positioning_feedback, select_exercise_key, visibility)
-from webcam_tinyiot import (PosePublisher, TinyIoTClient, TinyIoTError, DEFAULT_BASE,
+from webcam_tinyiot import (PosePublisher, TinyIoTClient, TinyIoTError, EventJournalError, DEFAULT_BASE,
                             DEFAULT_ORIGIN, EVENT_CONTAINER, SUMMARY_CONTAINER)
 from workout_summary import SummaryPublisher, completed_summary
 from workout_timeseries import WorkoutTimeSeries
@@ -126,12 +126,15 @@ def main():
     )
     publisher = (PosePublisher(args.tinyiot_base, args.tinyiot_origin,
                                event_container=args.event_container,
-                               event_origin=args.tinyiot_event_origin) if args.tinyiot else None)
+                               event_origin=args.tinyiot_event_origin,
+                               session_id=session_id) if args.tinyiot else None)
     summary_client = (TinyIoTClient(args.tinyiot_base,
                                    args.tinyiot_summary_origin or args.tinyiot_event_origin)
                       if args.tinyiot else None)
     summary_publisher = (SummaryPublisher(summary_client, args.summary_container)
                          if summary_client else None)
+    if publisher and summary_publisher:
+        publisher.set_summary_publisher(summary_publisher)
     ts_client = (TinyIoTClient(args.tinyiot_base,
                               args.workout_ts_origin or args.tinyiot_summary_origin or args.tinyiot_event_origin,
                               timeout=1.5)
@@ -428,6 +431,8 @@ def main():
                 elif key in (ord("c"), ord("C")) and workout is None:
                     workout = CindyWorkout(max(1, int(args.duration_minutes * 60)))
                     session_id = "webcam-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
+                    if publisher:
+                        publisher.set_session(session_id)
                     session_baseline = dict(total_reps)
                     event_sequence = 0
                     active = workout.current_exercise
@@ -443,6 +448,8 @@ def main():
                     total_rounds = 0
                     event_sequence = 0
                     session_id = "webcam-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
+                    if publisher:
+                        publisher.set_session(session_id)
                     if workout:
                         workout = CindyWorkout(max(1, int(args.duration_minutes * 60)))
                         active = workout.current_exercise
@@ -451,20 +458,26 @@ def main():
                     print(f"Workout counts reset; new session {session_id}.")
     finally:
         completion_elapsed = workout.elapsed if end_reason and workout else None
+        completion_error = None
         if voice_events:
             voice_events.close()
-        if publisher:
-            publisher.close()
         if end_reason and workout:
             final_totals = {name: total_reps[name] - session_baseline[name] for name in TARGETS}
             summary = completed_summary(session_id, SimpleNamespace(rounds=workout.rounds,
                                         elapsed=completion_elapsed), final_totals, end_reason)
-            if summary_publisher:
+            if publisher and summary_publisher:
                 try:
-                    result = summary_publisher.publish(summary)
-                    summary_result = result
-                    print(f"[TinyIoT] Workout summary PERSISTED session={session_id} result={result}")
-                    if ts_publisher:
+                    publisher.complete_summary(summary, event_sequence, timeout=10.0)
+                except EventJournalError as exc:
+                    completion_error = exc
+                publisher.close()
+                if completion_error is None:
+                    try:
+                        summary_result = publisher.journal.summary_status(session_id)
+                    except EventJournalError as exc:
+                        completion_error = exc
+                if completion_error is None:
+                    if summary_result == 'delivered' and ts_publisher:
                         try:
                             source_path = f"{args.summary_container.strip('/')}/webcam-summary-{session_id}"
                             ts_result, _ = ts_publisher.mirror_source(source_path)
@@ -473,13 +486,15 @@ def main():
                             # The confirmed WorkoutSummary remains authoritative; repair
                             # the optional TS through the explicit reconcile command.
                             print(f"[TinyIoT] Optional TimeSeries mirror failed for session={session_id}: {exc}")
-                except TinyIoTError as exc:
-                    summary_result = 'unconfirmed'
-                    print(f"[TinyIoT] Workout summary PERSISTENCE UNCONFIRMED session={session_id}: {exc}")
+                    if summary_result != 'delivered':
+                        print(f'[TinyIoT] Workout summary pending locally session={session_id}; '
+                              'will retry on next webcam worker start')
             else:
                 print(f"[SESSION] Completed locally; TinyIoT summary not enabled for session={session_id}")
         elif workout:
             print(f"[SESSION] Interrupted session={session_id}; no completed summary published")
+        if publisher and not (end_reason and workout and summary_publisher):
+            publisher.close()
         if summary_client:
             summary_client.close()
         if ts_client:
@@ -492,8 +507,11 @@ def main():
         if not dashboard:
             cv2.destroyAllWindows()
         camera_lock.close()
-        if dashboard and end_reason:
+        if dashboard and completion_error is not None:
+            dashboard.status(state='error', message=str(completion_error))
+        elif dashboard and end_reason:
             final_performance = dict(performance) if performance_enabled else None
+            publication_diagnostics = publisher.diagnostics() if publisher else {}
             if final_performance is not None:
                 final_performance["frames"] = performance["frames"]
             dashboard.status(state='completed', sessionId=session_id, completionReason=end_reason,
@@ -501,7 +519,15 @@ def main():
                              remainingSeconds=max(0, workout.duration_seconds - completion_elapsed),
                              counts=final_totals, completedRounds=workout.rounds,
                              summaryPublication=summary_result or 'disabled',
+                             **({'eventJournalPending': publication_diagnostics['eventJournalPending'],
+                                 'eventJournalFailed': publication_diagnostics['eventJournalFailed'],
+                                 'eventJournalError': publication_diagnostics['eventJournalError'],
+                                 'summaryPending': publication_diagnostics['summaryPending'],
+                                 'summaryFailed': publication_diagnostics['summaryFailed']}
+                                if publisher else {}),
                              **({'performance': final_performance} if final_performance is not None else {}))
+        if completion_error is not None:
+            raise completion_error
     print(f"Completed. Local repetitions: {total_reps}; rounds={workout.rounds if workout else total_rounds}. CSV: {csv_path}")
 
 

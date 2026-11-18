@@ -14,7 +14,7 @@ Local pose inference is edge computing because raw camera frames are processed o
 
 ## Event path
 
-`Camera -> latest-frame buffer -> MediaPipe -> exercise state machine -> confirmed repetition -> bounded TinyIoT event queue -> RepetitionCount CIN -> RepCount_Sub -> FastAPI SSE/dashboard`
+`Camera -> latest-frame buffer -> MediaPipe -> exercise state machine -> confirmed repetition -> SQLite event journal -> RepetitionCount CIN -> exact readback -> RepCount_Sub -> FastAPI SSE/dashboard`
 
 On timer completion or an explicit safe stop, the runner publishes one idempotent `WorkoutSummary` CIN keyed by the webcam session ID. `Summary_Sub` delivers it to FastAPI, which validates the stored CIN, queues a durable SQLite coaching job, and later publishes a deterministic CindyPT recommendation when the retained event evidence is sufficient.
 
@@ -22,9 +22,11 @@ On timer completion or an explicit safe stop, the runner publishes one idempoten
 
 - Pose inference and local counting continue while TinyIoT is temporarily unavailable.
 - Noncritical pose telemetry uses a five-item latest-value queue and stale readings are dropped.
-- Confirmed repetition events use a bounded 20,000-item in-memory queue with retry backoff and a shutdown spool at `data/recordings/webcam_pending_events.json`.
-- A clean shutdown saves undelivered events for the next run; a process or machine crash can still lose events that were only in RAM or in flight.
-- Queue overflow is counted and logged as `EVENT QUEUE FULL`; the local counter is not silently converted into a stored event.
+- Confirmed repetition events use a bounded, durable SQLite outbox at `data/recordings/webcam_pending_events.sqlite3`; the single event worker retries in order and acknowledges only after exact oneM2M readback. The former JSON shutdown spool is imported on startup.
+- Completed webcam summaries are sealed in the same outbox, checked against session event counts, and published only after all that session's events are readback-confirmed. Pending summaries replay when the webcam publisher next starts; waits at completion are bounded.
+- Optional `CINDYSENSE_SUMMARY_RECONCILIATION_ENABLED` scans retained workout summaries with the CindyPT read origin and idempotently enqueues missed coaching jobs. It is disabled by default because coaching may later publish recommendations.
+- Undelivered journal events survive a clean shutdown or worker crash. A crash between local repetition detection and journal commit can still lose that detection.
+- Journal capacity or disk failures stop event acceptance and are surfaced as worker errors; they are not reported as successful delivery.
 - Preview uses latest-frame semantics and is independent of the detector path.
 
 The project does not implement an ETSI MEC platform. It implements local edge inference plus an HTTP oneM2M CSE integration.
