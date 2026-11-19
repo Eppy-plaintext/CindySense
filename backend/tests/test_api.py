@@ -30,9 +30,11 @@ class APITests(unittest.IsolatedAsyncioTestCase):
         def handle(request):
             self.requests.append(request)
             path = request.url.path
-            if path.endswith('/WorkoutPerformance_TS') and request.url.params.get('fu') == '1':
+            if path.endswith('/WorkoutPerformance_TS') and request.url.params.get('rcn') == '6':
                 return httpx.Response(200, headers={'X-M2M-RSC': '2000'},
-                                      json={'m2m:uril': ['TinyIoT/CindySense_AE/WorkoutPerformance_TS/workout_test']})
+                                      json={'m2m:rrl': {'rrf': [{
+                                          'nm': 'workout_test', 'typ': 30,
+                                          'val': 'TinyIoT/CindySense_AE/WorkoutPerformance_TS/workout_test'}]}})
             if path.endswith('/WorkoutPerformance_TS'):
                 return httpx.Response(200, headers={'X-M2M-RSC': '2000'}, json={'m2m:ts': {'ty': 29}})
             if path.endswith('/WorkoutPerformance_TS/workout_test'):
@@ -81,11 +83,35 @@ class APITests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(response.json()['structured_event'])
         self.assertNotIn('pullUps', response.json())
         self.assertNotIn('roundsCompleted', response.json())
-        self.assertEqual(len(self.requests), 2)
-        self.assertTrue(self.requests[1].url.path.endswith('/RepetitionCount/la'))
-        self.assertEqual(self.requests[0].headers['X-M2M-Origin'], 'authorized-workout-origin')
-        self.assertEqual(self.requests[0].headers['X-M2M-RVI'], '4')
-        self.assertTrue(self.requests[0].headers['X-M2M-RI'].startswith('cindysense-'))
+        self.assertEqual(len(self.requests), 3)
+        self.assertEqual(self.requests[0].headers['X-M2M-Origin'], 'authorized-discovery-origin')
+        self.assertTrue(self.requests[0].url.params.get('fu'))
+        self.assertTrue(self.requests[2].url.path.endswith('/RepetitionCount/la'))
+        self.assertEqual(self.requests[1].headers['X-M2M-Origin'], 'authorized-workout-origin')
+        self.assertEqual(self.requests[1].headers['X-M2M-RVI'], '4')
+        self.assertTrue(self.requests[1].headers['X-M2M-RI'].startswith('cindysense-'))
+
+    async def test_live_read_uses_verified_configured_fallback_when_discovery_is_forbidden(self):
+        async def forbidden_discovery(request):
+            self.requests.append(request)
+            if request.url.params.get('fu') == '1':
+                return httpx.Response(403, headers={'X-M2M-RSC': '4103'}, json={})
+            if request.url.path.endswith('/RepetitionCount'):
+                return httpx.Response(200, headers={'X-M2M-RSC': '2000'},
+                                      json={'m2m:cnt': {'rn': 'RepetitionCount'}})
+            if request.url.path.endswith('/RepetitionCount/la'):
+                return httpx.Response(200, headers={'X-M2M-RSC': '2000'},
+                                      json={'m2m:cin': {'con': 11, 'ct': '20261118T000000'}})
+            return httpx.Response(404, headers={'X-M2M-RSC': '4004'}, json={})
+
+        await self.upstream.aclose()
+        self.upstream = httpx.AsyncClient(transport=httpx.MockTransport(forbidden_discovery))
+        main.tinyiot = TinyIoTClient('http://localhost:3000/TinyIoT', self.upstream)
+        response = await self.api.get('/api/workout/live')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['resource_path'], 'CindySense_AE/RepetitionCount')
+        self.assertEqual(self.requests[0].headers['X-M2M-Origin'], 'authorized-discovery-origin')
+        self.assertEqual(self.requests[1].headers['X-M2M-Origin'], 'authorized-workout-origin')
 
     async def test_workout_timeseries_history_is_read_only_and_scoped(self):
         response = await self.api.get('/api/onem2m/workout-timeseries')
@@ -95,6 +121,38 @@ class APITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([request.method for request in self.requests], ['GET', 'GET', 'GET'])
         self.assertTrue(all(request.headers['X-M2M-Origin'] == 'CDashboard'
                             for request in self.requests))
+        self.assertEqual(self.requests[1].url.params.get('rcn'), '6')
+        self.assertIsNone(self.requests[1].url.params.get('fu'))
+
+    async def test_workout_timeseries_rejects_malformed_child_listing(self):
+        def malformed(request):
+            if request.url.params.get('rcn') == '6':
+                return httpx.Response(200, headers={'X-M2M-RSC': '2000'},
+                                      json={'m2m:rrl': {'rrf': [{'typ': 4, 'val': 'TinyIoT/other'}]}})
+            return httpx.Response(200, headers={'X-M2M-RSC': '2000'},
+                                  json={'m2m:ts': {'ty': 29}})
+        await self.upstream.aclose()
+        self.upstream = httpx.AsyncClient(transport=httpx.MockTransport(malformed))
+        main.tinyiot = TinyIoTClient('http://localhost:3000/TinyIoT', self.upstream)
+        response = await self.api.get('/api/onem2m/workout-timeseries')
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.json()['detail']['code'], 'invalid_tinyiot_response')
+
+    async def test_workout_timeseries_rejects_oversized_child_listing(self):
+        def oversized(request):
+            if request.url.params.get('rcn') == '6':
+                entries = [{'typ': 30, 'val': f'TinyIoT/CindySense_AE/WorkoutPerformance_TS/workout_{index}'}
+                           for index in range(101)]
+                return httpx.Response(200, headers={'X-M2M-RSC': '2000'},
+                                      json={'m2m:rrl': {'rrf': entries}})
+            return httpx.Response(200, headers={'X-M2M-RSC': '2000'},
+                                  json={'m2m:ts': {'ty': 29}})
+        await self.upstream.aclose()
+        self.upstream = httpx.AsyncClient(transport=httpx.MockTransport(oversized))
+        main.tinyiot = TinyIoTClient('http://localhost:3000/TinyIoT', self.upstream)
+        response = await self.api.get('/api/onem2m/workout-timeseries')
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.json()['detail']['code'], 'invalid_tinyiot_response')
 
     async def test_numeric_string_repetition_content(self):
         self.workout_content = '11'

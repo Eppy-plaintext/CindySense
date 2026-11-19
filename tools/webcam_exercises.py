@@ -471,7 +471,7 @@ class ExerciseCounter:
                 and abs(head - self.last_head_position) > 0.15 + 0.03 * self.missing_frames):
             head = None
             self.head_baseline = self.head_peak = None
-        fast_sample = (not pullup and timestamp_ms is not None and self.last_sample_ms is not None
+        fast_sample = (timestamp_ms is not None and self.last_sample_ms is not None
                        and 0 < timestamp_ms - self.last_sample_ms <= FAST_FRAME_GAP_MS
                        and self.last_raw_angle is not None and self.last_raw_position is not None
                        and movement is not None and 40 <= abs(angle - self.last_raw_angle) <= 100
@@ -584,7 +584,9 @@ class ExerciseCounter:
             self.phase = "UP"
             # A fresh DOWN state still has to be earned before another rep.
             # Ten ignored frames cost about a third of a second at 30 fps.
-            self.cooldown_frames = self.COOLDOWN_FRAMES if pullup else 0 if self.fast_arm_candidate else 2
+            self.cooldown_frames = (self.COOLDOWN_FRAMES
+                                    if pullup and not self.fast_arm_candidate
+                                    else 0 if self.fast_arm_candidate else 2)
             self.fast_arm_candidate = False
             self.movement_baseline = position
             self.head_baseline = head

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { acceptSnapshot, liveDisplay } from './workoutDisplay.js'
+import { acceptSnapshot, liveDisplay, matchingWebcamSession } from './workoutDisplay.js'
 
 const started = Date.parse('2026-11-06T12:00:00Z')
 const snapshot = (counts, overrides = {}) => ({ sources: { webcam: {
@@ -33,6 +33,21 @@ test('timer expires from session start and stale source is identified', () => {
 test('sources are separate and missing sessions remain empty', () => {
   assert.equal(liveDisplay(snapshot({ pullup: 0, pushup: 0, squat: 5 }), 'mpu6050', started), null)
   assert.equal(liveDisplay(null, 'webcam', started), null)
+})
+
+test('missing or incomplete snapshot never supplies a matching pace session', () => {
+  const sessionId = 'webcam-20261106T120000Z-12345678'
+  assert.equal(matchingWebcamSession(null, undefined), null)
+  assert.equal(matchingWebcamSession(null, sessionId), null)
+  assert.equal(matchingWebcamSession({ sources: {} }, undefined), null)
+  assert.equal(matchingWebcamSession({ sources: { webcam: {} } }, undefined), null)
+  assert.equal(matchingWebcamSession(snapshot({ pullup: 0, pushup: 0, squat: 0 }), undefined), null)
+  assert.equal(matchingWebcamSession(snapshot({ pullup: 0, pushup: 0, squat: 0 }), 'another-session'), null)
+  assert.equal(matchingWebcamSession(snapshot({ pullup: 0, pushup: 0, squat: 0 }), sessionId)?.sessionId, sessionId)
+  assert.equal(liveDisplay({ sources: { webcam: { sessionId } } }, 'webcam', started), null)
+  assert.equal(liveDisplay(snapshot(null), 'webcam', started), null)
+  assert.equal(acceptSnapshot(null, null), false)
+  assert.equal(acceptSnapshot(snapshot({ pullup: 0, pushup: 0, squat: 0 }), null), false)
 })
 
 test('late older HTTP response and prior session cannot overwrite a newer snapshot', () => {

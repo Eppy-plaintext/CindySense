@@ -1,8 +1,8 @@
 """Cached, permission-aware oneM2M resource discovery.
 
-This module is intentionally not wired into application flows yet.  Discovery
-uses the configured discovery origin, while fallback verification uses the
-origin that will perform the eventual operation.
+Application read paths use this resolver where dynamic discovery is configured.
+Discovery uses the configured discovery origin, while fallback verification
+uses the origin that will perform the eventual operation.
 """
 
 from __future__ import annotations

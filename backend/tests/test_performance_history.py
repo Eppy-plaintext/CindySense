@@ -3,7 +3,8 @@ from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 from backend.events import RepetitionEvent
-from backend.performance import PaceWarningAnalyzer, PaceWarningConfig, analyze_performance
+from backend.performance import (PaceWarningAnalyzer, PaceWarningConfig, analyze_performance,
+                                 latest_set_paces, session_average_paces)
 from backend.workout_history import build_history
 
 
@@ -20,6 +21,44 @@ def events(gaps, exercise='pushup'):
 
 
 class PerformanceTests(unittest.TestCase):
+    def test_session_average_uses_accepted_interval_duration_not_set_means(self):
+        first = events([1] * 5, exercise='pullup')
+        later = [item.model_copy(update={'event_sequence': index + 5,
+                                          'repetitions': index + 5, 'round': 2,
+                                          'timestamp': first[-1].timestamp + timedelta(seconds=40 + 2 * index)})
+                 for index, item in enumerate(events([2] * 3, exercise='pullup'), 1)]
+        observed = first + later
+        metric = session_average_paces(observed)['pullup']
+        self.assertEqual(metric['acceptedIntervalCount'], 6)
+        self.assertEqual(metric['possibleIntervalCount'], 6)
+        self.assertEqual(metric['secondsPerRep'], 1.333)
+        self.assertEqual(metric['coverage'], 1)
+        self.assertIsNone(metric['unavailableReason'])
+        self.assertEqual(analyze_performance(observed)['exercises']['pullup']['sessionAveragePace'], metric)
+        latest = latest_set_paces(observed)['pullup']
+        self.assertEqual(latest['round'], 2)
+        self.assertEqual(latest['pace']['secondsPerRep'], 2)
+        third = later[-1].model_copy(update={'event_id': uuid4(), 'event_sequence': 9,
+                                             'repetitions': 9, 'round': 3,
+                                             'timestamp': later[-1].timestamp + timedelta(seconds=40)})
+        self.assertIsNone(latest_set_paces(observed + [third])['pullup']['pace'])
+
+    def test_average_rejects_missing_reps_reversed_time_and_long_gaps(self):
+        observed = events([1, 1, 1, 1, 1, 20, 1, 1], exercise='pushup')
+        gap = session_average_paces(observed)['pushup']
+        self.assertEqual(gap['rejectedIntervals']['long_gap'], 1)
+        self.assertEqual(gap['acceptedIntervalCount'], 6)
+        missing = [item for item in observed if item.repetitions != 3]
+        self.assertEqual(session_average_paces(missing)['pushup']['rejectedIntervals']['nonconsecutive'], 1)
+        reversed_event = observed[3].model_copy(update={'timestamp': observed[2].timestamp - timedelta(seconds=1)})
+        changed = observed[:3] + [reversed_event] + observed[4:]
+        self.assertGreater(session_average_paces(changed)['pushup']['rejectedIntervals']['invalid_time'], 0)
+        self.assertIsNone(session_average_paces([])['squat']['secondsPerRep'])
+        other = observed[0].model_copy(update={'session_id': 'webcam-other'})
+        self.assertEqual(session_average_paces(observed + [other])['pushup']['unavailableReason'],
+                         'mixed_sessions')
+        self.assertIsNone(latest_set_paces(observed + [other])['pushup'])
+
     def test_stable_and_insufficient_data(self):
         stable = analyze_performance(events([2] * 8))
         self.assertEqual(stable['state'], 'stable_performance')

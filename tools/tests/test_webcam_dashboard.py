@@ -40,6 +40,7 @@ class DashboardIPCTests(unittest.TestCase):
                 self.assertTrue(dashboard.frames)
                 self.assertTrue(dashboard.statuses)
                 self.assertGreaterEqual(preview.diagnostics()['previewDroppedFrames'], 0)
+                self.assertIsNotNone(preview.diagnostics()['previewCaptureToWriteMs'])
             finally:
                 preview.close()
 

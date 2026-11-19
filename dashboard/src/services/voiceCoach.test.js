@@ -1,14 +1,72 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { VoiceCoach } from './voiceCoach.js'
+import { VoiceCoach, handleLocalVoiceEvent } from './voiceCoach.js'
 
 function fixture(startImmediately = true) {
   const spoken = []
-  const synth = { speak: (utterance) => { spoken.push(utterance); if (startImmediately) utterance.onstart?.() },
+  const played = []
+  const synth = { speak: (utterance) => { spoken.push(utterance); played.push(utterance); if (startImmediately) utterance.onstart?.() },
     cancel: () => { spoken.length = 0 }, getVoices: () => [{ lang: 'en-US', localService: true }] }
   const coach = new VoiceCoach(synth, class { constructor(text) { this.text = text } })
-  return { coach, spoken, finish: () => spoken.at(-1)?.onend() }
+  return { coach, spoken, played, finish: () => spoken.at(-1)?.onend() }
 }
+
+test('duplicate delivery speaks once per event and allows the same count in a new session', () => {
+  const { coach, played, finish } = fixture()
+  for (const sessionId of ['first', 'second']) {
+    handleLocalVoiceEvent(coach, { type: 'start', sessionId })
+    handleLocalVoiceEvent(coach, { type: 'start', sessionId })
+    finish()
+    const rep = { type: 'rep', sessionId, eventId: 'rep-1', eventSequence: 1, exercise: 'pullup', count: 1 }
+    handleLocalVoiceEvent(coach, rep)
+    handleLocalVoiceEvent(coach, rep)
+    finish()
+    handleLocalVoiceEvent(coach, { type: 'timer', sessionId, minutes: 10 })
+    handleLocalVoiceEvent(coach, { type: 'timer', sessionId, minutes: 10 })
+    finish()
+    handleLocalVoiceEvent(coach, { type: 'complete', sessionId })
+    handleLocalVoiceEvent(coach, { type: 'complete', sessionId })
+    finish()
+  }
+  assert.deepEqual(played.map((item) => item.text), [
+    'Workout started. Five pull-ups. Let’s go!', 'One', '10 minutes remaining.', 'Time’s up! Workout complete!',
+    'Workout started. Five pull-ups. Let’s go!', 'One', '10 minutes remaining.', 'Time’s up! Workout complete!',
+  ])
+})
+
+test('only the selected browser voice queue plays shared events and warnings', () => {
+  const first = fixture()
+  const second = fixture()
+  second.coach.setOutputEnabled(false)
+  for (const { coach } of [first, second]) {
+    handleLocalVoiceEvent(coach, { type: 'start', sessionId: 'shared' })
+  }
+  first.finish()
+  for (const { coach } of [first, second]) {
+    handleLocalVoiceEvent(coach, { type: 'rep', sessionId: 'shared', eventId: 'rep-1',
+      eventSequence: 1, exercise: 'pullup', count: 1 })
+  }
+  first.finish()
+  for (const { coach } of [first, second]) {
+    handleLocalVoiceEvent(coach, { type: 'pace_warning', sessionId: 'shared',
+      warningId: 'warning-1', message: 'Slow down.' })
+  }
+  first.finish()
+  assert.deepEqual(first.played.map((item) => item.text), ['Workout started. Five pull-ups. Let’s go!', 'One', 'Slow down.'])
+  assert.equal(second.played.length, 0)
+})
+
+test('speaker takeover restores the session without replaying its start announcement', () => {
+  const { coach, played, finish } = fixture()
+  handleLocalVoiceEvent(coach, { type: 'start', sessionId: 'one', replay: true })
+  assert.equal(played.length, 0)
+  handleLocalVoiceEvent(coach, { type: 'rep', sessionId: 'one', eventId: 'rep-1',
+    eventSequence: 1, exercise: 'pullup', count: 1 })
+  finish()
+  assert.deepEqual(played.map((item) => item.text), ['One'])
+  handleLocalVoiceEvent(coach, { type: 'start', sessionId: 'two' })
+  assert.equal(played.at(-1).text, 'Workout started. Five pull-ups. Let’s go!')
+})
 
 test('Cindy counts and transitions follow confirmed events once', () => {
   const { coach, spoken, finish } = fixture()

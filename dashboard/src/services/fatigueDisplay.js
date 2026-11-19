@@ -17,7 +17,12 @@ export function fatigueStateForSession(result, sessionId, live = true) {
       data.results?.some((item) => item?.testOnly === true || item?.historicalTest === true)) {
     return { status: 'unavailable', message: 'Historical/test fatigue data is not shown as live-session status.' }
   }
-  if (data.dataSufficient !== true) return { status: 'unknown', message: 'Insufficient validated repetitions for a fatigue estimate.', results: data.results || [] }
+  if (data.dataSufficient !== true) {
+    const reason = data.reasonUnknown === 'detector_quality_unverified'
+      ? 'Detector quality is unverified; a fatigue estimate would be unreliable.'
+      : 'Insufficient validated repetitions for a fatigue estimate.'
+    return { status: 'unknown', message: reason, results: data.results || [] }
+  }
   return { status: 'ready', message: null, results: data.results || [] }
 }
 

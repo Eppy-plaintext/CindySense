@@ -18,8 +18,8 @@ export function ConnectionStatus({ result }) {
   </div>
 }
 
-function StoredPanelShell({ eyebrow, title, children }) {
-  return <section className="panel stored-panel"><div className="panel-header"><div><p className="eyebrow">{eyebrow}</p><h2>{title}</h2></div><span className="stored-tag">STORED DATA</span></div>{children}</section>
+function StoredPanelShell({ eyebrow, title, children, tag = 'STORED DATA' }) {
+  return <section className="panel stored-panel"><div className="panel-header"><div><p className="eyebrow">{eyebrow}</p><h2>{title}</h2></div>{tag && <span className="stored-tag">{tag}</span>}</div>{children}</section>
 }
 
 function ResultMessage({ result, loading, empty }) {
@@ -62,22 +62,15 @@ export function StoredRecommendationPanel({ result, progress }) {
   const advice = typeof stored === 'string' ? stored : details?.recommendation
   const hasAdvice = data?.available === true && typeof advice === 'string' && advice.trim() !== ''
   const savedForCurrentGoal = recommendationMatchesProgress(details, progress)
-  return <StoredPanelShell eyebrow="TINYIOT · STORED ADVICE" title="Latest saved recommendation">
+  return <StoredPanelShell eyebrow="CINDY PT" title="Latest saved recommendation" tag="SAVED">
     {result.status === 'success' && hasAdvice ? <>
-      {isTestGoal(details?.goal) && <p className="pt-test-label">TEST DATA — saved for the integration test goal.</p>}
-      <p className="pt-advice-label">TRAINING · {details?.source === 'rule-based' ? 'RULE-BASED' : 'STORED'}</p>
+      {(isTestGoal(details?.goal) || details?.synthetic === true) && <p className="pt-test-label">Test recommendation</p>}
+      <p className="pt-advice-label">TRAINING</p>
       <p className="stored-advice">{advice}</p>
-      {details?.explanation && <p className="pt-message">Why: {details.explanation}</p>}
       {Number.isInteger(details?.proposedTargetRounds) && <p className="pt-message">Suggested target: {details.proposedTargetRounds} rounds. Saved plans remain unchanged until approved.</p>}
       <p className="pt-advice-label">RECOVERY</p>
       <p className="stored-advice">{details?.recoveryRecommendation || 'No stored recovery recommendation is available.'}</p>
-      <div className="stored-metadata">
-        {details?.source != null && <span>Advice source <strong>{String(details.source)}</strong></span>}
-        {details?.roundsCompleted != null && <span>Stored rounds <strong>{String(details.roundsCompleted)}</strong></span>}
-        {details?.durationSeconds != null && <span>Stored duration <strong>{String(details.durationSeconds)}s</strong></span>}
-      </div>
-      <p className="stored-caption">Retrieved from {data.source || 'backend'}{data.recorded_at ? ` · Stored at ${data.recorded_at}` : ''}</p>
-      {!savedForCurrentGoal && <p className="stored-caution">This stored advice is not verified for the workout and goal currently selected for coaching. It may be historical or test data.</p>}
+      {!savedForCurrentGoal && <p className="stored-caution">Historical or unverified for the current workout and goal.</p>}
     </> : <ResultMessage result={result} loading="Loading stored recommendation…" empty="No saved recommendation is available yet." />}
   </StoredPanelShell>
 }

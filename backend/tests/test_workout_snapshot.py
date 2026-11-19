@@ -102,6 +102,54 @@ class SnapshotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['sources']['webcam']['counts'], {'pullup': 1, 'pushup': 0, 'squat': 0})
         self.assertTrue(result['sources']['mpu6050']['startInferred'])
 
+    async def test_recent_occurrence_times_survive_refresh_without_extra_reads(self):
+        start = datetime(2026, 11, 6, 12, tzinfo=timezone.utc)
+        for index in range(1, 11):
+            self.add(f'push-{index}', event('pushup', index,
+                     stamp=(start + timedelta(seconds=index * 2)).isoformat()))
+        first = await self.read()
+        tail = first['sources']['webcam']['recentEvents']
+        baseline = first['sources']['webcam']['baselineEvents']
+        self.assertEqual([item['repetitions'] for item in tail], list(range(3, 11)))
+        self.assertEqual([item['repetitions'] for item in baseline], list(range(1, 6)))
+        self.assertEqual(tail[-1]['timestamp'], (start + timedelta(seconds=20)).isoformat())
+        self.assertEqual(len([request for request in self.requests if request.url.path.endswith('/push-10')]), 1)
+        self.snapshot = WorkoutSnapshot()
+        second = await self.read()
+        self.assertEqual(second['sources']['webcam']['recentEvents'], tail)
+        self.assertEqual(second['sources']['webcam']['baselineEvents'], baseline)
+
+    async def test_active_five_round_snapshot_exposes_bounded_session_occurrences(self):
+        self.mni = 1000
+        session = 'webcam-20261119T113037Z-b106d783'
+        start = datetime(2026, 11, 19, 11, 30, 37, tzinfo=timezone.utc)
+        sequence = 0
+        for round_number in range(1, 6):
+            for exercise, target in (('pullup', 5), ('pushup', 10), ('squat', 15)):
+                for rep in range(1, target + 1):
+                    sequence += 1
+                    content = event(exercise, (round_number - 1) * target + rep,
+                                    session=session,
+                                    stamp=(start + timedelta(seconds=sequence)).isoformat())
+                    content['eventSequence'] = sequence
+                    content['round'] = round_number
+                    self.add(f'rep-{sequence}', content)
+        result = await self.read()
+        webcam = result['sources']['webcam']
+        self.assertEqual(webcam['sessionId'], session)
+        self.assertEqual(webcam['counts'], {'pullup': 25, 'pushup': 50, 'squat': 75})
+        self.assertEqual(webcam['eventCount'], 150)
+        self.assertEqual(len(webcam['recentEvents']), 24)
+        self.assertEqual(len(webcam['baselineEvents']), 15)
+        self.assertEqual(set(webcam['setPaces']), {'pullup', 'pushup', 'squat'})
+        self.assertEqual(webcam['setPaces']['pullup']['round'], 5)
+        self.assertEqual(webcam['setPaces']['squat']['pace']['secondsPerRep'], 1)
+        self.assertTrue(all(item['timestamp'] and item['eventSequence']
+                            for item in webcam['recentEvents']))
+        self.snapshot = WorkoutSnapshot()
+        self.assertEqual((await self.read())['sources']['webcam']['recentEvents'], webcam['recentEvents'])
+        self.assertEqual((await self.read())['sources']['webcam']['setPaces'], webcam['setPaces'])
+
     async def test_live_audit_synthetic_content_is_excluded_from_real_counts(self):
         zero_count = event('squat', 0)
         zero_count['eventSequence'] = 1

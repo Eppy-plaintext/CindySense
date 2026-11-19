@@ -61,6 +61,28 @@ Copy [config.example.h](firmware/config.example.h) to `firmware/config.h`, fill 
 
 [cindypt.py](backend/cindypt.py) provides rule-based coaching through FastAPI. Configure `TINYIOT_CINDYPT_ORIGIN` server-side for `CindySense_AE/WorkoutSummary`, `CindyPT_AE/FitnessGoals`, and `CindyPT_AE/AIRecommendations`. A verified completed-summary notification queues a job in local SQLite. The worker publishes idempotent advice only for a full timer workout with matching retained repetition evidence and a stored goal; a short explicit stop does not generate advice. Manual generation remains available. Run a single FastAPI worker with a persistent writable `CINDYSENSE_COACHING_DB` location. To recover missed summary callbacks, explicitly enable `CINDYSENSE_SUMMARY_RECONCILIATION_ENABLED`; the scan itself is read-only but a recovered job can publish advice. See [full-workout readiness](docs/full-workout-readiness.md) for the current preflight.
 
+#### Optional CindyPT MCP demonstration
+
+The optional MCP implementation in [cindypt_mcp_onem2m.py](backend/cindypt_mcp_onem2m.py), [cindypt_mcp_mec.py](backend/cindypt_mcp_mec.py), and [cindypt_mcp_agent.py](backend/cindypt_mcp_agent.py) is separate from FastAPI and the existing coaching queue. It is disabled unless an operator explicitly starts a workflow. It uses the pinned official `mcp==2.3.0` SDK and exposes typed tools for validated workout/goal/evidence reads, idempotent recommendation publication, MEC 011 discovery, and MEC 028 WLAN reads.
+
+Use only a disposable TinyIoT fixture for a local demonstration. The command below starts the two stdio MCP servers as subprocesses and writes its independent state journal outside the repository by default:
+
+```sh
+python -m backend.cindypt_mcp_agent --summary-resource CindySense_AE/WorkoutSummary/example-cin --summary-identity example-cin-ri
+```
+
+The agent discovers both tool sets before calling them. MEC is advisory: a disabled, unavailable, or unauthorized endpoint is recorded in the workflow trace and does not cause a recommendation to claim MEC consumption. Do not point this command at a shared or production-like TinyIoT CSE unless its recommendation write is intentionally authorized. The automated MCP tests use in-process MCP protocol servers, mocks, and a disposable SQLite database; they make no live oneM2M or MEC requests.
+
+#### Optional MEC bridge
+
+The existing MEC bridge is independent of FastAPI, the webcam, and CindyPT. It remains disabled by default. After configuring a dedicated least-privilege `MEC_BRIDGE_ORIGIN`, an authorized MEC endpoint, and the existing `MECBridge_AE/WLANInformation` container, explicitly run one bridge attempt:
+
+```sh
+python -m backend.mec_bridge_runner --request-id rehearsal-001
+```
+
+The runner uses MEC 011 discovery when `MEC_SERVICE_DISCOVERY_ENABLED=true`; otherwise it uses the configured MEC 028 endpoint. The existing WLAN client requires a valid HTTPS `MEC_WLAN_API_BASE_URL` even in discovery mode. It publishes only after a successful MEC response through the bridge's existing deterministic named-CIN write and readback verification. Disabled, unavailable, unauthorized, or malformed MEC responses produce a structured failure and no oneM2M write. Use a disposable CSE fixture for rehearsal; do not run it against shared TinyIoT resources without explicit authorization.
+
 The subscription monitor checks configured subscriptions at startup and periodically. Its recovery setting defaults to enabled and may create a missing subscription. Set `CINDYSENSE_SUBSCRIPTION_RECOVERY_ENABLED=false` for read-only inspection of an existing TinyIoT resource tree.
 
 The webcam runner prepares one idempotently named completed summary when its Cindy timer ends or the operator explicitly stops the workout. It does not save interrupted sessions. Connected workout publishing requires explicit, verified non-admin event and summary origins. Mocked tests cover delivery and Cindy PT ingestion. See [webcam workflow](docs/webcam-three-exercise.md).

@@ -95,6 +95,7 @@ class DashboardPreview:
         self.encode_ms = 0.0
         self.write_ms = 0.0
         self.last_age_ms = None
+        self.last_write_age_ms = None
         self.thread = threading.Thread(target=self._run, name='webcam-preview', daemon=True)
         self.thread.start()
 
@@ -122,6 +123,7 @@ class DashboardPreview:
                 started = time.monotonic()
                 self.dashboard.frame(jpeg.tobytes())
                 self.write_ms += (time.monotonic() - started) * 1000
+                self.last_write_age_ms = (time.monotonic() - captured_at) * 1000
                 self.frames += 1
                 self.dashboard.status(**values)
             time.sleep(self.interval)
@@ -130,7 +132,9 @@ class DashboardPreview:
         return {"previewFrames": self.frames, "previewDroppedFrames": self.dropped,
                 "previewEncodeAvgMs": round(self.encode_ms / max(1, self.frames), 2),
                 "previewWriteAvgMs": round(self.write_ms / max(1, self.frames), 2),
-                "previewFrameAgeMs": round(self.last_age_ms, 2) if self.last_age_ms is not None else None}
+                "previewFrameAgeMs": round(self.last_age_ms, 2) if self.last_age_ms is not None else None,
+                "previewCaptureToWriteMs": (round(self.last_write_age_ms, 2)
+                                             if self.last_write_age_ms is not None else None)}
 
     def close(self):
         with self.condition:

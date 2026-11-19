@@ -333,6 +333,10 @@ class PosePublisher:
         self.event_queued_at = {}
         self.event_last_latency_ms = None
         self.event_max_latency_ms = 0
+        self.event_last_publish_ms = None
+        self.event_max_publish_ms = 0
+        self.pose_last_publish_ms = None
+        self.pose_max_publish_ms = 0
         self.stopping = threading.Event()
         self.shutdown_deadline = None
         self.inflight_event = None
@@ -379,7 +383,13 @@ class PosePublisher:
                 print("[TinyIoT] Dropped stale webcam reading")
                 continue
             try:
-                self.client.publish_pose(pose)
+                publish_started = time.monotonic()
+                try:
+                    self.client.publish_pose(pose)
+                finally:
+                    elapsed_ms = round((time.monotonic() - publish_started) * 1000, 1)
+                    self.pose_last_publish_ms = elapsed_ms
+                    self.pose_max_publish_ms = max(self.pose_max_publish_ms, elapsed_ms)
                 print(f"[TinyIoT] HTTP 201 | phase={pose.get('phase')} reps={pose.get('repCount')}")
             except TinyIoTError as exc:
                 print(f"[TinyIoT] Upload failed: {exc}")
@@ -437,7 +447,11 @@ class PosePublisher:
                 "summaryRetried": summaries['retried'],
                 "summaryFailed": summaries['failed'],
                 "eventLastLatencyMs": getattr(self, "event_last_latency_ms", None),
-                "eventMaxLatencyMs": getattr(self, "event_max_latency_ms", 0)}
+                "eventMaxLatencyMs": getattr(self, "event_max_latency_ms", 0),
+                "eventLastPublishMs": getattr(self, "event_last_publish_ms", None),
+                "eventMaxPublishMs": getattr(self, "event_max_publish_ms", 0),
+                "poseLastPublishMs": getattr(self, "pose_last_publish_ms", None),
+                "poseMaxPublishMs": getattr(self, "pose_max_publish_ms", 0)}
 
     def _run_events(self):
         delay = 1.0
@@ -480,7 +494,13 @@ class PosePublisher:
                     self.fatal_error = 'failed_event'
                     return
                 self.inflight_event = event
-                result = self.event_client.publish_event(event, self.event_container)
+                publish_started = time.monotonic()
+                try:
+                    result = self.event_client.publish_event(event, self.event_container)
+                finally:
+                    elapsed_ms = round((time.monotonic() - publish_started) * 1000, 1)
+                    self.event_last_publish_ms = elapsed_ms
+                    self.event_max_publish_ms = max(self.event_max_publish_ms, elapsed_ms)
                 self.journal.acknowledge(row_id)
                 self.event_confirmed += 1
                 self.inflight_event = None
@@ -540,7 +560,6 @@ class PosePublisher:
               f"pending={counts['pending']} failed={counts['failed']} "
               f"retries={self.event_retries} overflow={self.event_overflow} "
               f"summariesPending={summaries['pending']} summariesFailed={summaries['failed']}")
-
 
 def main():
     parser = argparse.ArgumentParser(description="Set up or check CindySense webcam TinyIoT resources")

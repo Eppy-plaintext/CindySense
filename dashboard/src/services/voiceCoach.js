@@ -8,6 +8,7 @@ export class VoiceCoach {
     this.synth = synth
     this.Utterance = Utterance
     this.enabled = true
+    this.outputEnabled = true
     this.volume = 0.8
     this.rate = 1
     this.sessionId = null
@@ -34,6 +35,12 @@ export class VoiceCoach {
     if (!enabled) this.clear()
   }
 
+  setOutputEnabled(enabled) {
+    if (this.outputEnabled === enabled) return
+    this.outputEnabled = enabled
+    if (!enabled) this.clear()
+  }
+
   unlock() {
     if (!this.enabled || !this.synth || !this.Utterance) return
     try {
@@ -53,7 +60,7 @@ export class VoiceCoach {
     try { this.synth?.cancel() } catch { /* speech is optional */ }
   }
 
-  start(sessionId) {
+  start(sessionId, announce = true) {
     if (!sessionId || this.sessionId === sessionId) return
     this.clear()
     this.sessionId = sessionId
@@ -63,7 +70,7 @@ export class VoiceCoach {
     this.lastWarningAt = 0
     this.warningIds.clear()
     this.active = true
-    this.sayPriority('Workout started. Five pull-ups. Let’s go!')
+    if (announce) this.sayPriority('Workout started. Five pull-ups. Let’s go!')
   }
 
   end(sessionId, completed = true) {
@@ -122,7 +129,7 @@ export class VoiceCoach {
   }
 
   sayPriority(text, timing) {
-    if (!this.active || !this.enabled) return
+    if (!this.active || !this.enabled || !this.outputEnabled) return
     if (this.current?.kind === 'count' && !this.current.startedAt) this.clear()
     this.pendingCount = null
     this.priority = [{ text, timing, kind: 'priority' }]
@@ -130,7 +137,7 @@ export class VoiceCoach {
   }
 
   warning({ sessionId, warningId, message, timestamp }) {
-    if (!this.active || !this.enabled || sessionId !== this.sessionId ||
+    if (!this.active || !this.enabled || !this.outputEnabled || sessionId !== this.sessionId ||
         !warningId || !message || this.warningIds.has(warningId)) return
     const now = Date.now()
     if (now - this.lastWarningAt < this.warningCooldownMs) return
@@ -145,7 +152,7 @@ export class VoiceCoach {
   }
 
   drain() {
-    if (this.speaking || !this.enabled || !this.synth || !this.Utterance) return
+    if (this.speaking || !this.enabled || !this.outputEnabled || !this.synth || !this.Utterance) return
     const item = this.priority.shift() || this.pendingCount
     if (!item) return
     if (item === this.pendingCount) this.pendingCount = null
@@ -185,7 +192,7 @@ export class VoiceCoach {
 }
 
 export function handleLocalVoiceEvent(coach, event) {
-  if (event.type === 'start') coach.start(event.sessionId)
+  if (event.type === 'start') coach.start(event.sessionId, !event.replay)
   if (event.type === 'rep') coach.rep(event)
   if (event.type === 'timer') coach.timer(event.sessionId, event.minutes)
   if (event.type === 'complete') coach.end(event.sessionId)

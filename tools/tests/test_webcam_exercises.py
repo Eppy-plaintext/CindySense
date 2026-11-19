@@ -457,6 +457,19 @@ class ExerciseCounterTests(unittest.TestCase):
                     detections += counter.update(angle, position)
         self.assertEqual((counter.reps, detections), (5, 5))
 
+    def test_fast_pullups_remove_only_the_confirmed_cycle_cooldown(self):
+        counter = ExerciseCounter("pullup")
+        detections = 0
+        timestamp = 0
+        for _ in range(8):
+            detections += counter.update(170, .55, timestamp_ms=timestamp)
+            timestamp += 32
+        for _ in range(5):
+            for angle, position in ([(85, .42)] * 4 + [(170, .55)] * 4):
+                detections += counter.update(angle, position, timestamp_ms=timestamp)
+                timestamp += 32
+        self.assertEqual((counter.reps, detections), (5, 5))
+
     def test_pullup_partial_and_lateral_swing_are_rejected_with_diagnostics(self):
         partial = ExerciseCounter("pullup")
         for angle, position in [(170, .55)] * 8 + [(132, .47)] * 12 + [(170, .55)] * 12:

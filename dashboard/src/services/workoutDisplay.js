@@ -2,6 +2,7 @@ export const CINDY_TARGETS = { pullUps: 5, pushUps: 10, squats: 15 }
 const EXERCISE_NAMES = { pullUps: 'pullup', pushUps: 'pushup', squats: 'squat' }
 
 export function acceptSnapshot(previous, incoming) {
+  if (!incoming || typeof incoming !== 'object') return false
   if (!previous) return true
   const oldTime = Date.parse(previous.retrievedAt)
   const newTime = Date.parse(incoming?.retrievedAt)
@@ -16,9 +17,15 @@ export function acceptSnapshot(previous, incoming) {
   return true
 }
 
+export function matchingWebcamSession(snapshot, sessionId) {
+  const session = snapshot?.sources?.webcam
+  return typeof sessionId === 'string' && sessionId && session?.sessionId === sessionId
+    ? session : null
+}
+
 export function liveDisplay(snapshot, source, now) {
   const session = snapshot?.sources?.[source]
-  if (!session) return null
+  if (!session || !session.counts || typeof session.counts !== 'object') return null
   const counts = {
     pullUps: session.counts.pullup,
     pushUps: session.counts.pushup,

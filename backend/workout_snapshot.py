@@ -6,10 +6,13 @@ import re
 import time
 
 from .events import RepetitionEvent, classify_repetition_content, deduplicate_and_order
+from .performance import latest_set_paces
 from .tinyiot import TinyIoTClient, TinyIoTError
 
 TARGETS = {'pullup': 5, 'pushup': 10, 'squat': 15}
 MAX_CACHED_EVENTS = 2000
+PACE_TAIL_PER_EXERCISE = 8
+BASELINE_EVENTS_PER_EXERCISE = 5
 WEBCAM_SESSION_TIME = re.compile(r'^webcam-(\d{8}T\d{6}Z)-')
 
 
@@ -49,6 +52,26 @@ def summarize_events(events: list[RepetitionEvent]) -> dict:
             observed.add(event.exercise)
         latest_at = max(event.timestamp for event in session_events)
         start_at = min(_session_start(event) for event in session_events)
+        # The dashboard needs occurrence times after a refresh. Reuse the
+        # validated events already fetched for counts; do not add CIN reads.
+        recent_events = []
+        baseline_events = []
+        for exercise in TARGETS:
+            exercise_events = sorted(
+                (event for event in session_events if event.exercise == exercise),
+                key=lambda event: (event.event_sequence or 0, event.timestamp, str(event.event_id)),
+            )
+            def occurrence(event: RepetitionEvent) -> dict:
+                return {
+                    'eventId': str(event.event_id),
+                    'eventSequence': event.event_sequence,
+                    'exercise': event.exercise,
+                    'repetitions': event.repetitions,
+                    'round': event.round,
+                    'timestamp': event.timestamp.isoformat(),
+                }
+            recent_events.extend(occurrence(event) for event in exercise_events[-PACE_TAIL_PER_EXERCISE:])
+            baseline_events.extend(occurrence(event) for event in exercise_events[:BASELINE_EVENTS_PER_EXERCISE])
         sources[source] = {
             'sessionId': session_id,
             'counts': counts,
@@ -58,6 +81,9 @@ def summarize_events(events: list[RepetitionEvent]) -> dict:
             'observedExercises': sorted(observed),
             'startInferred': source != 'webcam' or WEBCAM_SESSION_TIME.match(session_id) is None,
             'eventCount': len(session_events),
+            'recentEvents': recent_events,
+            'baselineEvents': baseline_events,
+            'setPaces': latest_set_paces(session_events),
         }
     return {'sources': sources, 'cachedEventCount': len(ordered)}
 

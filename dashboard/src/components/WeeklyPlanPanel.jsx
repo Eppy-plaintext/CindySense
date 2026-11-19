@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { usePolling } from '../hooks/usePolling.js'
 import { getCindyPtRecovery, getSavedCindyPtPlan, previewCindyPtPlan, saveCindyPtPlan } from '../services/api.js'
-import { formatCindyDuration } from '../services/cindyptDisplay.js'
+import { formatCindyDuration, isTestGoal } from '../services/cindyptDisplay.js'
 import { savePlanAfterConfirmation } from '../services/weeklyPlan.js'
 import { hasNewCompletedWorkout, validateSavedRecovery, validateWeeklyPlan } from '../services/weeklyPlanDisplay.js'
 
@@ -22,6 +22,7 @@ export function WeeklyPlanPanel({ progressResult }) {
     ? validateWeeklyPlan(savedResult.data.plan) : null
   const savedPlan = savedResult.data?.available && !savedPlanError ? savedResult.data.plan : null
   const plan = preview || savedPlan
+  const testPlan = Boolean(plan && (plan.testGoal || isTestGoal(plan.goal) || plan.workoutProvenance === 'historical-test'))
   const isPreview = Boolean(preview)
   const alreadySaved = Boolean(preview && savedPlan?.planId === preview.planId)
   const newWorkoutAvailable = hasNewCompletedWorkout(savedPlan, progressResult, recentSave)
@@ -76,8 +77,8 @@ export function WeeklyPlanPanel({ progressResult }) {
   }
 
   return <section className="panel pt-weekly" aria-label="Cindy PT weekly plan">
-    <div className="panel-header"><div><p className="eyebrow">SEVEN-DAY TRAINING</p><h2>Weekly Cindy plan</h2></div><span className="stored-tag">RULE-BASED</span></div>
-    <p className="pt-message">Plan dates use your local timezone ({timezone}). The next plan starts on the coming Monday, or today if it is Monday.</p>
+    <div className="panel-header"><div><p className="eyebrow">SEVEN-DAY TRAINING</p><h2>Your Weekly Cindy Plan</h2></div></div>
+    <p className="pt-message">Plan dates follow your local timezone.</p>
     <div className="pt-plan-controls">
       <label>Experience level<select value={experienceLevel} onChange={(event) => { setExperienceLevel(event.target.value); setPreview(null) }}><option value="beginner">Beginner</option><option value="intermediate">Intermediate</option><option value="advanced">Advanced</option></select></label>
       <fieldset><legend>Training days</legend><div className="pt-day-picker">{WEEKDAYS.map((name, day) => <label key={name}><input type="checkbox" checked={trainingDays.includes(day)} onChange={() => toggleDay(day)} />{name.slice(0, 3)}</label>)}</div></fieldset>
@@ -90,13 +91,11 @@ export function WeeklyPlanPanel({ progressResult }) {
     {!plan && savedResult.status === 'success' && !savedPlanError && <p className="pt-message">{savedResult.data?.incomplete ? 'A previous save is incomplete. Preview and save again to retry.' : 'No saved weekly plan yet. Preview a plan without writing to TinyIoT.'}</p>}
     {newWorkoutAvailable && <p className="pt-plan-update" role="status">New workout available. Preview an updated CindyPT plan.</p>}
     {plan && <>
-      <p className="pt-plan-state">{isPreview ? 'PREVIEW — NOT SAVED' : 'SAVED IN TINYIOT'}{alreadySaved ? ' · IDENTICAL PLAN ALREADY SAVED' : ''}</p>
-      <p className="pt-message">Week of {plan.weekStart} · {plan.timezone} · {plan.experienceLevel}</p>
-      <p className="pt-message">Plan goal: {plan.goal.label || 'Cindy workout goal'} · {plan.goal.targetRounds} rounds in {formatCindyDuration(plan.goal.durationSeconds)}.</p>
-      {plan.testGoal && <p className="pt-test-label">TEST DATA — this plan uses the integration test goal.</p>}
-      {plan.workoutProvenance === 'historical-test' && <p className="pt-test-label">TEST DATA — the source workout is the historical integration record.</p>}
-      {plan.workoutProvenance === 'unverified' && <p className="pt-message">The stored workout has no provenance label; treat its origin as unverified.</p>}
-      {plan.limitedInformation && <p className="pt-message">Limited information: {plan.completedWorkoutCount === 0 ? 'no completed workouts are stored.' : 'fewer than two distinct completed workouts are stored.'} Targets stay conservative.</p>}
+      <p className="pt-plan-state">{isPreview ? 'Preview — not saved' : 'Saved plan'}{alreadySaved ? ' · Already saved' : ''}</p>
+      <div className="pt-plan-summary"><p>Week of <strong>{plan.weekStart}</strong></p><p>{testPlan ? 'Test plan' : 'Workout goal'}: <strong>{plan.goal.targetRounds} rounds in {formatCindyDuration(plan.goal.durationSeconds)}</strong></p></div>
+      {testPlan && <p className="pt-test-label">Test plan; review before using for training.</p>}
+      {plan.workoutProvenance === 'unverified' && <p className="pt-message">Workout source is unverified.</p>}
+      {plan.limitedInformation && <p className="pt-message">Limited workout history; targets remain conservative.</p>}
       <div className="pt-week-list">{plan.days.map((day) => <article key={day.date} className={`pt-week-day ${day.type}`}><div><strong>{day.weekday}</strong><span>{day.date}</span></div><div><b>{day.type === 'workout' ? 'WORKOUT' : 'RECOVERY'}</b><strong>{day.focus}</strong>{day.type === 'workout' ? <><span>{day.suggestedRounds} Cindy round{day.suggestedRounds === 1 ? '' : 's'} · {formatCindyDuration(day.suggestedDurationSeconds)}</span><span>Pull-ups {day.exerciseVolume.pullup} · Push-ups {day.exerciseVolume.pushup} · Squats {day.exerciseVolume.squat}</span></> : <span>Rest or easy movement</span>}<small>{day.reason}</small></div></article>)}</div>
       <h3>Recovery guidance</h3>
       {!isPreview && (recoveryResult.status === 'loading' || recoveryResult.status === 'idle') && <p className="pt-message" role="status">Loading saved recovery guidance…</p>}

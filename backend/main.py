@@ -163,13 +163,32 @@ def _discovery_error(result):
 async def _resolve_read_resource(ae_scope, name, operation_origin, fallback_path):
     if not operation_origin:
         raise TinyIoTError('origin_not_configured', 'The oneM2M operation originator is not configured.', 503)
-    result = await _discovery_client().resolve(
+    resolver = _discovery_client()
+    # The production TinyIoT client always supports discovery.  Keep the
+    # configured path usable for narrow injected clients used by isolated
+    # integrations that intentionally expose only the retrieve API.
+    if not callable(getattr(resolver.client, 'discover', None)):
+        return fallback_path
+    result = await resolver.resolve(
         ae_scope=ae_scope, name=name, resource_type=CONTAINER_TYPE,
         operation_origin=operation_origin, fallback_path=fallback_path,
     )
     if not result.path:
         raise _discovery_error(result)
     return result.path
+
+
+async def _resolve_repetition_read_resource():
+    """Resolve the dashboard's read-only repetition container safely.
+
+    Event publication deliberately continues to use the configured path: the
+    webcam publisher must not gain a discovery dependency or a broader write
+    scope.  Reads can use discovery because the configured path is still
+    retrieved and type-verified as the safe fallback.
+    """
+    return await _resolve_read_resource(
+        'CindySense_AE', 'RepetitionCount', settings.workout_origin,
+        settings.repetition_resource)
 
 
 def local_webcam_request(request):
@@ -462,7 +481,7 @@ async def workout_timeseries_history():
         ts = parent.get('m2m:ts')
         if not isinstance(ts, dict) or ts.get('ty') != 29:
             raise TinyIoTError('invalid_tinyiot_response', 'Workout history resource is not a TS.', 502)
-        refs = await tinyiot.discover(resource, origin, resource_type=30)
+        refs = await tinyiot.child_references(resource, origin, resource_type=30)
         prefix = f'TinyIoT/{resource}/'
         if len(refs) > 100 or any(not ref.startswith(prefix) or '/' in ref[len(prefix):]
                                   for ref in refs):
@@ -517,7 +536,8 @@ async def workout_monitoring_group():
 @app.get('/api/workout/live')
 async def live_workout():
     try:
-        content, instance = await tinyiot.latest_content(settings.repetition_resource, settings.workout_origin)
+        resource = await _resolve_repetition_read_resource()
+        content, instance = await tinyiot.latest_content(resource, settings.workout_origin)
         try:
             kind, event, legacy = classify_repetition_content(content)
         except ValueError as exc:
@@ -525,7 +545,7 @@ async def live_workout():
         return {
             'available': True,
             'source': 'TinyIoT',
-            'resource_path': settings.repetition_resource,
+            'resource_path': resource,
             'latest_repetition_content': content,
             'content_kind': kind,
             'structured_event': event.content() if event else None,
@@ -539,7 +559,8 @@ async def live_workout():
 @app.get('/api/workout/snapshot')
 async def live_workout_snapshot():
     try:
-        return await workout_snapshot.read(tinyiot, settings.repetition_resource, settings.workout_origin)
+        resource = await _resolve_repetition_read_resource()
+        return await workout_snapshot.read(tinyiot, resource, settings.workout_origin)
     except TinyIoTError as exc:
         raise api_error(exc) from exc
 

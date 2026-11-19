@@ -17,6 +17,46 @@ exercise modes preserves counts and re-arms the selected detector. The overlay
 shows mode, count, phase, and the 20-minute AMRAP clock. The CSV under
 `data/recordings/` records measurements locally.
 
+### Diagnose capture and missed fast repetitions
+
+These commands make no TinyIoT requests. Close other camera applications first;
+the camera lock prevents simultaneous CindySense probes. Use the same camera,
+resolution, lighting, and movement tempo for each comparison:
+
+```powershell
+.\.venv-webcam\Scripts\python.exe tools/webcam_capture_probe.py --seconds 60
+$env:CINDYSENSE_PERF_LOGGING = '1'
+.\.venv-webcam\Scripts\python.exe tools/webcam_squat.py --exercise cindy --duration-minutes 3 --voice-events-port 0
+```
+
+The first command measures capture without MediaPipe, detection, voice, or
+network publishing. For the second, manually count slow and fast sets of each
+exercise. The runner prints `[PERF]` every five seconds and `[PERF FINAL]` on
+exit. Its CSV records detector phase, rejection reason, rep event, camera read
+failures, dropped unread frames, pose inference time, detector-update gap,
+and per-exercise detected-rep gap. Compare those rows against the manual count
+and note the exact time of any observed freeze. `--perf-gap-ms` sets the
+detector-gap alert threshold (100 ms by default). Remove
+`--voice-events-port 0` and connect the local dashboard to compare browser
+voice on the same Cindy sequence. Browser speech playback is outside the Python
+frame loop; `voiceEmitMs` measures only local event enqueueing.
+
+`capturedAtUtc` and `captureElapsedMs` mark when OpenCV `read()` returned, not
+sensor exposure. `readReturnToInferenceMs` is the delay after that return;
+neither it nor `staleFrame` proves sensor frame age. The legacy `frameAgeMs`
+CSV column is left blank to avoid implying a sensor timestamp. The camera
+backend's reported buffer size and `bufferSet` return value are diagnostic,
+not proof that a requested buffer size took effect. The latest-frame slot
+reports overwritten unread frames; do not interpret this as confirmed lost
+physical repetitions.
+
+Network-on comparisons must use an explicitly disposable local TinyIoT CSE
+with separately authorized test containers and originators. Do not point a
+diagnostic run at production TinyIoT resources or ACPs. The default runner
+without `--tinyiot` is the safe network-off comparison. Retain the CSV and
+console output for the same manually counted sets before changing camera
+buffering, detection thresholds, or cooldowns.
+
 For a connected workout, first verify the existing `Webcam_AE/PoseData`,
 `CindySense_AE/RepetitionCount`, and `CindySense_AE/WorkoutSummary` resources
 and non-admin publisher permissions. Configure verified origins in

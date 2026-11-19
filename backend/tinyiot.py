@@ -42,6 +42,23 @@ class TinyIoTClient:
             raise TinyIoTError('invalid_tinyiot_response', 'Discovery response is missing m2m:uril.', 502)
         return references
 
+    async def child_references(self, resource_path: str, origin: str,
+                               resource_type: int, limit: int = 101) -> list[str]:
+        """List direct child references using retrieve privilege (rcn=6)."""
+        payload = await self._request('GET', resource_path, origin, params={
+            'rcn': 6, 'ty': resource_type, 'lvl': 1, 'lim': limit,
+        })
+        listing = payload.get('m2m:rrl')
+        entries = listing.get('rrf') if isinstance(listing, dict) else None
+        if not isinstance(entries, list) or any(
+            not isinstance(entry, dict) or entry.get('typ') != resource_type
+            or not isinstance(entry.get('val'), str) for entry in entries
+        ):
+            raise TinyIoTError('invalid_tinyiot_response', 'Child reference listing is malformed.', 502)
+        if len(entries) >= limit:
+            raise TinyIoTError('invalid_tinyiot_response', 'Child reference listing exceeds its limit.', 502)
+        return [entry['val'] for entry in entries]
+
     async def create_subscription(self, resource_path: str, origin: str, name: str, notification_uri: str) -> dict:
         return await self._request('POST', resource_path, origin, {
             'm2m:sub': {'rn': name, 'nu': [notification_uri], 'enc': {'net': [3]}, 'nct': 1},

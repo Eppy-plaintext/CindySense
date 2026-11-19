@@ -139,6 +139,24 @@ class CindyPTTests(unittest.IsolatedAsyncioTestCase):
         advice = (await self.api.get('/api/cindypt/recommendations/current')).json()['recommendations']
         self.assertFalse(advice['planChangeAppropriate'])
 
+    async def test_session_average_pace_is_coaching_context_not_quality_verification(self):
+        self.sessions = [self.session('full')]
+        self.sessions[0]['performance']['exercises'] = {'pushup': {
+            'state': 'stable_performance', 'sessionAveragePace': {
+                'secondsPerRep': 1.5, 'repsPerMinute': 40,
+                'acceptedIntervalCount': 20, 'possibleIntervalCount': 22,
+                'coverage': 0.909, 'unavailableReason': None}}}
+        self.summaries = [self.summary('full')]
+        progress = (await self.api.get('/api/cindypt/progress')).json()
+        self.assertEqual(progress['coachingWorkout']['performance']['exercises']['pushup']
+                         ['sessionAveragePace']['secondsPerRep'], 1.5)
+        advice = (await self.api.get('/api/cindypt/recommendations/current')).json()['recommendations']
+        self.assertEqual(advice['observedMetrics']['performance']['exercises']['pushup']
+                         ['sessionAveragePace']['acceptedIntervalCount'], 20)
+        self.assertIn('pushup 1.5 s/rep', advice['explanation'])
+        self.assertFalse(advice['planChangeAppropriate'])
+        self.assertIsNone(advice['proposedTargetRounds'])
+
     async def test_missing_summary_and_worker_crash_stay_visible_without_advice(self):
         self.sessions = [self.session('crashed')]
         progress = (await self.api.get('/api/cindypt/progress')).json()

@@ -17,6 +17,15 @@ test('shows unknown for missing or insufficient data', () => {
   assert.equal(fatigueStateForSession({ status: 'success', data: { selectedSessionId: 'webcam-current', dataSufficient: true, results: [] } }, null, false).status, 'unavailable')
 })
 
+test('explains the backend detector-quality safeguard', () => {
+  const state = fatigueStateForSession({ status: 'success', data: {
+    selectedSessionId: 'webcam-current', dataSufficient: false,
+    reasonUnknown: 'detector_quality_unverified',
+  } }, 'webcam-current')
+  assert.equal(state.status, 'unknown')
+  assert.match(state.message, /Detector quality is unverified/)
+})
+
 test('never presents historical/test results as live fatigue', () => {
   const result = ready()
   result.data.historicalTest = true

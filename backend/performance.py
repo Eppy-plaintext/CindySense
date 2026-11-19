@@ -14,6 +14,91 @@ from statistics import mean, median, pstdev
 from .events import RepetitionEvent
 
 EXERCISES = ('pullup', 'pushup', 'squat')
+SET_TARGETS = {'pullup': 5, 'pushup': 10, 'squat': 15}
+
+
+def _ordered_exercise_events(events, exercise):
+    unique = {str(event.event_id): event for event in events if event.exercise == exercise}
+    return sorted(unique.values(), key=lambda item: (item.event_sequence or 0, item.timestamp))
+
+
+def session_average_paces(events, rest_multiplier=2.5, minimum_intervals=3):
+    """Observed within-set pace; never count transitions or missing repetitions."""
+    if len({event.session_id for event in events}) > 1:
+        return {exercise: {'secondsPerRep': None, 'repsPerMinute': None,
+                           'acceptedIntervalCount': 0, 'possibleIntervalCount': 0,
+                           'coverage': 0, 'unavailableReason': 'mixed_sessions',
+                           'rejectedIntervals': {}} for exercise in EXERCISES}
+    result = {}
+    for exercise in EXERCISES:
+        ordered = _ordered_exercise_events(events, exercise)
+        possible = 0
+        candidates = []
+        rejected = {'nonconsecutive': 0, 'invalid_time': 0, 'long_gap': 0}
+        for before, after in zip(ordered, ordered[1:]):
+            if before.round != after.round:
+                continue
+            possible += 1
+            if (after.repetitions != before.repetitions + 1 or
+                    (after.event_sequence or 0) <= (before.event_sequence or 0)):
+                rejected['nonconsecutive'] += 1
+                continue
+            seconds = (after.timestamp - before.timestamp).total_seconds()
+            if seconds <= 0:
+                rejected['invalid_time'] += 1
+                continue
+            candidates.append(seconds)
+        baseline = median(candidates) if candidates else None
+        accepted = [value for value in candidates if value <= baseline * rest_multiplier] if baseline else []
+        rejected['long_gap'] = len(candidates) - len(accepted)
+        count = len(accepted)
+        available = count >= minimum_intervals
+        average = sum(accepted) / count if available else None
+        result[exercise] = {
+            'secondsPerRep': round(average, 3) if available else None,
+            'repsPerMinute': round(60 / average, 2) if available else None,
+            'acceptedIntervalCount': count,
+            'possibleIntervalCount': possible,
+            'coverage': round(count / possible, 3) if possible else 0,
+            'unavailableReason': None if available else 'insufficient_valid_intervals',
+            'rejectedIntervals': rejected,
+        }
+    return result
+
+
+def latest_set_paces(events, rest_multiplier=2.5, rolling_intervals=4):
+    """Three bounded refresh-recovery values from session-matched event history."""
+    if len({event.session_id for event in events}) > 1:
+        return {exercise: None for exercise in EXERCISES}
+    result = {}
+    for exercise in EXERCISES:
+        ordered = _ordered_exercise_events(events, exercise)
+        if not ordered:
+            result[exercise] = None
+            continue
+        latest = ordered[-1]
+        current = [item for item in ordered if item.round == latest.round]
+        intervals = []
+        measured = None
+        for before, after in zip(current, current[1:]):
+            seconds = (after.timestamp - before.timestamp).total_seconds()
+            if (after.repetitions != before.repetitions + 1 or
+                    (after.event_sequence or 0) <= (before.event_sequence or 0) or seconds <= 0):
+                intervals = []
+                continue
+            if intervals and seconds > median(intervals) * rest_multiplier:
+                intervals = []
+                continue
+            intervals = (intervals + [seconds])[-rolling_intervals:]
+            if len(intervals) >= 2:
+                measured = {'secondsPerRep': round(sum(intervals) / len(intervals), 3),
+                            'repsPerMinute': round(60 * len(intervals) / sum(intervals), 2),
+                            'intervalCount': len(intervals), 'measuredAt': after.timestamp.isoformat()}
+        result[exercise] = {'round': latest.round, 'repetitions': latest.repetitions,
+                            'lastEventAt': latest.timestamp.isoformat(),
+                            'setComplete': latest.repetitions % SET_TARGETS[exercise] == 0,
+                            'pace': measured}
+    return result
 
 @dataclass(frozen=True)
 class PerformanceConfig:
@@ -48,6 +133,7 @@ def analyze_performance(events: list[RepetitionEvent], config: PerformanceConfig
         by_exercise[event.exercise].append(event)
         by_round[event.round].append(event)
     exercises = {}
+    average_paces = session_average_paces(events, config.rest_multiplier, config.minimum_pace_intervals)
     all_gaps = []
     states = []
     for exercise in EXERCISES:
@@ -81,6 +167,7 @@ def analyze_performance(events: list[RepetitionEvent], config: PerformanceConfig
             'paceChangePercent': round((late / early - 1) * 100, 1) if early and late else None,
             'paceConsistencyCv': round(pstdev(pace) / mean(pace), 3) if len(pace) >= 2 else None,
             'state': state, 'estimatedRestGaps': gaps,
+            'sessionAveragePace': average_paces[exercise],
         }
     rounds = []
     for number, round_events in sorted(by_round.items()):

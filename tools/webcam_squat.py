@@ -22,7 +22,9 @@ from workout_summary import SummaryPublisher, completed_summary
 from workout_timeseries import WorkoutTimeSeries
 from local_voice_events import LocalVoiceEvents
 from webcam_dashboard import CameraLock, DashboardIPC, DashboardPreview
-from webcam_camera import LatestFrameCamera
+from webcam_camera import LatestFrameCamera, is_stale_frame
+from webcam_metrics import WebcamTimings
+from webcam_quality import TrackingQuality
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_MODEL = PROJECT_ROOT / "models" / "pose_landmarker_lite.task"
@@ -75,7 +77,15 @@ def main():
                         help="Local browser voice event stream port; 0 disables it")
     parser.add_argument("--dashboard-ipc", type=Path,
                         help="Local status, stop control, and JPEG preview directory")
+    parser.add_argument("--perf-gap-ms", type=float, default=100.0,
+                        help="Detector-update gap reported in diagnostic logs (default: 100 ms)")
+    parser.add_argument("--camera-recovery-seconds", type=float, default=6.0,
+                        help="Maximum time to wait for frames after an active-session camera pause")
     args = parser.parse_args()
+    if args.perf_gap_ms <= 0:
+        parser.error('--perf-gap-ms must be positive')
+    if args.camera_recovery_seconds <= 0:
+        parser.error('--camera-recovery-seconds must be positive')
     if args.dashboard_ipc and args.exercise != 'cindy':
         parser.error('Dashboard control supports Cindy workouts only.')
     dashboard = DashboardIPC(args.dashboard_ipc) if args.dashboard_ipc else None
@@ -149,7 +159,12 @@ def main():
             print(f"[VOICE] Local event stream unavailable: {exc}")
     def announce(kind, **details):
         if voice_events and workout:
-            return voice_events.emit({"type": kind, "sessionId": session_id, **details})
+            started = time.monotonic()
+            try:
+                return voice_events.emit({"type": kind, "sessionId": session_id, **details})
+            finally:
+                if timings:
+                    timings.record('voiceEmitMs', (time.monotonic() - started) * 1000)
         return None
     print(f"Webcam session {session_id}; mode={args.exercise}; TinyIoT={'on' if publisher else 'off'}")
     print("Click the webcam window before pressing keys.")
@@ -164,9 +179,20 @@ def main():
     timer_announced = set()
     last_dashboard_update = 0.0
     performance_enabled = os.environ.get("CINDYSENSE_PERF_LOGGING") == "1"
+    timings = WebcamTimings(args.perf_gap_ms) if performance_enabled else None
+    tracking_quality = TrackingQuality(args.perf_gap_ms)
+    camera_interrupted_at = None
+    previous_dropped_frames = 0
+    last_detector_at = None
+    first_detector_at = None
+    last_rep_at = {name: None for name in TARGETS}
+    last_perf_report = start
     performance = {"frames": 0, "captureMs": 0.0, "poseMs": 0.0,
-                   "jpegMs": 0.0, "statusMs": 0.0, "frameGapMs": 0.0, "droppedFrames": 0,
-                   "lastFrameAgeMs": None, "lastConfirmLatencyMs": None}
+                   "frameGapMs": 0.0, "droppedFrames": 0, "missingPoseFrames": 0,
+                   "unusableMeasurementFrames": 0,
+                   "lastReadReturnToInferenceMs": None, "delayedAfterReadFrames": 0,
+                   "processedFps": 0.0,
+                   "captureFps": None, "lastConfirmLatencyMs": None}
     summary_result = None
     publication_diagnostics = {}
     last_publication_diagnostics_ms = -250
@@ -188,10 +214,14 @@ def main():
                       "squatSampleGapMs", "squatSmoothingMode",
                       "eventId", "eventQueueDepth", "captureWaitMs", "frameAgeMs",
                       "droppedFrames", "frameGapMs", "poseMs", "cameraReadFailures",
-                      "cameraConsecutiveReadFailures", "cameraRecoveries"]
+                      "cameraConsecutiveReadFailures", "cameraRecoveries",
+                      "capturedAtUtc", "captureElapsedMs", "inferenceStartedUtc", "staleFrame",
+                      "captureFps", "processedFps", "eventLastLatencyMs",
+                      "readReturnToInferenceMs", "detectorGapMs", "repGapMs"]
             writer = csv.DictWriter(f, fieldnames=fields)
             writer.writeheader()
             while True:
+                frame_started = time.monotonic()
                 if workout and workout.finished:
                     print(f"[SESSION] 20-minute Cindy complete; rounds={workout.rounds}")
                     end_reason = "timer"
@@ -204,13 +234,29 @@ def main():
                 capture_started = time.monotonic()
                 ok, frame, frame_info = camera.read()
                 capture_ms = (time.monotonic() - capture_started) * 1000
+                if timings:
+                    timings.record('captureWaitMs', capture_ms)
                 if not ok:
-                    print("Camera frame read failed.")
+                    if camera_interrupted_at is None:
+                        camera_interrupted_at = time.monotonic()
+                        tracking_quality.interruption(active)
+                        print(f"[CAMERA] Frame delivery paused; waiting up to {args.camera_recovery_seconds}s for recovery")
+                    camera_error = camera.terminal_error()
+                    if not camera_error and time.monotonic() - camera_interrupted_at < args.camera_recovery_seconds:
+                        if dashboard:
+                            dashboard.status(state='running', sessionId=session_id, cameraInterrupted=True,
+                                             trackingQuality=tracking_quality.snapshot(),
+                                             message='Camera paused; waiting for frames. Repetitions during the gap cannot be counted.')
+                        continue
+                    print(f"[CAMERA] {camera_error or 'Frame delivery did not recover within the configured window.'}")
                     if dashboard:
                         dashboard.status(state='error', sessionId=session_id,
-                                         message='Camera frame read failed; workout was interrupted.')
+                                         trackingQuality=tracking_quality.snapshot(),
+                                         message='Camera frame delivery stopped; workout was interrupted.')
                     break
-                frame_age_ms = (time.monotonic() - frame_info["capturedAt"]) * 1000
+                if camera_interrupted_at is not None:
+                    print(f"[CAMERA] Frame delivery resumed after {time.monotonic() - camera_interrupted_at:.2f}s")
+                    camera_interrupted_at = None
                 frame_exercise = active
                 frame = cv2.flip(frame, 1)
                 h, w = frame.shape[:2]
@@ -221,14 +267,24 @@ def main():
                 last_capture_at = frame_info["capturedAt"]
                 last_ts_ms = ts_ms
                 pose_started = time.monotonic()
+                inference_started_utc = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+                frame_age_ms = (pose_started - frame_info["capturedAt"]) * 1000
+                stale_frame = is_stale_frame(frame_info["capturedAt"], pose_started)
                 result = landmarker.detect_for_video(image, ts_ms)
                 pose_ms = round((time.monotonic() - pose_started) * 1000, 1)
+                if timings:
+                    timings.record('poseMs', pose_ms)
                 performance["frames"] += 1
                 performance["captureMs"] = round(performance["captureMs"] + capture_ms, 1)
                 performance["poseMs"] = round(performance["poseMs"] + pose_ms, 1)
                 performance["frameGapMs"] = round(frame_gap_ms, 1)
-                performance["lastFrameAgeMs"] = round(frame_age_ms, 1)
-                performance["droppedFrames"] = camera.diagnostics()["droppedFrames"]
+                performance["lastReadReturnToInferenceMs"] = round(frame_age_ms, 1)
+                camera_diagnostics = camera.diagnostics()
+                performance["droppedFrames"] = camera_diagnostics["droppedFrames"]
+                dropped_delta = max(0, camera_diagnostics['droppedFrames'] - previous_dropped_frames)
+                previous_dropped_frames = camera_diagnostics['droppedFrames']
+                performance["captureFps"] = camera_diagnostics["captureFps"]
+                performance["delayedAfterReadFrames"] += int(stale_frame)
                 angle, confidence, side = None, 0.0, "NONE"
                 body_movement, body_confidence = None, 0.0
                 head_position = lateral_position = None
@@ -247,11 +303,28 @@ def main():
                     )
                     if frame_exercise == "pullup":
                         head_position, lateral_position = pullup_auxiliary_measurement(landmarks)
+                else:
+                    performance['missingPoseFrames'] += 1
+                if angle is None:
+                    performance['unusableMeasurementFrames'] += 1
                 counter = counters[frame_exercise]
                 rejected_before = counter.rejected_candidates
                 phase_before = counter.phase
                 counted = counter.update(angle, body_movement, head_position, lateral_position,
                                          timestamp_ms=ts_ms)
+                detector_at = time.monotonic()
+                detector_gap_ms = ((detector_at - last_detector_at) * 1000
+                                   if last_detector_at is not None else None)
+                if timings and detector_gap_ms is not None:
+                    timings.record('detectorGapMs', detector_gap_ms)
+                last_detector_at = detector_at
+                tracking_quality.record(frame_exercise, has_pose=bool(result.pose_landmarks),
+                                        usable_measurement=angle is not None,
+                                        detector_gap_ms=detector_gap_ms, dropped_frames=dropped_delta)
+                if first_detector_at is None:
+                    first_detector_at = detector_at
+                performance['processedFps'] = round(
+                    (performance['frames'] - 1) / max(0.001, detector_at - first_detector_at), 2)
                 confirmed_at_ms = time.time_ns() // 1_000_000 if counted else None
                 counted = counted and not (workout and workout.finished)
                 if frame_exercise == "pushup" and (counter.phase != phase_before or counter.rejected_candidates != rejected_before):
@@ -263,7 +336,11 @@ def main():
                 if counter.rejected_candidates != rejected_before:
                     print(f"[REJECT] exercise={frame_exercise} reason={counter.last_rejection}")
                 event = None
+                rep_gap_ms = None
                 if counted:
+                    if last_rep_at[frame_exercise] is not None:
+                        rep_gap_ms = round((detector_at - last_rep_at[frame_exercise]) * 1000, 1)
+                    last_rep_at[frame_exercise] = detector_at
                     event_round = workout.rounds + 1 if workout else 1
                     spoken_count = workout.progress[frame_exercise] + 1 if workout else reps_this_mode[frame_exercise] + 1
                     reps_this_mode[frame_exercise] += 1
@@ -297,13 +374,22 @@ def main():
                     if published_at_ms is not None:
                         print(f"[VOICE] id={event['eventId']} confirmToLocalPublishMs={published_at_ms - confirmed_at_ms}")
                     if publisher:
-                        publisher.offer_event(event)
+                        journal_started = time.monotonic()
+                        try:
+                            publisher.offer_event(event)
+                        finally:
+                            if timings:
+                                timings.record('journalAppendMs', (time.monotonic() - journal_started) * 1000)
 
                 elapsed_s = (time.monotonic() - start)
                 if publisher and (event is not None or ts_ms - last_publication_diagnostics_ms >= 250):
                     # Journal metrics open SQLite connections. Sample them at
                     # a bounded rate, and immediately after a new event.
+                    diagnostics_started = time.monotonic()
                     publication_diagnostics = publisher.diagnostics()
+                    if timings:
+                        timings.record('publicationDiagnosticsMs',
+                                       (time.monotonic() - diagnostics_started) * 1000)
                     last_publication_diagnostics_ms = ts_ms
                 display_exercise = frame_exercise
                 display_counter = counters[display_exercise]
@@ -358,6 +444,7 @@ def main():
                         **publication_diagnostics,
                     })
                 squat_diag = display_counter.squat_diagnostics(ts_ms)
+                csv_started = time.monotonic()
                 writer.writerow({"timestampUtc": timestamp, "elapsedMs": ts_ms, "exercise": display_exercise,
                                  "kneeAngleDeg": f"{angle:.2f}" if display_exercise == "squat" and angle is not None else "",
                                  "trackedLeg": side if display_exercise == "squat" else "NONE",
@@ -385,38 +472,67 @@ def main():
                                  "eventId": event["eventId"] if event is not None else "",
                                  "eventQueueDepth": publication_diagnostics["eventQueueDepth"] if publisher else 0,
                                  "captureWaitMs": round(capture_ms, 1),
-                                 "frameAgeMs": round(frame_age_ms, 1),
-                                 "droppedFrames": camera.diagnostics()["droppedFrames"],
+                                 "frameAgeMs": "",  # No sensor exposure timestamp is available.
+                                 "droppedFrames": camera_diagnostics["droppedFrames"],
                                  "frameGapMs": frame_gap_ms, "poseMs": pose_ms,
-                                 "cameraReadFailures": camera.diagnostics()["readFailures"],
-                                 "cameraConsecutiveReadFailures": camera.diagnostics()["consecutiveReadFailures"],
-                                 "cameraRecoveries": camera.diagnostics()["recoveries"]})
+                                 "cameraReadFailures": camera_diagnostics["readFailures"],
+                                 "cameraConsecutiveReadFailures": camera_diagnostics["consecutiveReadFailures"],
+                                 "cameraRecoveries": camera_diagnostics["recoveries"],
+                                 "capturedAtUtc": frame_info["capturedAtUtc"],
+                                 "captureElapsedMs": max(0, int((frame_info["capturedAt"] - start) * 1000)),
+                                 "inferenceStartedUtc": inference_started_utc,
+                                 "staleFrame": stale_frame,
+                                 "captureFps": camera_diagnostics["captureFps"],
+                                 "processedFps": performance["processedFps"],
+                                 "eventLastLatencyMs": publication_diagnostics.get("eventLastLatencyMs"),
+                                 "readReturnToInferenceMs": round(frame_age_ms, 1),
+                                 "detectorGapMs": round(detector_gap_ms, 1) if detector_gap_ms is not None else "",
+                                 "repGapMs": rep_gap_ms if rep_gap_ms is not None else ""})
+                if timings:
+                    timings.record('csvWriteMs', (time.monotonic() - csv_started) * 1000)
                 if dashboard and time.monotonic() - last_dashboard_update >= 0.15:
                     values = dict(state='running', sessionId=session_id,
+                                     cameraInterrupted=False, trackingQuality=tracking_quality.snapshot(),
                                      durationSeconds=workout.duration_seconds,
                                      remainingSeconds=workout.remaining, counts={
                                          name: total_reps[name] - session_baseline[name] for name in TARGETS},
                                      completedRounds=workout.rounds, activeExercise=active,
                                      positioning=positioning,
-                                     eventQueueDepth=publication_diagnostics['eventQueueDepth'] if publisher else 0)
+                                     eventQueueDepth=publication_diagnostics['eventQueueDepth'] if publisher else 0,
+                                     eventLastLatencyMs=publication_diagnostics.get('eventLastLatencyMs'),
+                                     eventMaxLatencyMs=publication_diagnostics.get('eventMaxLatencyMs'))
                     if performance_enabled:
                         metrics = dict(performance)
                         frames = max(1, performance["frames"])
                         metrics["captureAvgMs"] = round(performance["captureMs"] / frames, 2)
                         metrics["poseAvgMs"] = round(performance["poseMs"] / frames, 2)
-                        metrics["jpegAvgMs"] = round(performance["jpegMs"] / frames, 2)
-                        metrics["statusAvgMs"] = round(performance["statusMs"] / frames, 2)
+                        metrics['cameraReadFailures'] = camera_diagnostics['readFailures']
+                        metrics['cameraReadMaxMs'] = camera_diagnostics['readMaxMs']
+                        metrics['captureIntervalMaxMs'] = camera_diagnostics['captureIntervalMaxMs']
                         if preview:
                             metrics.update(preview.diagnostics())
                         values["performance"] = metrics
                     if preview:
+                        preview_started = time.monotonic()
                         preview.offer(frame, values, frame_info["capturedAt"])
+                        if timings:
+                            timings.record('previewOfferMs', (time.monotonic() - preview_started) * 1000)
                     last_dashboard_update = time.monotonic()
                 if dashboard:
                     key = -1
                 else:
+                    render_started = time.monotonic()
                     cv2.imshow("CindySense Webcam Workout", frame)
                     key = cv2.waitKey(1) & 0xFF
+                    if timings:
+                        timings.record('opencvRenderMs', (time.monotonic() - render_started) * 1000)
+                if timings:
+                    timings.record('frameProcessMs', (time.monotonic() - frame_started) * 1000)
+                    if time.monotonic() - last_perf_report >= 5.0:
+                        print(f"[PERF] camera={camera.diagnostics()} stages={timings.snapshot()} "
+                              f"publish={publication_diagnostics.get('eventLastPublishMs')}ms "
+                              f"publishMax={publication_diagnostics.get('eventMaxPublishMs')}ms")
+                        last_perf_report = time.monotonic()
                 if workout and workout.finished:
                     end_reason = "timer"
                     announce("complete")
@@ -438,6 +554,7 @@ def main():
                 elif key in (ord("c"), ord("C")) and workout is None:
                     workout = CindyWorkout(max(1, int(args.duration_minutes * 60)))
                     session_id = "webcam-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
+                    tracking_quality = TrackingQuality(args.perf_gap_ms)
                     if publisher:
                         publisher.set_session(session_id)
                     session_baseline = dict(total_reps)
@@ -455,6 +572,7 @@ def main():
                     total_rounds = 0
                     event_sequence = 0
                     session_id = "webcam-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
+                    tracking_quality = TrackingQuality(args.perf_gap_ms)
                     if publisher:
                         publisher.set_session(session_id)
                     if workout:
@@ -511,6 +629,11 @@ def main():
             if performance_enabled:
                 performance.update(preview.diagnostics())
         camera.close()
+        if timings:
+            performance['timings'] = timings.snapshot()
+            performance['camera'] = camera.diagnostics()
+            performance['publication'] = publication_diagnostics
+            print(f"[PERF FINAL] {performance}")
         if not dashboard:
             cv2.destroyAllWindows()
         camera_lock.close()
@@ -522,6 +645,7 @@ def main():
             if final_performance is not None:
                 final_performance["frames"] = performance["frames"]
             dashboard.status(state='completed', sessionId=session_id, completionReason=end_reason,
+                             cameraInterrupted=False, trackingQuality=tracking_quality.snapshot(),
                              durationSeconds=summary['durationSeconds'],
                              remainingSeconds=max(0, workout.duration_seconds - completion_elapsed),
                              counts=final_totals, completedRounds=workout.rounds,

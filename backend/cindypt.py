@@ -141,6 +141,17 @@ def recommend(progress: dict) -> dict:
         observations.append('Movement detection quality was not verified; observed pace and gaps may include missed repetitions.')
     if performance.get('estimatedRestGaps'):
         observations.append('Long gaps were observed between recorded repetitions; they are not confirmed rest or fatigue.')
+    average_paces = {name: metrics.get('sessionAveragePace')
+                     for name, metrics in performance.get('exercises', {}).items()
+                     if isinstance(metrics, dict)}
+    usable_averages = [(name, metric) for name, metric in average_paces.items()
+                       if isinstance(metric, dict) and metric.get('secondsPerRep') is not None and
+                       metric.get('acceptedIntervalCount', 0) >= 3]
+    if usable_averages:
+        observed = ', '.join(f"{name} {metric['secondsPerRep']:.1f} s/rep"
+                             for name, metric in usable_averages)
+        observations.append(f'Observed within-set detected-rep averages: {observed}. '
+                            'These are coaching context, not verified movement quality or fatigue.')
     proposal_allowed = full and reliability == 'verified' and not str(goal.get('label') or '').upper().startswith('TEST')
     proposal = (min(goal['targetRounds'], workout['roundsCompleted'] + 1)
                 if proposal_allowed and not progress['goalAchieved'] else

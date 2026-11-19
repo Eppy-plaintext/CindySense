@@ -1,4 +1,4 @@
-import { comparableSessions, historyRows } from '../services/historyDisplay.js'
+import { comparableSessions, formatHistoryDate, historyRows } from '../services/historyDisplay.js'
 
 const STATUS = {
   completed_20_minute: 'Completed 20-minute workout',
@@ -22,11 +22,11 @@ export function StoredHistoryPage({ result }) {
     {result?.status === 'success' && result.data?.available === true && <>
       <p className="pt-message">{rows.length} sessions · {comparable.length} comparable 20-minute workouts. Missing event history may reflect TinyIoT retention.</p>
       <section className="panel history-panel" aria-label="Completed rounds over time"><h2>Completed rounds over time</h2>
-        {comparable.length ? [...comparable].reverse().map((row) => <div className="history-chart-row" key={row.sessionId}><span>{new Date(row.date || row.recordedAt).toLocaleDateString()}</span><div className="progress-track"><span style={{ width: `${100 * row.completedRounds / scale}%` }} /></div><strong>{row.completedRounds}</strong></div>) : <p className="pt-message">Comparable 20-minute workouts are not available yet.</p>}
+        {comparable.length ? [...comparable].reverse().map((row) => <div className="history-chart-row" key={row.sessionId}><span>{formatHistoryDate(row.date || row.recordedAt)}</span><div className="progress-track"><span style={{ width: `${100 * row.completedRounds / scale}%` }} /></div><strong>{row.completedRounds}</strong></div>) : <p className="pt-message">Comparable 20-minute workouts are not available yet.</p>}
       </section>
       <section className="panel history-panel" aria-label="Stored workout sessions"><h2>Sessions and performance</h2>
-        <div className="history-table"><div className="history-row history-head"><span>DATE / SESSION</span><span>REPS / ROUNDS</span><span>DURATION</span><span>STATUS</span><span></span></div>
-          {rows.map((row) => <div className="history-row" key={row.sessionId}><span><strong>{row.date ? new Date(row.date).toLocaleString() : 'Date unknown'}</strong><small>{row.sessionId}</small></span>
+        <div className="history-table"><div className="history-row history-head"><span>DATE</span><span>REPS / ROUNDS</span><span>DURATION</span><span>STATUS</span><span></span></div>
+          {rows.map((row) => <div className="history-row" key={row.sessionId}><span><strong>{formatHistoryDate(row.date, true)}</strong></span>
             <span className="result">{row.exerciseCounts ? `Pull-ups ${row.exerciseCounts.pullup ?? '?'} · Push-ups ${row.exerciseCounts.pushup ?? '?'} · Squats ${row.exerciseCounts.squat ?? '?'}` : 'Totals unavailable'}<small>Rounds {row.completedRounds ?? 'unverified'} · Push-up pace {row.pace == null ? 'unavailable' : `${row.pace}s/rep`} · Possible rest gaps {row.restGaps ?? 'unavailable'}</small><small>{row.comparable && row.targetRounds ? `Target ${row.targetRounds} rounds · ${row.targetProgressPercent}% achieved` : 'Excluded from equal-duration comparison'}</small></span>
             <span className="duration">{row.durationSeconds == null ? 'Unknown' : `${Math.floor(row.durationSeconds / 60)}m ${row.durationSeconds % 60}s`}</span>
             <span><em className={`status-chip ${row.comparable ? 'complete' : 'stopped'}`}>{STATUS[row.status] || row.status}</em><small>{row.performance?.state?.replaceAll('_', ' ') || 'Pace unavailable'}{row.roundChangeFromPrevious != null ? ` · ${row.roundChangeFromPrevious > 0 ? '+' : ''}${row.roundChangeFromPrevious} rounds vs previous` : ''}</small></span><span></span></div>)}

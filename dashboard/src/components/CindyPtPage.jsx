@@ -1,8 +1,9 @@
 import { useState } from 'react'
 import { StoredRecommendationPanel } from './ApiPanels.jsx'
 import { usePolling } from '../hooks/usePolling.js'
-import { discoverWorkoutResources, generateCindyPtRecommendation, getCindyPtGoal, getCindyPtProgress, getCindyPtRecommendations, getCurrentCindyPtRecommendation, getWorkoutMonitoringGroup, saveCindyPtGoal } from '../services/api.js'
+import { generateCindyPtRecommendation, getCindyPtGoal, getCindyPtProgress, getCindyPtRecommendations, getCurrentCindyPtRecommendation, saveCindyPtGoal } from '../services/api.js'
 import { formatCindyDuration, isTestGoal, recommendationMatchesProgress } from '../services/cindyptDisplay.js'
+import { fatigueAlertValue, selectedAveragePaces, selectedWorkoutStats, workoutStatDisplay } from '../services/cindyptWorkoutStats.js'
 import { WeeklyPlanPanel } from './WeeklyPlanPanel.jsx'
 
 export function CindyPtPage({ summaryRevision = 0 }) {
@@ -14,8 +15,6 @@ export function CindyPtPage({ summaryRevision = 0 }) {
   const progressResult = usePolling(getCindyPtProgress, { refreshKey: `${refresh}-${summaryRevision}` })
   const recommendationResult = usePolling(getCindyPtRecommendations, { refreshKey: `${refresh}-${summaryRevision}` })
   const currentAdviceResult = usePolling(getCurrentCindyPtRecommendation, { refreshKey: `${refresh}-${summaryRevision}` })
-  const groupResult = usePolling(getWorkoutMonitoringGroup, { refreshKey: `${refresh}-${summaryRevision}` })
-  const discoveryResult = usePolling(discoverWorkoutResources, { refreshKey: refresh })
 
   const goal = goalResult.data?.goal
   const visibleRoundsInput = roundsInput ?? String(goal?.targetRounds ?? 7)
@@ -24,7 +23,9 @@ export function CindyPtPage({ summaryRevision = 0 }) {
   const selectionReady = progress && Object.hasOwn(progress, 'latestWorkout')
   const workout = progressResult.status === 'success' && selectionReady && progress?.available ? progress.workout : null
   const latest = progress?.latestWorkout
-  const selected = progress?.coachingWorkout
+  const stats = selectedWorkoutStats(progress, progress?.fatigueAlertHistory)
+  const alertValue = fatigueAlertValue(progress, stats.fatigueAlerts)
+  const averagePaces = selectedAveragePaces(progress)
   const recommendation = recommendationResult.data?.recommendations
   const alreadySaved = recommendationMatchesProgress(recommendation, progress)
   const busy = action.status === 'pending'
@@ -64,16 +65,14 @@ export function CindyPtPage({ summaryRevision = 0 }) {
     }
   }
 
-  const target = progress?.goal?.targetRounds
-  const fraction = workout && target ? Math.min(100, Math.round(workout.roundsCompleted / target * 100)) : 0
   return <div className="page-wrap"><section className="page-heading"><div><p className="eyebrow">YOUR DIGITAL COACH</p><h1>Cindy PT</h1><p className="subheading">Goals and rule-based guidance from stored, completed workouts.</p></div><span className="coach-badge"><span className="pulse-dot" /> STORED CINDY PT DATA</span></section>
     <div className="pt-grid">
       <section className="goal-card panel" aria-label="Cindy workout goal">
-        <p className="eyebrow">CURRENT FITNESS GOAL</p><h2>{goal?.label || 'Cindy workout goal'}</h2>
+        <p className="eyebrow">CURRENT FITNESS GOAL</p><h2>{isTestGoal(goal) ? 'Test fitness goal' : goal?.label || 'Cindy workout goal'}</h2>
         {goalResult.status === 'loading' || goalResult.status === 'idle' ? <p role="status">Loading saved goal…</p>
           : goalResult.status === 'error' ? <p className="pt-error" role="alert">{goalResult.error}</p>
             : goalResult.data?.available ? <><p>{goal.targetRounds} complete rounds in {formatCindyDuration(goal.durationSeconds)}.</p>
-              {isTestGoal(goal) && <p className="pt-test-label">TEST DATA — replace this integration goal with your own.</p>}</>
+              {isTestGoal(goal) && <p className="pt-test-label">Test goal</p>}</>
               : <p>No saved Cindy goal yet.</p>}
         <form className="pt-goal-form" onSubmit={saveGoal}>
           <label>Target rounds<input type="number" min="1" max="100" step="1" required value={visibleRoundsInput} onChange={(event) => setRoundsInput(event.target.value)} /></label>
@@ -81,25 +80,21 @@ export function CindyPtPage({ summaryRevision = 0 }) {
           <button className="control-btn primary" type="submit" disabled={busy}>Save goal</button>
         </form>
       </section>
-      <section className="schedule-card panel" aria-label="Latest workout and coaching selection">
-        <p className="eyebrow">LATEST WORKOUT</p><h2>Recent session</h2>
+      <section className="schedule-card panel" aria-label="Selected workout for coaching">
+        <p className="eyebrow">WORKOUT FOR COACHING</p><h2>Selected workout summary</h2>
         {progressResult.status === 'loading' || progressResult.status === 'idle' ? <p className="pt-message" role="status">Loading workout history…</p>
           : progressResult.status === 'error' ? <p className="pt-error" role="alert">{progressResult.error}</p>
             : !selectionReady ? <p className="pt-message">FastAPI is serving an older CindyPT response. Restart the backend to enable verified workout selection.</p>
-            : <>{latest ? <><p className="pt-message">Session: {latest.sessionId}</p>
-                <p className="pt-message">{latest.durationSeconds != null ? formatCindyDuration(latest.durationSeconds) : 'Duration unverified'} · {latest.completedRounds ?? 'Unknown'} completed rounds · {latest.status.replaceAll('_', ' ')}</p>
-                <p className="pt-message">Completion reason: {latest.completionReason || 'unverified'}</p>
-                <p className="pt-message">Observed reps: {Object.entries(latest.exerciseCounts || {}).map(([name, count]) => `${name} ${count}`).join(' · ') || 'Unavailable'}</p>
-                <p className="pt-message">Summary {latest.summaryVerified ? 'verified against retained events' : 'not verified'} · {latest.comparable ? 'comparable 20-minute workout' : 'not comparable to a full 20-minute workout'}</p></>
-                : <p className="pt-message">No legitimate retained workout session is available.</p>}
-              <p className="eyebrow">WORKOUT SELECTED FOR COACHING</p>
-              {selected ? <><p className="pt-message">{selected.sessionId} · {progress.selectionStatus.replaceAll('_', ' ')}</p>
-                <p className="pt-message">{progress.selectionReason}</p>
-                {progress.selectionStatus !== 'sufficient' && <p className="pt-message">No sufficiently verified workout is available for personalized target adjustments.</p>}</>
-                : <p className="pt-message">No sufficiently verified workout is available for personalized target adjustments. {progress?.selectionReason}</p>}
-              {workout && <><div className="pt-stats"><div><span>Completed rounds</span><strong>{workout.roundsCompleted}</strong></div><div><span>Target rounds</span><strong>{target}</strong></div><div><span>Remaining rounds</span><strong>{progress.roundsRemaining}</strong></div></div>
-                <div className="goal-progress"><div><span>Round progress</span><strong>{fraction}%</strong></div><div className="progress-track"><span style={{ width: `${fraction}%` }} /></div></div>
-                <p className="pt-message">Detector reliability: {(progress.detectorReliability || 'detector_quality_unknown').replaceAll('_', ' ')}. Target changes are unavailable without reliable movement evidence.</p></>}</>}
+            : <><div className="pt-workout-stats">
+                {([['Total Pull-ups', stats.pullups], ['Total Push-ups', stats.pushups], ['Total Squats', stats.squats], ['Fatigue Alerts', stats.fatigueAlerts]]).map(([label, value]) => {
+                  const display = workoutStatDisplay(label === 'Fatigue Alerts' ? alertValue : value)
+                  return <div key={label}><span>{label}</span><strong className={display.numeric ? 'is-number' : 'is-status'}>{display.text}</strong></div>
+                })}
+              </div>
+              {averagePaces && <p className="pt-workout-notice">Detected session-average pace: {[
+                ['Pull-ups', 'pullup'], ['Push-ups', 'pushup'], ['Squats', 'squat'],
+              ].map(([label, key]) => `${label} ${averagePaces[key] ? `${averagePaces[key].secondsPerRep.toFixed(1)} s/rep` : '--'}`).join(' · ')}. Accepted within-set intervals only; missed detections may affect pace.</p>}
+              {stats.status && <p className="pt-workout-notice" role="status">{stats.status}</p>}</>}
       </section>
       <section className="recommendations panel" aria-label="Cindy PT recommendations">
         <div className="panel-header"><div><p className="eyebrow">COACH'S NOTES</p><h2>Training and recovery recommendations</h2></div><span className="stored-tag">RULE-BASED</span></div>
@@ -108,8 +103,7 @@ export function CindyPtPage({ summaryRevision = 0 }) {
           currentAdviceResult.data.recommendations?.dataSufficiency === progress.selectionStatus &&
           !alreadySaved && <><p className="pt-advice-label">CURRENT WORKOUT · PREVIEW</p>
             <p className="stored-advice">{currentAdviceResult.data.recommendations.recommendation}</p>
-            <p className="pt-message">Why: {currentAdviceResult.data.recommendations.explanation}</p>
-            <p className="pt-message">{currentAdviceResult.data.recommendations.proposedTargetRounds == null ? 'No target change is supported by the current evidence.' : `Proposed target: ${currentAdviceResult.data.recommendations.proposedTargetRounds} rounds.`} Preview and approve a plan below before saving; your current plan is unchanged.</p>
+            {Number.isInteger(currentAdviceResult.data.recommendations.proposedTargetRounds) && <p className="pt-message">Suggested target: {currentAdviceResult.data.recommendations.proposedTargetRounds} rounds. Approve a plan before saving.</p>}
             <p className="stored-advice">{currentAdviceResult.data.recommendations.recoveryRecommendation}</p></>}
         <button className="control-btn primary pt-generate" type="button" onClick={generateRecommendation} disabled={!canGenerate}>Generate Recommendation</button>
         {alreadySaved && <p className="pt-message">A recommendation is already saved for this workout and goal.</p>}
@@ -118,21 +112,6 @@ export function CindyPtPage({ summaryRevision = 0 }) {
         <StoredRecommendationPanel result={recommendationResult} progress={progress} />
       </section>
     </div>
-    <section className="recommendations panel" aria-label="oneM2M monitoring" style={{ marginTop: 18 }}>
-      <p className="eyebrow">ONEM2M MONITORING</p><h2>Workout resources</h2>
-      {groupResult.status === 'success' ? <>
-        <p className="pt-message">Group: {groupResult.data.resource_path} · fan-out status: {groupResult.data.overall_status}</p>
-        <p className="pt-message">Members: {groupResult.data.members.join(', ')}</p>
-        <ul>{groupResult.data.fanout_results.map((result, index) =>
-          <li key={index}>Fan-out result {index + 1}: RSC {result.rsc} · {result.pc?.['m2m:cnt']
-            ? `CNT ${result.pc['m2m:cnt'].rn || 'member'}, content instances ${result.pc['m2m:cnt'].cni ?? 'unknown'}`
-            : 'member response unavailable'}</li>)}</ul>
-      </> : <p className="pt-message">Group fan-out: {groupResult.status === 'error' ? groupResult.error : 'checking…'}</p>}
-      {discoveryResult.status === 'success' ? <>
-        <p className="pt-message">TinyIoT CSE discovery · container type 3</p>
-        <ul>{discoveryResult.data.resources.map((resource) => <li key={resource}>{resource} · owner {discoveryResult.data.owners[resource]}</li>)}</ul>
-      </> : <p className="pt-message">CSE discovery: {discoveryResult.status === 'error' ? discoveryResult.error : 'checking…'}</p>}
-    </section>
     <WeeklyPlanPanel key={refresh} progressResult={progressResult} />
     {action.status !== 'idle' && <p className={action.status === 'error' ? 'pt-action pt-error' : 'pt-action'} role={action.status === 'error' ? 'alert' : 'status'}>{action.message}</p>}
   </div>
